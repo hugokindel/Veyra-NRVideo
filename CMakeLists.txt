@@ -1151,6 +1151,12 @@ include_directories(${FFMPEG_INCLUDE_DIRS})
   add_executable(veyra_settings_transaction_tests tests/integration/SettingsTransactionTests.cpp)
   target_compile_features(veyra_settings_transaction_tests PRIVATE cxx_std_20)
   target_link_libraries(veyra_settings_transaction_tests PRIVATE veyra_engine)
+  # Mirror output window: second swap chain parity, skips, resize, pause, detach.
+  add_executable(veyra_mirror_output_gpu_tests tests/integration/MirrorOutputGpuTests.cpp)
+  target_compile_features(veyra_mirror_output_gpu_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_mirror_output_gpu_tests PRIVATE /utf-8)
+  target_compile_definitions(veyra_mirror_output_gpu_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(veyra_mirror_output_gpu_tests PRIVATE veyra_engine)
   add_executable(veyra_capture_cadence_fg_tests tests/integration/CaptureCadenceFgTests.cpp)
   target_compile_features(veyra_capture_cadence_fg_tests PRIVATE cxx_std_20)
   target_link_libraries(veyra_capture_cadence_fg_tests PRIVATE veyra_engine)
@@ -1377,6 +1383,10 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
     src/ui/bridge/Chain.cpp
     src/ui/bridge/Recording.cpp
     src/ui/bridge/VirtualCamera.cpp
+    # Mirror output window: GUI-thread Win32 window the engine presents into.
+    src/ui/bridge/Mirror.cpp
+    src/ui/MirrorWindow.cpp
+    src/ui/MirrorWindow.h
     src/ui/bridge/View.cpp
     # Custom (Chrome bridge): local HTTP endpoint the browser extension posts to.
     src/ui/bridge/PlaybackServer.cpp

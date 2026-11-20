@@ -22,7 +22,7 @@ void EngineController::runLargeImage(HWND window,const sink::RgbaImage& original
     previewDesc.rgbInput=true;previewDesc.stillImage=true;previewDesc.noFeatures=true;previewDesc.enableNr=false;previewDesc.enableFg=false;
     // Same high-quality screen resampling as video (EngineController::run).
     previewDesc.highQualityPresentation=GetEnvironmentVariableW(L"VEYRA_TEST_PRESENT_BILINEAR",nullptr,0)==0;
-    pipeline::EnhanceGraph preview(ctx,ring);VideoPresenter presenter;
+    pipeline::EnhanceGraph preview(ctx,ring);VideoPresenter presenter;presenter.setMirror(&mirror_);
     struct Cleanup {
         gfx::CommandSlotRing& ring;VideoPresenter& presenter;pipeline::EnhanceGraph& graph;
         ~Cleanup(){ring.drainQueue();presenter.close();graph.shutdown();}

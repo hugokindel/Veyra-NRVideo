@@ -197,7 +197,14 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
     const auto presentStart=std::chrono::steady_clock::now();
     const auto slotWaitStart=ring.cpuWaitMilliseconds();
     xessFailed_=false;
-    RECT rc{};GetClientRect(window_,&rc);if(rc.right<1||rc.bottom<1)return true;
+    RECT rc{};GetClientRect(window_,&rc);
+    if(rc.right<1||rc.bottom<1){
+        // No player area (closing/collapsed): still honour a mirror release, the
+        // UI may be waiting to destroy that window.
+        if(mirrorWindow_&&mirror_&&mirror_->window.load()!=mirrorWindow_)
+            detachMirror(mirror_->window.load()?MirrorState::Waiting:MirrorState::Off);
+        return true;
+    }
     const auto now=std::chrono::steady_clock::now();
     bool resized=false;
     const auto deferUntil=uint64_t(uintptr_t(GetPropW(window_,L"Veyra.ResizeDeferUntil")));
@@ -223,6 +230,9 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
     // stretch current buffers there instead of repeatedly draining the GPU
     // and rebuilding provider resources at monitor/DPI boundaries.
     const bool windowChanging=GetPropW(window_,L"Veyra.InteractiveMove")||GetPropW(window_,L"Veyra.DpiTransition");
+    // The mirror window uses the user's view on its own client size; film
+    // pixel rounding belongs to the player window only.
+    const PreviewView mirrorView=view;
     view=filmPixelAlignedView(window_,rc.right,rc.bottom,graph.workWidth(),graph.workHeight(),view);
     auto hdrBaseline=graph.hdrCurve();
     const auto& metadataBaseline=graph.hdrMetadata();
@@ -317,10 +327,12 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
     const RetainedFrame retained{graph.presentationReadyFenceObject(slot,generated),graph.presentationReadyFence(slot,generated),
         slot,unsigned(rc.right),unsigned(rc.bottom),generated,referencesValid,baseReference,IsWindowVisible(window_)!=FALSE,
         comparison,split,view,identity,MonitorFromWindow(window_,MONITOR_DEFAULTTONEAREST),graph.hdrOutput()?effective:HdrCurveSettings{}};
+    const bool mirrorDraw=prepareMirror(ctx,graph);
     // Pausing keeps the last flip-model buffer visible. Re-submit only when
     // its producer fence, view, comparison, visibility, monitor or size changes.
     // Deferred resize must keep polling until the actual buffers match.
-    if(retainUnchanged&&(!capture_||!capture_->needsFrame())&&retained.producer&&retained.fence&&retainedFrame_&&*retainedFrame_==retained&&
+    // A newly attached or resized mirror also needs the paused frame once.
+    if(retainUnchanged&&(!capture_||!capture_->needsFrame())&&!(mirrorDraw&&mirrorDirty_)&&retained.producer&&retained.fence&&retainedFrame_&&*retainedFrame_==retained&&
         !windowChanging&&targetWidth==sink_.width()&&targetHeight==sink_.height()&&
         SUCCEEDED(ctx.device()->GetDeviceRemovedReason())&&
         !GetEnvironmentVariableW(L"VEYRA_TEST_DISABLE_PAUSED_PRESENT_REUSE",nullptr,0)){
@@ -435,6 +447,7 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
         // The counter advances outside the branch, so the periodic sample fires.
         ++doviFollowCount;
     }
+    const auto mainDims=std::to_array(dims); // the mirror re-derives only its geometry
     list->SetGraphicsRoot32BitConstants(0,16,dims,0);
     list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(slot+(generated?2:0))*pass_.increment});
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);list->DrawInstanced(3,1,0,0);
@@ -474,6 +487,54 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
         if(comparison==2)rect.right=LONG(std::clamp((rc.right*.5f+(std::clamp(split,0.0f,1.0f)-view.centerX)*renderW)*sink_.bufferWidth()/rc.right,0.0f,float(sink_.bufferWidth())));list->RSSetScissorRects(1,&rect);list->DrawInstanced(3,1,0,0);
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);
         if(veyra::log::verboseFrameLogs())veyra::log::info("comparison",std::format("real-frame source={} epoch={} revision={} reference={} mode={} split={} (same leased frame)",identity.sourceFrameId,identity.epoch,identity.settingsRevision,baseReference?"base":"input",comparison,split));
+    }
+    // Mirror window: the same shader, constants and source on the mirror's own
+    // client geometry, in this list (the source is still a pixel-shader
+    // resource and the consumer fence signalled after this list covers it).
+    // Presented right after the main chain; no readback, no CPU wait.
+    bool mirrorRecorded=false;
+    if(mirrorDraw){
+        uint32_t mirrorIndex=0;auto* mirrorBuffer=mirrorSink_.currentBackBuffer(&mirrorIndex);
+        RECT mc{};GetClientRect(mirrorWindow_,&mc);
+        const float mw=float(std::max(1L,mc.right)),mh=float(std::max(1L,mc.bottom));
+        const auto [mRenderW,mRenderH]=mirrorView.renderedSize(mw,mh,float(graph.workWidth()),float(graph.workHeight()));
+        if(mirrorBuffer&&mRenderW>0&&mRenderH>0){
+            D3D12_RESOURCE_BARRIER target{};target.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            target.Transition.pResource=mirrorBuffer;target.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            target.Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;target.Transition.StateAfter=D3D12_RESOURCE_STATE_RENDER_TARGET;
+            list->ResourceBarrier(1,&target);
+            const D3D12_CPU_DESCRIPTOR_HANDLE mirrorRtv{mirrorRtvs_->GetCPUDescriptorHandleForHeapStart().ptr+size_t(mirrorIndex)*inc_};
+            list->ClearRenderTargetView(mirrorRtv,black,0,nullptr);list->OMSetRenderTargets(1,&mirrorRtv,FALSE,nullptr);
+            const float bw=float(mirrorSink_.bufferWidth()),bh=float(mirrorSink_.bufferHeight());
+            const D3D12_VIEWPORT mirrorViewport{0,0,bw,bh,0,1};
+            D3D12_RECT mirrorRect{0,0,LONG(bw),LONG(bh)};
+            list->RSSetViewports(1,&mirrorViewport);list->RSSetScissorRects(1,&mirrorRect);
+            list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootSignature(pass_.rootSig.Get());list->SetPipelineState(pass_.pso.Get());
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            auto mirrorDims=mainDims;
+            mirrorDims[0]=mRenderW;mirrorDims[1]=mRenderH;
+            mirrorDims[3]=1.0f/std::min(mw/mRenderW,mh/mRenderH);
+            mirrorDims[4]=mw;mirrorDims[5]=mh;mirrorDims[6]=mirrorView.centerX;mirrorDims[7]=mirrorView.centerY;
+            list->SetGraphicsRoot32BitConstants(0,16,mirrorDims.data(),0);
+            list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(slot+(generated?2:0))*pass_.increment});
+            list->DrawInstanced(3,1,0,0);
+            if(comparison&&!generated&&referencesValid){
+                auto* reference=baseReference?graph.baseReference(slot):graph.sourceReference(slot);
+                D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=reference;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore=D3D12_RESOURCE_STATE_COMMON;b.Transition.StateAfter=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;list->ResourceBarrier(1,&b);
+                mirrorDims[2]=samplingFlags+curveFlag+(graph.hdr10Output()?4:graph.hdrOutput()?0:1)+(graph.videoHdrActive()?8:0);
+                list->SetGraphicsRoot32BitConstants(0,16,mirrorDims.data(),0);
+                list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(pipeline::kOutputPoolSlots+slot+(baseReference?2:0))*pass_.increment});
+                if(comparison==2)mirrorRect.right=LONG(std::clamp((mw*.5f+(std::clamp(split,0.0f,1.0f)-mirrorView.centerX)*mRenderW)*bw/mw,0.0f,bw));
+                list->RSSetScissorRects(1,&mirrorRect);list->DrawInstanced(3,1,0,0);
+                std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);
+            }
+            std::swap(target.Transition.StateBefore,target.Transition.StateAfter);list->ResourceBarrier(1,&target);
+            // Later passes in this list (probe restore, XeSS tagging) set their own state;
+            // the main render target is restored for anything that assumes it.
+            list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);list->RSSetViewports(1,&viewport);list->RSSetScissorRects(1,&rect);
+            mirrorRecorded=true;mirrorLastBuffer_=mirrorIndex;
+        }
     }
     for(auto& b:barriers)std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
     if(copyBeforePresent_)barriers[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -626,6 +687,22 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
     reflex_.presentStart(reflexFrame,generated);
     const bool presented=sink_.present(st);
     reflex_.presentEnd(reflexFrame,generated);
+    if(mirrorRecorded&&presented){
+        // Present(0,0) on a latency-1 chain whose capacity was acquired above:
+        // it does not wait for the mirror display's refresh.
+        Status mirrorStatus=Status::Ok;
+        if(mirrorSink_.present(mirrorStatus)){
+            mirrorDirty_=false;mirrorHasPresented_=true;
+            if(mirror_)mirror_->presented.fetch_add(1);
+        }else if(mirrorStatus==Status::DeviceFailure){
+            return false;
+        }else{
+            veyra::log::warn("mirror","mirror Present failed; detaching it and retrying in 2 s (player window unaffected)");
+            mirrorFailedWindow_=mirrorWindow_;mirrorRetryAt_=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            if(!ring.drainQueue())return false;
+            detachMirror(MirrorState::Failed);
+        }
+    }
     const auto presentEnd=std::chrono::steady_clock::now();
     const auto ms=[](auto d){return std::chrono::duration<double,std::milli>(d).count();};
     const bool slow=ms(presentEnd-presentStart)>=80.0;
@@ -653,6 +730,85 @@ bool VideoPresenter::readPresentedFrameForTest(gfx::D3D12DeviceContext& ctx,gfx:
     if(!hasPresented_||!sink_.swapChain()||!ring.drainQueue())return false;
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
     return SUCCEEDED(sink_.swapChain()->GetBuffer(lastBuffer_,IID_PPV_ARGS(&buffer)))&&sink::readRgba8(ctx,ring,buffer.Get(),image);
+}
+bool VideoPresenter::prepareMirror(gfx::D3D12DeviceContext& ctx,pipeline::EnhanceGraph& graph){
+    if(!mirror_)return false;
+    HWND wanted=mirror_->window.load();
+    if(wanted&&!IsWindow(wanted))wanted=nullptr;
+    if(mirrorWindow_&&mirrorWindow_!=wanted)detachMirror(wanted?MirrorState::Waiting:MirrorState::Off);
+    if(!wanted){mirrorFailedWindow_=nullptr;publishMirrorState(MirrorState::Off);return false;}
+    // XeSS owns Present for its generated frames on the direct queue; a second
+    // chain there could disturb its pacing, so the mirror stays off with it.
+    if(!presentationQueue_||sink_.xess()){
+        if(mirrorWindow_)detachMirror(MirrorState::Unsupported);
+        publishMirrorState(MirrorState::Unsupported);return false;
+    }
+    const auto now=std::chrono::steady_clock::now();
+    RECT rc{};GetClientRect(wanted,&rc);
+    const unsigned width=unsigned(std::max(1L,rc.right)),height=unsigned(std::max(1L,rc.bottom));
+    if(!mirrorWindow_){
+        if(wanted==mirrorFailedWindow_&&now<mirrorRetryAt_)return false;
+        gfx::PresentSink::Desc d;d.targetWindow=wanted;d.width=width;d.height=height;d.vsync=false;d.tearing=false;d.waitable=true;
+        d.hdr=graph.hdrOutput();d.hdr10=graph.hdr10Output();d.title=L"Veyra mirror";
+        veyra::log::info("mirror",std::format("attach window=0x{:X} client={}x{} output={} (second swap chain on the presentation queue; same final frame, no readback)",
+            reinterpret_cast<uintptr_t>(wanted),width,height,d.hdr10?"HDR10":d.hdr?"scRGB":"SDR"));
+        Status st=Status::Ok;
+        bool ok=mirrorSink_.initialize(ctx.device(),presentationQueue_.Get(),d,st);
+        if(ok){
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=3;
+            ok=SUCCEEDED(ctx.device()->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&mirrorRtvs_)))&&refreshMirrorTargets(ctx.device());
+        }
+        if(!ok){
+            veyra::log::warn("mirror",std::format("attach failed status={}; retrying in 2 s (player window unaffected)",int(st)));
+            mirrorSink_.shutdown();mirrorRtvs_.Reset();
+            mirrorFailedWindow_=wanted;mirrorRetryAt_=now+std::chrono::seconds(2);
+            publishMirrorState(MirrorState::Failed);return false;
+        }
+        // One queued frame at most, polled with a zero timeout below: the mirror
+        // never queues behind its display and never makes the player wait.
+        if(!mirrorSink_.configurePacing(true,false,false))veyra::log::warn("mirror","frame latency control unavailable; mirror presents unpaced");
+        mirrorWindow_=wanted;mirrorFailedWindow_=nullptr;mirrorDirty_=true;
+        mirrorPendingWidth_=width;mirrorPendingHeight_=height;mirrorPendingSince_=now;
+        mirror_->width.store(width);mirror_->height.store(height);
+    }
+    if(!IsWindowVisible(wanted)||IsIconic(wanted)){mirror_->skipped.fetch_add(1);return false;}
+    if(width!=mirrorSink_.width()||height!=mirrorSink_.height()){
+        // Resize once the size has settled (a drag resizes every message);
+        // DXGI stretches the current buffers meanwhile.
+        if(width!=mirrorPendingWidth_||height!=mirrorPendingHeight_){mirrorPendingWidth_=width;mirrorPendingHeight_=height;mirrorPendingSince_=now;}
+        else if(now-mirrorPendingSince_>=std::chrono::milliseconds(120)&&mirrorSink_.resizeDue()){
+            mirrorSink_.resize(width,height);
+            if(!mirrorSink_.currentBackBuffer()||!refreshMirrorTargets(ctx.device())){
+                veyra::log::warn("mirror","resize lost the mirror buffers; detaching and retrying in 2 s");
+                mirrorFailedWindow_=wanted;mirrorRetryAt_=now+std::chrono::seconds(2);
+                detachMirror(MirrorState::Failed);return false;
+            }
+            mirrorDirty_=true;mirror_->width.store(mirrorSink_.width());mirror_->height.store(mirrorSink_.height());
+        }
+    }else{mirrorPendingWidth_=width;mirrorPendingHeight_=height;}
+    if(!mirrorSink_.waitPresentationReady(0)){mirror_->skipped.fetch_add(1);return false;}
+    publishMirrorState(MirrorState::Active);
+    return true;
+}
+bool VideoPresenter::refreshMirrorTargets(ID3D12Device* device){
+    if(!mirrorRtvs_||!mirrorSink_.swapChain())return false;
+    for(unsigned i=0;i<3;++i){
+        Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+        const HRESULT hr=mirrorSink_.swapChain()->GetBuffer(i,IID_PPV_ARGS(&buffer));
+        if(FAILED(hr)){veyra::log::error("mirror",std::format("GetBuffer index={} hr=0x{:X}",i,unsigned(hr)));return false;}
+        device->CreateRenderTargetView(buffer.Get(),nullptr,{mirrorRtvs_->GetCPUDescriptorHandleForHeapStart().ptr+size_t(i)*inc_});
+    }
+    return true;
+}
+void VideoPresenter::detachMirror(MirrorState next){
+    if(mirrorWindow_||mirrorSink_.swapChain()){
+        veyra::log::info("mirror",std::format("detach window=0x{:X} presented={} next={}",reinterpret_cast<uintptr_t>(mirrorWindow_),mirrorSink_.presentCount(),int(next)));
+        // PresentSink::shutdown waits for its queue to go idle before releasing.
+        mirrorSink_.shutdown();
+    }
+    mirrorRtvs_.Reset();mirrorWindow_=nullptr;mirrorDirty_=false;mirrorHasPresented_=false;
+    if(mirror_){mirror_->width.store(0);mirror_->height.store(0);}
+    publishMirrorState(next);
 }
 bool VideoPresenter::ensureCoverageProbe(ID3D12Device* device){
     if(probeStats_)return true;
@@ -695,7 +851,10 @@ void VideoPresenter::close(){
     reflex_.close();reflexFrame_=reflexInputFrame_=0;
     if(presentationRing_.initialized())presentationRing_.drainQueue();
     hasPresented_=false;gpuTimer_.close();compositeTarget_.Reset();exclusionUiTarget_.Reset();exclusionHudlessTarget_.Reset();exclusionUiEnabled_=false;copyBeforePresent_=copyEligible_=false;rtvs_.Reset();
-    probeStats_.Reset();probeReadback_.Reset();probeCpuViews_.Reset();probePass_={};probePending_=false;probeFailed_=false;probeNext_={};probeCurve_={};probeIdentity_={};liveCoverage_={};pass_={};sink_.shutdown();
+    probeStats_.Reset();probeReadback_.Reset();probeCpuViews_.Reset();probePass_={};probePending_=false;probeFailed_=false;probeNext_={};probeCurve_={};probeIdentity_={};liveCoverage_={};pass_={};
+    // The mirror chain presents on the presentation queue: release it first.
+    detachMirror(mirror_&&mirror_->window.load()?MirrorState::Waiting:MirrorState::Off);mirrorFailedWindow_=nullptr;
+    sink_.shutdown();
     presentMotionPass_={};presentMotion_={};previousXessWidth_=previousXessHeight_=0;
     presentationRing_.shutdown();presentationFence_.Reset();presentationQueue_.Reset();
     if(presentationEvent_){CloseHandle(presentationEvent_);presentationEvent_=nullptr;}
@@ -851,6 +1010,12 @@ PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceConte
     }
     status=join({latency,cap,queue,syncMode,syncDetail});
     return effective;
+}
+Microsoft::WRL::ComPtr<ID3D12Resource> VideoPresenter::mirrorPresentedResourceForTest(){
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    if(presentationQueue_&&!presentationRing_.drainQueue())return buffer;
+    if(mirrorHasPresented_&&mirrorSink_.swapChain())mirrorSink_.swapChain()->GetBuffer(mirrorLastBuffer_,IID_PPV_ARGS(&buffer));
+    return buffer;
 }
 Microsoft::WRL::ComPtr<ID3D12Resource> VideoPresenter::presentedResourceForTest() {
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;

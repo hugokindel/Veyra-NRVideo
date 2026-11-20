@@ -28,6 +28,7 @@
 #include "veyra/engine/ExportOptions.h"
 #include "veyra/engine/LiveRecorder.h"
 #include "veyra/engine/VirtualCamera.h"
+#include "veyra/engine/MirrorOutput.h"
 #include "veyra/engine/DisplayStateService.h"
 namespace veyra::source { struct RemotePlayConnectDesc; class RemotePlaySessionSource; struct MoonlightConnectDesc; class MoonlightSessionSource; struct XboxConnectDesc; class XboxSessionSource; }
 namespace veyra::remoteplay { struct ControllerState;struct ControllerFeedback; }
@@ -315,6 +316,13 @@ public:
     // Refresh/VRR state of monitors, shared by every session's presenter and
     // the UI; queried in the background on events only. Any thread.
     DisplayStateService& displayStates(){return displayStates_;}
+    // Mirror output window (MirrorOutput.h). Any thread. The caller owns the
+    // HWND and keeps it alive until mirrorReleased() after clearing it (or
+    // until the engine is destroyed); null turns the mirror off.
+    void setMirrorWindow(HWND window){mirror_.window.store(window);}
+    MirrorOutputStatus mirrorStatus()const{return mirrorSnapshot(mirror_);}
+    // True once no presenter holds a swap chain on a previously set window.
+    bool mirrorReleased()const{return mirror_.width.load()==0&&MirrorState(mirror_.state.load())!=MirrorState::Active;}
 private:
     void run(HWND,std::wstring,PlayerOptions,std::shared_ptr<source::RemotePlayConnectDesc> remoteRequest={},std::shared_ptr<source::MoonlightConnectDesc> moonlightRequest={},std::shared_ptr<source::XboxConnectDesc> xboxRequest={});
     void runLargeImage(HWND,const sink::RgbaImage&,PlayerOptions,gfx::D3D12DeviceContext&,gfx::CommandSlotRing&);
@@ -358,6 +366,7 @@ private:
     PresentCaptureFanout captures_{recordingCaptures_,*virtualCamera_};
     // Declared before worker_: it outlives the engine thread's presenters.
     DisplayStateService displayStates_;
+    MirrorOutputLink mirror_; // likewise outlives the presenters
     std::thread worker_;
     std::unique_ptr<PreviewGpuSession> prewarmed_; // engine dispatcher only
     std::atomic<bool> prewarmEnabled_{false}; // off until the saved preference enables it (default off since 2026-10-05)

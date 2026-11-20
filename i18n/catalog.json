@@ -5331,6 +5331,19 @@
    "ru": "XeSS не удалось включить; предыдущие настройки восстановлены"
   },
   {
+   "zh": "XeSS 补帧自行管理呈现，镜像窗口暂不可用；换用其他补帧或关闭补帧后显示",
+   "src": "src/ui/bridge/Mirror.cpp",
+   "zh-TW": "XeSS 補幀自行管理呈現，鏡像視窗暫不可用；改用其他補幀或關閉補幀後顯示",
+   "en": "XeSS frame generation manages presentation itself, so the mirror window is unavailable; it shows once you use another frame generation or turn it off",
+   "ja": "XeSS フレーム生成は表示を自身で管理するため、ミラーウィンドウは使用できません。別のフレーム生成を使うか、フレーム生成をオフにすると表示されます",
+   "ko": "XeSS 프레임 생성이 화면 표시를 직접 관리하므로 미러 창을 사용할 수 없습니다. 다른 프레임 생성을 사용하거나 끄면 표시됩니다",
+   "es": "La generación de fotogramas XeSS gestiona la presentación por sí misma, así que la ventana espejo no está disponible; se mostrará al usar otra generación de fotogramas o desactivarla",
+   "fr": "La génération d'images XeSS gère elle-même la présentation : la fenêtre miroir est indisponible ; elle s'affiche avec une autre génération d'images ou une fois celle-ci désactivée",
+   "de": "XeSS-Frame-Generation steuert die Ausgabe selbst, daher ist das Spiegelfenster nicht verfügbar; es zeigt das Bild mit einer anderen Frame-Generation oder wenn sie aus ist",
+   "pt-BR": "A geração de fotogramas XeSS gere a apresentação por si mesma, por isso a janela espelho não está disponível; aparece ao usar outra geração de fotogramas ou ao desligá-la",
+   "ru": "Генерация кадров XeSS сама управляет выводом, поэтому окно-зеркало недоступно; оно заработает с другой генерацией кадров или после её отключения"
+  },
+  {
    "zh": "XeSS 默认零运动；FSR 仍有自身的光流计算",
    "src": "qml/NodePage.qml",
    "zh-TW": "XeSS 預設零運動；FSR 仍有自身的光流計算",
@@ -12805,6 +12818,19 @@
    "de": "Wählen Sie Veyra Virtual Camera als Videoaufnahmegerät in Ihrer Streaming-App aus. Gibt das vollständig verarbeitete Bild ohne Vollbild aus.",
    "pt-BR": "Selecione Veyra Virtual Camera como um dispositivo de captura de vídeo em seu aplicativo de streaming. Saídas da imagem inteira processada sem tela cheia.",
    "ru": "Выберите Виртуальную камеру Veyra в качестве устройства захвата видео в потоковом приложении. Выдает полную обработанную картинку без полноэкранного изображения."
+  },
+  {
+   "zh": "在第二个窗口显示同一画面（Ctrl+M）：拖到另一块屏幕，双击或按 F11 全屏，Esc 退出全屏",
+   "src": "qml/ProPage.qml",
+   "zh-TW": "在第二個視窗顯示同一畫面（Ctrl+M）：拖到另一塊螢幕，按兩下或按 F11 全螢幕，Esc 離開全螢幕",
+   "en": "Show the same picture in a second window (Ctrl+M): drag it to another screen, double-click or press F11 for fullscreen, Esc to leave fullscreen",
+   "ja": "同じ映像を2つ目のウィンドウに表示します（Ctrl+M）。別の画面へドラッグし、ダブルクリックまたは F11 で全画面、Esc で解除します",
+   "ko": "같은 화면을 두 번째 창에 표시합니다(Ctrl+M). 다른 화면으로 끌어 놓고 더블클릭하거나 F11을 눌러 전체 화면, Esc로 전체 화면을 해제합니다",
+   "es": "Muestra la misma imagen en una segunda ventana (Ctrl+M): arrástrala a otra pantalla, haz doble clic o pulsa F11 para pantalla completa y Esc para salir",
+   "fr": "Affiche la même image dans une seconde fenêtre (Ctrl+M) : faites-la glisser vers un autre écran, double-cliquez ou appuyez sur F11 pour le plein écran, Échap pour en sortir",
+   "de": "Zeigt dasselbe Bild in einem zweiten Fenster (Strg+M): auf einen anderen Bildschirm ziehen, Doppelklick oder F11 für Vollbild, Esc beendet das Vollbild",
+   "pt-BR": "Mostra a mesma imagem numa segunda janela (Ctrl+M): arraste-a para outro ecrã, clique duas vezes ou prima F11 para ecrã inteiro e Esc para sair",
+   "ru": "Показывает ту же картинку во втором окне (Ctrl+M): перетащите его на другой экран, двойной щелчок или F11 — полный экран, Esc — выход из полноэкранного режима"
   },
   {
    "zh": "在线",
@@ -37948,6 +37974,58 @@
    "de": "Wenn der Spiegelserver ausfällt, verbindet sich Veyra direkt mit GitHub.",
    "pt-BR": "Se o espelho falhar, o Veyra se conecta diretamente ao GitHub.",
    "ru": "При сбое зеркала Veyra подключится напрямую к GitHub."
+  },
+  {
+   "zh": "镜像窗口",
+   "src": "qml/ProPage.qml",
+   "zh-TW": "鏡像視窗",
+   "en": "Mirror window",
+   "ja": "ミラーウィンドウ",
+   "ko": "미러 창",
+   "es": "Ventana espejo",
+   "fr": "Fenêtre miroir",
+   "de": "Spiegelfenster",
+   "pt-BR": "Janela espelho",
+   "ru": "Окно-зеркало"
+  },
+  {
+   "zh": "镜像窗口已打开：拖到另一块屏幕，双击或按 F11 全屏",
+   "src": "src/ui/bridge/Mirror.cpp",
+   "zh-TW": "鏡像視窗已開啟：拖到另一塊螢幕，按兩下或按 F11 全螢幕",
+   "en": "Mirror window open: drag it to another screen, double-click or press F11 for fullscreen",
+   "ja": "ミラーウィンドウを開きました。別の画面へドラッグし、ダブルクリックまたは F11 で全画面にします",
+   "ko": "미러 창이 열렸습니다. 다른 화면으로 끌어 놓고 더블클릭하거나 F11을 눌러 전체 화면으로 전환하세요",
+   "es": "Ventana espejo abierta: arrástrala a otra pantalla y haz doble clic o pulsa F11 para pantalla completa",
+   "fr": "Fenêtre miroir ouverte : faites-la glisser vers un autre écran, double-cliquez ou appuyez sur F11 pour le plein écran",
+   "de": "Spiegelfenster geöffnet: auf einen anderen Bildschirm ziehen, Doppelklick oder F11 für Vollbild",
+   "pt-BR": "Janela espelho aberta: arraste-a para outro ecrã e clique duas vezes ou prima F11 para ecrã inteiro",
+   "ru": "Окно-зеркало открыто: перетащите его на другой экран, двойной щелчок или F11 — полный экран"
+  },
+  {
+   "zh": "镜像窗口无法创建，请查看日志",
+   "src": "src/ui/bridge/Mirror.cpp",
+   "zh-TW": "鏡像視窗無法建立，請查看日誌",
+   "en": "The mirror window could not be created; see the log.",
+   "ja": "ミラーウィンドウを作成できません。ログを確認してください",
+   "ko": "미러 창을 만들 수 없습니다. 로그를 확인하세요",
+   "es": "No se pudo crear la ventana espejo; consulta el registro.",
+   "fr": "Impossible de créer la fenêtre miroir ; consultez le journal.",
+   "de": "Das Spiegelfenster konnte nicht erstellt werden; siehe Protokoll.",
+   "pt-BR": "Não foi possível criar a janela espelho; consulte o registo.",
+   "ru": "Не удалось создать окно-зеркало; см. журнал."
+  },
+  {
+   "zh": "镜像窗口画面创建失败，正在重试",
+   "src": "src/ui/bridge/Mirror.cpp",
+   "zh-TW": "鏡像視窗畫面建立失敗，正在重試",
+   "en": "The mirror window's picture could not be set up; retrying",
+   "ja": "ミラーウィンドウの映像を準備できませんでした。再試行しています",
+   "ko": "미러 창 화면을 준비하지 못했습니다. 다시 시도하는 중입니다",
+   "es": "No se pudo preparar la imagen de la ventana espejo; reintentando",
+   "fr": "Impossible de préparer l'image de la fenêtre miroir ; nouvel essai",
+   "de": "Das Bild des Spiegelfensters konnte nicht eingerichtet werden; neuer Versuch",
+   "pt-BR": "Não foi possível preparar a imagem da janela espelho; a tentar novamente",
+   "ru": "Не удалось подготовить изображение окна-зеркала; повторная попытка"
   },
   {
    "zh": "长句自动缩小",

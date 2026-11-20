@@ -876,6 +876,8 @@ Window {
     Shortcut { sequence: "Ctrl+O"; onActivated: veyra.openFileDialog() }
     Shortcut { sequence: "Ctrl+U"; onActivated: veyra.openNetworkDialog() }
     Shortcut { sequence: "Ctrl+E"; onActivated: root.page = "exp" }
+    // Mirror window (second screen) on/off from any page.
+    Shortcut { sequence: "Ctrl+M"; onActivated: veyra.setMirrorWindowOpen(!veyra.mirrorWindowOpen) }
     Shortcut {
         sequence: veyra.shortcuts.lock
         enabled: root.fullscreen

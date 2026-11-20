@@ -494,6 +494,30 @@ VPage {
                 ToolTip.visible: head.compactActions && cameraHover.hovered
                 ToolTip.text: qsTr("虚拟摄像机")
             }
+            // Mirror window: the same final picture in a second window the user
+            // drags to another screen (double-click / F11 for fullscreen there).
+            RowLayout {
+                objectName: "pro-mirror-window-control"
+                Layout.alignment: Qt.AlignVCenter
+                spacing: 6
+                VIcon { visible: head.compactActions; name: "tv"; size: 14 }
+                Text {
+                    visible: !head.compactActions
+                    text: qsTr("镜像窗口")
+                    color: veyra.mirrorWindowOpen ? Theme.accent : Theme.t2
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fsBody
+                }
+                VSwitch {
+                    objectName: "pro-mirror-window-toggle"
+                    checked: veyra.mirrorWindowOpen
+                    onToggled: enabled => veyra.setMirrorWindowOpen(enabled)
+                }
+                HoverHandler { id: mirrorHover }
+                ToolTip.visible: mirrorHover.hovered
+                ToolTip.delay: 500
+                ToolTip.text: qsTr("在第二个窗口显示同一画面（Ctrl+M）：拖到另一块屏幕，双击或按 F11 全屏，Esc 退出全屏")
+            }
             RowLayout {
                 objectName: "pro-replay-control"
                 Layout.alignment: Qt.AlignVCenter

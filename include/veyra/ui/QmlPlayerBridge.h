@@ -240,6 +240,9 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(bool virtualCameraEnabled READ virtualCameraEnabled NOTIFY virtualCameraChanged)
     Q_PROPERTY(QVariantMap virtualCameraState READ virtualCameraState NOTIFY virtualCameraChanged)
     Q_PROPERTY(int virtualCameraFps READ virtualCameraFps NOTIFY preferencesChanged)
+    // Mirror output window: a second draggable window with the same final picture.
+    Q_PROPERTY(bool mirrorWindowOpen READ mirrorWindowOpen NOTIFY mirrorWindowChanged)
+    Q_PROPERTY(QVariantMap mirrorWindowState READ mirrorWindowState NOTIFY mirrorWindowChanged)
     Q_PROPERTY(QVariantMap recordingState READ recordingState NOTIFY recordingChanged)
     Q_PROPERTY(QString recordingDirectory READ recordingDirectory NOTIFY preferencesChanged)
     Q_PROPERTY(int recordingBitrateMbps READ recordingBitrateMbps NOTIFY preferencesChanged)
@@ -1422,6 +1425,12 @@ public:
     QVariantMap virtualCameraState()const;
     int virtualCameraFps()const;
     void pollVirtualCamera();
+    Q_INVOKABLE void setMirrorWindowOpen(bool open);
+    Q_INVOKABLE void toggleMirrorFullscreen();
+    bool mirrorWindowOpen()const;
+    QVariantMap mirrorWindowState()const;
+    void pollMirrorWindow();
+    void releaseMirrorWindow();
     Q_INVOKABLE void stopRecording(const QString& source = QString());
     Q_INVOKABLE void toggleRecording(const QString& source = QString());
     Q_INVOKABLE void chooseRecordingDirectory();
@@ -1534,6 +1543,7 @@ signals:
     void preferencesChanged();
     void recordingChanged();
     void virtualCameraChanged();
+    void mirrorWindowChanged();
     void replayChanged();
     void microphoneDevicesChanged();
     void colourLibraryChanged();

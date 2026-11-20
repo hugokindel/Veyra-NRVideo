@@ -1,5 +1,16 @@
 # 当前工作日志
 
+## 2026-11-20 镜像窗口（第二屏同画面输出）
+
+分支 `feature/mirror-output`（基于 main `eb5fd6d0`），仅本地提交，未 push/Release。需求：用户希望在显示器与电视上同时看 Veyra 输出，Windows“复制”模式会关闭 HDR，所以改为“扩展”模式下的第二个可拖动窗口。设计与限制见 [镜像窗口](MIRROR_WINDOW_2026-11-20.md)。
+
+- 引擎：`MirrorOutputLink` + `VideoPresenter` 第二个 `PresentSink`，与主画面同一着色器、常量、源和格式，同一命令列表录制，主 Present 之后 `Present(0,0)`；延迟 1 帧并以零超时轮询，忙则跳帧，不回读、不等待。XeSS-FG 时报告不支持。主画面区为 0（关闭中）也会处理镜像释放。
+- 界面：GUI 线程 Win32 `MirrorWindow`（双击/F11/Alt+Enter 全屏、Esc 退出、全屏 2 秒隐藏光标、关闭即隐藏、位置记忆），专业页“镜像窗口”开关与 Ctrl+M，测试开关 `--mirror-window <open-ms>[,fullscreen-ms[,close-ms]]`；6 条新文案 9 种语言，`scripts/i18n/extract.py --check` 缺失 0。
+- 本机环境没有 `E:/项目/Veyra`，研发产物放在 `D:/Projects/Veyra-work/{deps,build,logs,tests,tmp}`。构建脚本 `D:/Projects/Veyra-work/build-veyra.ps1`（VS2022 BuildTools、Qt 6.8.3、FFmpeg 头文件取自已发布源码包并用用户 2.2.0 DLL 生成导入库、DLSS SDK 310.7.0、NVOF 5.0 MIT 头文件），关闭 libdovi/RemotePlay/Moonlight/Xbox，属精简开发构建，不是完整交付。`veyra_qml_ui` 与测试目标 `-j2` 构建通过（exit 0）。
+- `veyra_mirror_output_gpu_tests`（RTX 5090，D3D12 调试层）：attach、SDR 中心像素 200/200、16:9 入 2:1 窗口左右黑边、隐藏时只计跳帧、120 ms 稳定后缩放、暂停不重提交且缩放后补一帧、断开/重连、关闭后 waiting、HDR10 镜像与图输出 10 位误差 0，`MIRROR_RESULT passed=1 debugErrors=0`。既有 `veyra_settings_transaction_tests` 仍 `SETTINGS_RESULT passed=1 debugErrors=0`。
+- 实际程序（复制的 2.2.0 运行目录 + 本次 exe/QML/着色器，私有 data-dir）：1080p60 文件播放时打开镜像窗口，自动放到另一块屏幕，attach 1898x1024 SDR；全屏后 150 ms 内缩放到 3840x2160；约 8 秒 presented=480（随 60 fps 源）；关闭时 detach。主画面 present-cost 总耗时 0.19–0.63 ms（镜像 4K 全屏时最高），每秒约 60 次提交不变。首轮发现退出时主画面区为 0 导致镜像 1 s 内未释放（窗口按设计留给进程回收），已修复；复测退出 220 ms 内 detach，无告警。
+- 未验证：电视上的 HDR 观感、G-SYNC 与第二条翻转链并存、120 Hz 电视与 240 Hz 显示器下的实际跳帧、XeSS-FG 提示、帧生成实机。需用户在显示器 + LG C5 上确认。
+
 ## 2026-11-20 Veyra 2.2.0 正式发行
 
 用户授权向 Likely7/Veyra-NRVideo 发布 2.2.0、精简 README 并把完整更新和已有对比图放在 Release。安装器分支 7ecb5d1d 合入发行树，WORKLOG 的追加冲突保留两边记录。运行程序、QML、着色器及依赖构建使用主线 41d1aeb6，其中生产源码与 ecbe0543 一致。从已验证配置重用依赖参数，只加入正式 Ed25519 验签公钥及关闭回环测试。命令入口为 `scripts/acceptance/build-recording-handoff.py --task codex-release-2.2.0-20261120 --label 2.2.0 --jobs 2 --reconfigure`，8 个目标 374.0 秒通过，回执在同任务 `logs/build-20261120-055915`。

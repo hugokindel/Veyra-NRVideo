@@ -512,7 +512,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
     // only name the stopped command list after the removal, so teardown checks once more.
     bool gpuFailureAwaitingRemoval=false;
     sink::AudioPipeline audioPipe;sink::AudioRenderer audio;VideoPresenter presenter;
-    presenter.setCapture(&captures_);presenter.setDisplayStates(&displayStates_);
+    presenter.setCapture(&captures_);presenter.setDisplayStates(&displayStates_);presenter.setMirror(&mirror_);
     auto& coreCache=gpu->core;auto& recentGraphCache=gpu->recent;auto& graph=gpu->graph;
     auto& graphBytes=gpu->graphBytes;auto cacheBudgetPolledAt=Clock::now();
     const bool recentCacheAllowed=!GetEnvironmentVariableW(L"VEYRA_TEST_DISABLE_RECENT_GRAPH_CACHE",nullptr,0);

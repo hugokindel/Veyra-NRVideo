@@ -842,6 +842,7 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
     //   --exit-after <ms>       quit the app by itself after N ms, so a test run ends
     //                           through the engine's own teardown instead of a kill
     //   --video-probe <normal|hidden|no-region|covers-only>  native-window diagnosis
+    //   --mirror-window <open-ms>[,fullscreen-ms[,close-ms]]  mirror output window timeline
     const QStringList args = QCoreApplication::arguments();
     QString openPath;
     QVariantMap testOptions;
@@ -955,6 +956,25 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
             QTimer::singleShot(atMs, &bridge, [&bridge, pkey, pval] {
                 veyra::log::info("qml-test", std::format("pref-at {}={}", pkey.toStdString(), pval.toStdString()));
                 bridge.setPreference(pkey, pval);
+            });
+        } else if (a == QLatin1String("--mirror-window") && hasValue) {
+            // Test switch: open the mirror window N ms in through the same entry
+            // the 镜像窗口 switch / Ctrl+M uses; `fullscreen` also toggles it,
+            // `close` closes it again at the given later time.
+            // Format: --mirror-window <open-ms>[,fullscreen-ms[,close-ms]]
+            const QStringList at = args.at(++i).split(QLatin1Char(','));
+            const int openMs = at.value(0).toInt();
+            QTimer::singleShot(openMs, &bridge, [&bridge] {
+                veyra::log::info("qml-test", "mirror-window: open");
+                bridge.setMirrorWindowOpen(true);
+            });
+            if (at.size() > 1 && at.at(1).toInt() > 0) QTimer::singleShot(at.at(1).toInt(), &bridge, [&bridge] {
+                veyra::log::info("qml-test", "mirror-window: toggle fullscreen");
+                bridge.toggleMirrorFullscreen();
+            });
+            if (at.size() > 2 && at.at(2).toInt() > 0) QTimer::singleShot(at.at(2).toInt(), &bridge, [&bridge] {
+                veyra::log::info("qml-test", "mirror-window: close");
+                bridge.setMirrorWindowOpen(false);
             });
         } else if (!a.startsWith(QLatin1Char('-'))) {
             openPath = a;

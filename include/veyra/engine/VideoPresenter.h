@@ -12,6 +12,7 @@
 #include "veyra/engine/PresentationSettings.h"
 #include "veyra/engine/PresentCapture.h"
 #include "veyra/engine/DisplayStateService.h"
+#include "veyra/engine/MirrorOutput.h"
 #include <chrono>
 #include <array>
 #include <optional>
@@ -25,6 +26,15 @@ public:
     void setCapture(PresentCapture* capture){capture_=capture;}
     // Shared refresh/VRR states (the engine's); must outlive the presenter.
     void setDisplayStates(DisplayStateService* states){displayStates_=states;}
+    // Mirror output window request/state shared with the UI; must outlive the
+    // presenter. The mirror gets the same final frame on a second swap chain
+    // and never makes the main presentation wait (see MirrorOutput.h).
+    void setMirror(MirrorOutputLink* mirror){mirror_=mirror;}
+    uint64_t mirrorPresentedCount()const{return mirrorSink_.presentCount();}
+    bool mirrorAttached()const{return mirrorWindow_!=nullptr;}
+    // Test-only: the mirror buffer last presented. Drains the presentation
+    // queue; the caller releases it before the next resize/detach.
+    Microsoft::WRL::ComPtr<ID3D12Resource> mirrorPresentedResourceForTest();
     ~VideoPresenter(){close();}
     // mediaClockPaced: the owner already waits on a media clock before each
     // source (file playback). Retained for diagnostics; XeLL low latency must
@@ -220,6 +230,25 @@ private:
     std::optional<std::chrono::steady_clock::time_point> vrrConfirmAt_;
     void startDisplayState();
     void applyDisplayState(const DisplayState&);
+    // Mirror output (second borrowed window). The sink presents on the native
+    // presentation queue; its draw is recorded into the main present list so
+    // the existing consumer fence covers the output-pool read.
+    MirrorOutputLink* mirror_=nullptr;
+    gfx::PresentSink mirrorSink_;
+    HWND mirrorWindow_=nullptr;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> mirrorRtvs_;
+    bool mirrorDirty_=false,mirrorHasPresented_=false;
+    unsigned mirrorLastBuffer_=0;
+    HWND mirrorFailedWindow_=nullptr;
+    std::chrono::steady_clock::time_point mirrorRetryAt_{};
+    unsigned mirrorPendingWidth_=0,mirrorPendingHeight_=0;
+    std::chrono::steady_clock::time_point mirrorPendingSince_{};
+    // True when the mirror is attached, visible and has swap-chain capacity
+    // for this frame. Never blocks: a busy mirror skips the frame.
+    bool prepareMirror(gfx::D3D12DeviceContext&,pipeline::EnhanceGraph&);
+    bool refreshMirrorTargets(ID3D12Device*);
+    void detachMirror(MirrorState next);
+    void publishMirrorState(MirrorState state){if(mirror_)mirror_->state.store(int(state));}
     uint32_t xessInputId_=0;
     struct XessWork {pipeline::FrameIdentity identity{};uint32_t id=0;};
     std::array<XessWork,4> xessWork_{};

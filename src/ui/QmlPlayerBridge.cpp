@@ -415,6 +415,7 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         // Live recording state: the recorder owns the files, this side shows them.
         {
             pollVirtualCamera();
+            pollMirrorWindow();
             const auto live=impl_->engine.recordingSnapshot();
             QVariantMap state;
             state["active"]=live.active;
@@ -738,6 +739,8 @@ QmlPlayerBridge::~QmlPlayerBridge() {
     // Before anything is torn down: this reads the playback position.
     // The overlay is a child window: it has to go before the video window does.
     flushHdrMemory();
+    // The engine outlives the bridge: detach its mirror swap chain before the window goes.
+    releaseMirrorWindow();
     if (qApp) qApp->removeEventFilter(this);
     if (qApp) qApp->removeNativeEventFilter(&impl_->displayChangeFilter);
     // rememberPosition(true) writes every preference, a pending volume included.

@@ -10,6 +10,7 @@
 #include "veyra/ngx/DlssgLite.h"
 #include "veyra/RuntimePaths.h"
 #include "veyra/ui/GamePassthrough.h"
+#include "MirrorWindow.h"
 #include <QAbstractNativeEventFilter>
 #include <QGuiApplication>
 #include <QScreen>
@@ -376,6 +377,10 @@ struct QmlPlayerBridge::Impl {
     // Live recording state published by the engine (see LiveRecorder.h).
     QVariantMap recordingState;
     QVariantMap virtualCameraState;
+    // Mirror output window (src/ui/MirrorWindow.h). The bridge releases it
+    // in its destructor only after the engine let go of its swap chain.
+    std::unique_ptr<MirrorWindow> mirrorWindow;
+    QVariantMap mirrorWindowState;
     uint64_t recordingSaved = 0;   // LiveRecorder's finished-file counter already announced
     QVariantMap replayState;       // the instant replay buffer (#103)
     uint64_t replaySaved = 0;      // its saved-clip counter already announced
