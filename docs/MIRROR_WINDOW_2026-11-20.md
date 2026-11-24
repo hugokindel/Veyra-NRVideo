@@ -99,3 +99,8 @@ Same source; only the build environment changed, so the exe matches the official
   the official one).
 - Checks: mirror GPU test passed=1 debugErrors=0; VFG GPU test 2521 checks 0 failures; official 2.2.1 portable
   via Veyra.exe: VFG, mirror attach/fullscreen/close (801 presents), clean exit.
+
+## Later patches
+
+- `v2.2.1-mirror4` (`33a47f46`): Elgato 4K Pro HDR chroma fix; the patch now also ships `shaders/YuvToLinearRgb.dxil`. See [Elgato 4K Pro chroma](ELGATO_4K_PRO_CHROMA_2026-11-24.md).
+

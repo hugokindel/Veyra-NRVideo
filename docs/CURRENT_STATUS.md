@@ -4,6 +4,12 @@
 
 [2.2.0 历史发行](https://github.com/Likely7/Veyra-NRVideo/releases/tag/v2.2.0) · [2.2.0 对应源码与构建](BUILD_2.2.0.md)。
 
+## Fork：hugokindel/Veyra-NRVideo `feature/mirror-output`
+
+- 基于官方 2.2.1，加入[镜像窗口](MIRROR_WINDOW_2026-11-20.md)（扩展模式第二窗口，同一最终画面，两屏保留 HDR）与 [Elgato 4K Pro 色度修复](ELGATO_4K_PRO_CHROMA_2026-11-24.md)。全功能构建，exe 依赖与官方 2.2.1 一致。
+- 最新补丁标签 `v2.2.1-mirror4`（`33a47f46`）：替换官方 2.2.1 NVIDIA 包中的 `veyra_qml_ui.exe`、`qml/Veyra/Main.qml`、`ProPage.qml`、`shaders/YuvToLinearRgb.dxil`。用户安装 `C:/Shared/Veyra` 为此版本。
+- 待定：更新公钥（当前未写入）；GitHub Release 未创建；采集卡交接时的镜像切换与流媒体/DeckLink/Magewell/AMD 实机未验证。记录见 [WORKLOG](WORKLOG.md) 2026-11-24。
+
 ## 2.2.0
 
 - 11 月 20 日社区修复覆盖导出续跑与文件恢复、硬解回退、字幕字体、Xbox 音频时钟、PS5 手柄、Moonlight 配对和虚拟摄像机。#203 实时翻译在「设置 → 播放 → 实时翻译设置」和专业模式的字幕菜单提供。本机模型与 CPU 运行库按需下载。构建和验收范围见 [工作日志](WORKLOG.md)。

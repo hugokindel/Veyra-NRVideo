@@ -1,5 +1,16 @@
 # 当前工作日志
 
+## 2026-11-24 Fork：镜像窗口 2.2.1 全功能构建与 Elgato 4K Pro 色度修复
+
+Fork `hugokindel/Veyra-NRVideo`，分支 `feature/mirror-output`。用户授权推送到该 fork；不推送、不评论上游 `Likely7/Veyra-NRVideo`。研发产物在 `D:/Projects/Veyra-work/{deps,build,logs,tests,tmp,releases}`（本机无 `E:/项目/Veyra`）。补丁包以官方 2.2.1 NVIDIA 包为底，只替换 exe、`Main.qml`、`ProPage.qml`（mirror4 起加 `shaders/YuvToLinearRgb.dxil`），沿用官方运行库。
+
+- 合并 `v2.2.1` → `59c94a8d`；采集 promote 交换时镜像改交给增强后的 presenter（`releaseMirror()`/`setMirror()`）。标签 `v2.2.1-mirror1`。
+- 全功能构建（`D:/Projects/Veyra-work/build-full.ps1`，`build/full`）：XeSS 3.0.2、FidelityFX 2.3.0 与 1.1.4 光流（/MT 自建）、AMF 1.5.3、ORT-DML 1.24.4（RIFE）、libdovi 3.4.0（私有 Rust 1.100，导出与官方 DLL 相同）、vcpkg `30ef65ca` x64-windows-static（OpenSSL/Opus/SDL3/libass/libdatachannel 等）+ pkgconf、Chiaki 暂存校验 `CHIAKI_STAGE_EXACT_PATCHES_VERIFIED`、Moonlight `MOONLIGHT_STAGE PASS`、DeckLink 12.0 IDL（obs-studio `0c790bd0`）、Magewell SDK 3.3.1.1596（用户下载，innoextract 解包，仅头文件）。configure 无 “unavailable in this build”；exe 依赖 89 个 DLL 与官方完全一致，不再需要 libcrypto。未写入更新公钥（防止应用内更新覆盖补丁 exe），待用户决定。详见 [镜像窗口](MIRROR_WINDOW_2026-11-20.md)。标签 `v2.2.1-mirror2`、`v2.2.1-mirror3`（加 Magewell）。
+- Elgato 4K Pro（`33a47f46`，标签 `v2.2.1-mirror4`）：用户以已知图样实测为标准限制范围色度（Cb 增益 1.004、Cr 1.012），从非 MK.2 全范围色度规则中排除；平坦中性灰在 Cb −0.94、Cr −1.20 码值，P010 下加每设备色度中心校正。用户复测：灰阶 RGB 相等，Auto 色度增益 1.00，Cr +0.1；彩色块 Cb 仍约 −1（随内容，来源未定）。详见 [Elgato 4K Pro 色度](ELGATO_4K_PRO_CHROMA_2026-11-24.md)。
+- 每轮验证：`veyra_mirror_output_gpu_tests` passed=1 debugErrors=0；`veyra_vfg_gpu_tests` 2521 项 0 失败；`veyra_capture_color_tests` failures=0；`veyra_hdr_color_tests` 全部通过；官方 2.2.1 便携包经 Veyra.exe 冒烟（镜像 attach/全屏/关闭，退出码 0）。补丁 ZIP 与 SHA256SUMS、RELEASE_NOTES 在 `D:/Projects/Veyra-work/releases/v2.2.1-mirror{1..4}`；GitHub Release 未创建（需浏览器手动）。
+- 用户安装 `C:/Shared/Veyra` 已为 mirror4；备份 `versions/2.2.1/_pre-mirror-backup`（官方原件）、`_mirror1-backup`、`_mirror3-backup`。
+- 未验证：Remote Play/Moonlight/Xbox/DeckLink/Magewell/AMD 路径仅编译；采集卡原始→增强交接时镜像切换（日志 `[mirror] detach ... next=1` 后应有新 attach）需用户实机。
+
 ## 2026-11-23 2.2.1 录制与 GPU 性能修复重打包
 
 - 从已验收的 2.2.1 `9e428c54` 继续，移植 Asphalt 报告确认的三项行为到现有共享链路。录制和回放以源尺寸判断换段，编码尺寸向上补齐偶数，已有单次 NV12/P010 转换延展最右列和最下一行。调色仅在需要清晰度或正向去朦胧时计算低分辨率统计。双超分首段模型旁路时以实际首段输入直接降采样，省去 RGBA16F 中间纹理和同尺寸复制。
@@ -261,7 +272,7 @@ USB 采集同图音频启动失败可退回纯视频，连续两次重开无帧�
 
 ## 2026-11-20 镜像窗口（第二屏同画面输出）
 
-分支 `feature/mirror-output`（基于 main `eb5fd6d0`），仅本地提交，未 push/Release。需求：用户希望在显示器与电视上同时看 Veyra 输出，Windows“复制”模式会关闭 HDR，所以改为“扩展”模式下的第二个可拖动窗口。设计与限制见 [镜像窗口](MIRROR_WINDOW_2026-11-20.md)。
+分支 `feature/mirror-output`（基于 main `eb5fd6d0`），当时仅本地提交，未 push/Release（后续已推送到 fork 并补齐全部功能，见 2026-11-24 条目）。需求：用户希望在显示器与电视上同时看 Veyra 输出，Windows“复制”模式会关闭 HDR，所以改为“扩展”模式下的第二个可拖动窗口。设计与限制见 [镜像窗口](MIRROR_WINDOW_2026-11-20.md)。
 
 - 引擎：`MirrorOutputLink` + `VideoPresenter` 第二个 `PresentSink`，与主画面同一着色器、常量、源和格式，同一命令列表录制，主 Present 之后 `Present(0,0)`；延迟 1 帧并以零超时轮询，忙则跳帧，不回读、不等待。XeSS-FG 时报告不支持。主画面区为 0（关闭中）也会处理镜像释放。
 - 界面：GUI 线程 Win32 `MirrorWindow`（双击/F11/Alt+Enter 全屏、Esc 退出、全屏 2 秒隐藏光标、关闭即隐藏、位置记忆），专业页“镜像窗口”开关与 Ctrl+M，测试开关 `--mirror-window <open-ms>[,fullscreen-ms[,close-ms]]`；6 条新文案 9 种语言，`scripts/i18n/extract.py --check` 缺失 0。

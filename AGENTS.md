@@ -2,6 +2,16 @@
 
 更新：2026-11-19。当前任务为整合各功能与修复至本地 main，版本源码 2.2.0。用户要求本轮先不构建。旧规则全文在[归档](docs/history/rules/AGENTS_before_main_2026-11-18.md)，其中带日期的施工树、版本与授权属于当时记录，不能覆盖用户后续指令。
 
+## Fork 说明（hugokindel/Veyra-NRVideo，2026-11-24）
+
+本节只适用于该 fork 的本机工作，优先于下文针对上游主线的路径与发布规则。
+
+- 仓库 `D:/Projects/Veyra-NRVideo`，`origin` = fork，`upstream` = `Likely7/Veyra-NRVideo`。工作分支 `feature/mirror-output`。可推送分支与标签到 fork；不得推送、评论或发布到上游。
+- 本机没有 `E:/项目/Veyra`：依赖、构建、日志、测试、临时与补丁包放在 `D:/Projects/Veyra-work/{deps,build,logs,tests,tmp,releases}`。全功能构建脚本 `D:/Projects/Veyra-work/build-full.ps1`（`build/full`）；依赖来源见 [镜像窗口](docs/MIRROR_WINDOW_2026-11-20.md) 的 Full-feature build 节。
+- 交付形式是覆盖官方 2.2.1 NVIDIA 包的补丁（exe + 改动的 QML/着色器），沿用官方运行库；新补丁用新标签 `v2.2.1-mirrorN`，不移动已推送标签。改动着色器时必须把对应 DXIL 放入补丁并逐一比对哈希。
+- 用户安装在 `C:/Shared/Veyra`，只在用户要求且 Veyra 已关闭时替换，替换前备份到 `versions/2.2.1/_*-backup`。不要启动用户安装去打开采集卡；冒烟测试用 `D:/Projects/Veyra-work/tests/mirror-on-221` 的官方便携包副本和视频文件。
+- Elgato 4K Pro 的色度中心校正是实测常数（见 [记录](docs/ELGATO_4K_PRO_CHROMA_2026-11-24.md)），修改需新的图样测量。
+
 ## 入口与当前状态
 
 - 唯一主线源码：`E:/项目/Veyra/worktrees/main-claude-anr-20261113`，分支`main`。桌面旧工程保留共用`.git`与未提交工作，不能按旧副本删除。
