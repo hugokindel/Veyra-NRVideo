@@ -4,7 +4,7 @@
 
 ## Fork 说明（hugokindel/Veyra-NRVideo，2026-11-24）
 
-本节只适用于该 fork 的本机工作，优先于下文针对上游主线的路径与发布规则。
+本节只适用于该 fork 的本机工作，优先于下文针对上游主线的路径与发布规则。**合并上游新版本前先读 [docs/FORK.md](docs/FORK.md)**：fork 改动的文件清单、合并后必须复查的点（尤其每处 VideoPresenter 创建/交换都要移交镜像）、依赖与构建脚本 `scripts/fork/`、测试、补丁审计步骤。上游若改写本文件导致本节丢失，从 FORK.md 恢复。
 
 - 仓库 `D:/Projects/Veyra-NRVideo`，`origin` = fork，`upstream` = `Likely7/Veyra-NRVideo`。工作分支 `feature/mirror-output`。可推送分支与标签到 fork；不得推送、评论或发布到上游。
 - 本机没有 `E:/项目/Veyra`：依赖、构建、日志、测试、临时与补丁包放在 `D:/Projects/Veyra-work/{deps,build,logs,tests,tmp,releases}`。全功能构建脚本 `D:/Projects/Veyra-work/build-full.ps1`（`build/full`）；依赖来源见 [镜像窗口](docs/MIRROR_WINDOW_2026-11-20.md) 的 Full-feature build 节。

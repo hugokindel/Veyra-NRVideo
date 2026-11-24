@@ -8,6 +8,7 @@
 
 - 基于官方 2.2.1，加入[镜像窗口](MIRROR_WINDOW_2026-11-20.md)（扩展模式第二窗口，同一最终画面，两屏保留 HDR）与 [Elgato 4K Pro 色度修复](ELGATO_4K_PRO_CHROMA_2026-11-24.md)。全功能构建，exe 依赖与官方 2.2.1 一致。
 - 最新补丁标签 `v2.2.1-mirror4`（`33a47f46`）：替换官方 2.2.1 NVIDIA 包中的 `veyra_qml_ui.exe`、`qml/Veyra/Main.qml`、`ProPage.qml`、`shaders/YuvToLinearRgb.dxil`。用户安装 `C:/Shared/Veyra` 为此版本。
+- 合并上游、构建、测试与打包流程见 [FORK.md](FORK.md)；构建脚本在 `scripts/fork/`。
 - 待定：更新公钥（当前未写入）；GitHub Release 未创建；采集卡交接时的镜像切换与流媒体/DeckLink/Magewell/AMD 实机未验证。记录见 [WORKLOG](WORKLOG.md) 2026-11-24。
 
 ## 2.2.0
