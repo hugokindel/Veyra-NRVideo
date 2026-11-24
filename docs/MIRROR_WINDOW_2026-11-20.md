@@ -75,3 +75,23 @@ as the switch, for unattended runtime checks.
   0 failures; patch on the official 2.2.1 NVIDIA portable via its launcher: VFG initialised, mirror
   attach/fullscreen/close (787 presents), clean exit. The capture-card handover itself was not run
   (needs the capture device); look for `[mirror] detach ... next=1` then a new `[mirror] attach`.
+
+## Full-feature build (2026-11-24)
+
+Same source; only the build environment changed, so the exe matches the official 2.2.1 feature set
+(`dumpbin /dependents`: the same 89 DLL imports as the official exe, no libcrypto DLL any more).
+- Public SDKs at the commits in `scripts/ci/fetch-sdks.ps1`: XeSS 3.0.2, FidelityFX 2.3.0, AMF 1.5.3;
+  ONNX Runtime DirectML 1.24.4 + DirectML 1.15.4 NuGet (RIFE); FidelityFX 1.1.4 `ffx_opticalflow_x64` and
+  `ffx_backend_dx12_x64` built from tag v1.1.4 with `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` (AMD OF).
+- libdovi 3.4.0 from dovi_tool `d1abe0e2` with the command in DEVELOPMENT.md (Rust 1.100); its 24 exports
+  equal the official `dolby_vision.dll`, which the package keeps providing.
+- vcpkg `30ef65ca` x64-windows-static (OpenSSL 3.6.4, Opus 1.6.1, SDL3 3.4.14, libass 0.17.5,
+  libdatachannel 0.24.5 with the repo's libjuice overlay, protobuf, curl, json-c, libevent, miniupnpc) and
+  `pkgconf` (x64-windows) for Chiaki's json-c lookup.
+- Chiaki-ng `0e169501` + patches 0001-0005 (CHIAKI_STAGE_EXACT_PATCHES_VERIFIED); moonlight-common-c
+  `f900dd47` (MOONLIGHT_STAGE PASS); nanopb generator with protobuf 6.33 in a private venv.
+- DeckLink: Win IDL set of SDK 12.0 from obs-studio `0c790bd0` (plugins/decklink/win/decklink-sdk).
+- Not included: Magewell (the MWCapture SDK 3.3.1.1596 download needs Magewell registration) and the update
+  public key (left empty on purpose: in-app update would replace this exe with the official one).
+- Checks: mirror GPU test passed=1 debugErrors=0; VFG GPU test 2521 checks 0 failures; official 2.2.1 portable
+  via Veyra.exe: VFG, mirror attach/fullscreen/close (801 presents), clean exit.
