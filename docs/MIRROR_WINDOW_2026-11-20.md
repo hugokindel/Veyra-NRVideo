@@ -62,3 +62,16 @@ as the switch, for unattended runtime checks.
   against the graph output, contain-fit pillarbox, hidden-window skips, settled resize, paused
   re-present, detach/reattach, close → waiting, D3D12 debug layer clean.
 - Actual results of this round are in [WORKLOG](WORKLOG.md).
+
+## Rebased on 2.2.1 (2026-11-24)
+
+- Merged `v2.2.1`. Conflicts were adjacent includes, the frame-statistics overlay next to the mirror
+  draw (both kept; the overlay is drawn on the player only, like subtitles) and the presenter, which is
+  now a `unique_ptr`.
+- 2.2.1 starts capture with a raw-preview presenter and swaps in a separately prepared enhanced
+  presenter. A window holds one swap chain, so the swap calls `VideoPresenter::releaseMirror()` on the
+  outgoing presenter and `setMirror` on the new one; the mirror re-attaches on the next frame.
+- Checks: `veyra_mirror_output_gpu_tests` passed=1 debugErrors=0; `veyra_vfg_gpu_tests` 2521 checks
+  0 failures; patch on the official 2.2.1 NVIDIA portable via its launcher: VFG initialised, mirror
+  attach/fullscreen/close (787 presents), clean exit. The capture-card handover itself was not run
+  (needs the capture device); look for `[mirror] detach ... next=1` then a new `[mirror] attach`.
