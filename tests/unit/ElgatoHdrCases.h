@@ -169,6 +169,40 @@ template<class Check> void elgatoHdrCases(Check check) {
         source::ElgatoHdrControl control;
         check(control.configure(&ps,L"Other Capture",false,0,color)&&ps.gets==0&&ps.sets==0&&!color.fullRangeChroma,"other devices receive zero vendor calls for 8-bit formats");
     }
+    // Elgato 4K Pro: measured standard limited chroma (Cb gain 1.004, Cr 1.012 on a
+    // known pattern) and a constant chroma centre offset of about -1 code.
+    constexpr auto pro4k=L"Elgato 4K Pro";
+    check(source::isElgato4kPro(pro4k)&&source::isElgato4kPro(L"elgato 4k pro")&&source::isElgato4kPro(L"Game Capture 4K Pro")&&
+          !source::isElgato4kPro(L"Elgato 4K60 Pro")&&!source::isElgato4kPro(name)&&!source::isElgato4kPro(x4k)&&!source::isElgatoMk2(pro4k)&&source::isElgatoDevice(pro4k),
+          "4K Pro exact device aliases only (not the 4K60 Pro family)");
+    ps={};ps.hdr();color=defaults();{
+        source::ElgatoHdrControl control;
+        check(control.configure(&ps,pro4k,true,0,color)&&ps.mode==0&&color.transfer==pipeline::TransferFunction::PQ&&color.range==pipeline::ColorRange::Limited&&!color.fullRangeChroma,
+              "4K Pro P010: standard limited chroma (excluded from the non-MK.2 full-range chroma rule)");
+        check(color.chromaCentreCodes[0]==source::kElgato4kProChromaCentreCodes[0]&&color.chromaCentreCodes[1]==source::kElgato4kProChromaCentreCodes[1]&&
+              color.chromaCentreCodes[0]>0.5f&&color.chromaCentreCodes[1]>0.5f,"4K Pro P010 carries the measured chroma centre correction");
+        check(control.configure(&ps,pro4k,true,0,color)&&color.chromaCentreCodes[0]==source::kElgato4kProChromaCentreCodes[0],"4K Pro correction is assigned, not accumulated, on reconfigure");
+    }
+    ps={};ps.rejectSet=true;ps.readableMode=false;color=defaults();{
+        source::ElgatoHdrControl control;
+        check(control.configure(&ps,pro4k,true,1,color)&&!color.fullRangeChroma&&color.chromaCentreCodes[1]==source::kElgato4kProChromaCentreCodes[1],
+              "4K Pro correction does not depend on the vendor property set");
+    }
+    ps={};ps.hdr();color=defaults();{
+        source::ElgatoHdrControl control;
+        check(control.configure(&ps,pro4k,false,0,color)&&color.chromaCentreCodes[0]==0&&color.chromaCentreCodes[1]==0,"4K Pro 8-bit (card tonemapped) has no correction: it was not measured");
+    }
+    ps={};ps.hdr();color=defaults();{
+        source::ElgatoHdrControl control;
+        check(control.configure(&ps,x4k,true,0,color)&&color.chromaCentreCodes[0]==0&&color.chromaCentreCodes[1]==0,"other Elgato cards keep a zero chroma centre correction");
+    }
+    {
+        const float none[2]{0,0},fix[2]{0.94f,1.2f},neg[2]{-1.0f,-20.0f};
+        const auto field=[](uint32_t w,int i){return int(int8_t(uint8_t(w>>(8+8*i))));};
+        const uint32_t a=pipeline::packYuvChromaWord(3,none),b=pipeline::packYuvChromaWord(2,fix),c=pipeline::packYuvChromaWord(0,neg);
+        check(a==3&&(b&0xFFu)==2&&field(b,0)==15&&field(b,1)==19&&(b>>24)==0&&field(c,0)==-16&&field(c,1)==-127,
+              "chroma word: location in bits 0..7, Cb/Cr centre in signed 1/16-code steps, clamped");
+    }
     ps={};color=defaults();{
         source::ElgatoHdrControl control;
         check(control.configure(&ps,name,true,0,color)&&ps.sets==0&&color.transfer==pipeline::TransferFunction::SRGB,"zero SDR packet never enables HDR");

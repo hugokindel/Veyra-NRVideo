@@ -171,12 +171,30 @@ struct ColorDescription {
     // 4K60 Pro MK.2 encode HDR P010 this way (Nitlink, measured against the
     // console on the TV). Decoding that chroma as limited over-saturates it.
     bool fullRangeChroma = false;
+    // Per-device chroma centre correction in 10-bit code units (Cb, Cr), added
+    // to the chroma samples before the YUV decode. Zero for every source except
+    // a capture card whose neutral grey was measured off centre (Elgato 4K Pro).
+    // The shader carries it in 1/16 code steps, clamped to +/-7.9 codes.
+    float chromaCentreCodes[2] = {0.0f, 0.0f};
     bool dolbyVisionP84 = false; // Declared HLG-compatible HEVC base layer.
 
     bool isHdrPath() const {
         return scRgb || transfer == TransferFunction::PQ || transfer == TransferFunction::HLG;
     }
 };
+
+// YuvToLinearRgb yuvDimensions.w: chroma location in bits 0..7, chroma centre
+// correction as signed 1/16-code steps in bits 8..15 (Cb) and 16..23 (Cr).
+inline uint32_t packYuvChromaWord(uint32_t chromaLocation, const float centreCodes[2]) {
+    uint32_t word = chromaLocation & 0xFFu;
+    for (int i = 0; i < 2; ++i) {
+        const float steps = centreCodes[i] * 16.0f;
+        int value = int(steps + (steps < 0 ? -0.5f : 0.5f));
+        value = value < -127 ? -127 : value > 127 ? 127 : value;
+        word |= (uint32_t(value) & 0xFFu) << (8 + 8 * i);
+    }
+    return word;
+}
 
 enum class FrameFlagBits : uint32_t {
     None            = 0,

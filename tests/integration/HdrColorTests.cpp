@@ -157,7 +157,7 @@ int wmain(int argc,wchar_t** argv){
   // Elgato non-MK.2 P010 (limited luma, full-range chroma): chroma code c decoded
   // as full range must equal the standard limited decode of 512+(c-512)*896/1023,
   // and must be less saturated than decoding the same code as limited.
-  const auto decode=[&](unsigned vCode,bool fullChroma,float rgb[3])->bool{
+  const auto decode=[&](unsigned vCode,bool fullChroma,float rgb[3],unsigned uCode=512,float cbFix=0,float crFix=0)->bool{
    pipeline::EnhanceGraph graph(ctx,ring);pipeline::EnhanceGraphDesc gd;
    gd.sourceWidth=gd.workWidth=64;gd.sourceHeight=gd.workHeight=32;gd.enableNr=gd.enableFg=gd.enableSr=false;gd.noFeatures=true;gd.hdrInput=true;gd.hdrOutput=true;
    gd.hdrOutputMode=engine::HdrOutputMode::ScRgb;
@@ -165,9 +165,9 @@ int wmain(int argc,wchar_t** argv){
    AVFrame* f=av_frame_alloc();f->width=64;f->height=32;f->format=AV_PIX_FMT_P010;f->color_range=AVCOL_RANGE_MPEG;f->colorspace=AVCOL_SPC_BT2020_NCL;f->color_trc=AVCOL_TRC_SMPTE2084;f->color_primaries=AVCOL_PRI_BT2020;
    if(av_frame_get_buffer(f,32)<0){av_frame_free(&f);return false;}
    for(unsigned y=0;y<32;++y)for(unsigned x=0;x<64;++x)reinterpret_cast<uint16_t*>(f->data[0]+y*f->linesize[0])[x]=uint16_t(509u<<6); // ~100 cd/m2
-   for(unsigned y=0;y<16;++y)for(unsigned x=0;x<32;++x){auto* row=reinterpret_cast<uint16_t*>(f->data[1]+y*f->linesize[1]);row[x*2]=uint16_t(512u<<6);row[x*2+1]=uint16_t(vCode<<6);}
+   for(unsigned y=0;y<16;++y)for(unsigned x=0;x<32;++x){auto* row=reinterpret_cast<uint16_t*>(f->data[1]+y*f->linesize[1]);row[x*2]=uint16_t(uCode<<6);row[x*2+1]=uint16_t(vCode<<6);}
    pipeline::ColorDescription color;color.pixelFormat=pipeline::SourcePixelFormat::P010;color.transfer=pipeline::TransferFunction::PQ;color.matrix=pipeline::YuvMatrix::BT2020NCL;
-   color.range=pipeline::ColorRange::Limited;color.fullRangeChroma=fullChroma;
+   color.range=pipeline::ColorRange::Limited;color.fullRangeChroma=fullChroma;color.chromaCentreCodes[0]=cbFix;color.chromaCentreCodes[1]=crFix;
    pipeline::EnhanceGraph::FrameOutputs out;bool ok=graph.process(f,0,true,out,1,&color);
    if(ok){
     auto* texture=graph.videoFrameResource(out.videoSlot);auto desc=texture->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 size=0;ctx.device()->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&size);
@@ -191,6 +191,15 @@ int wmain(int argc,wchar_t** argv){
   ok=ok&&sameError<.02&&limited[0]>fullChroma[0]*1.05;
   std::cout<<"HDR_P010_FULL_CHROMA full="<<fullChroma[0]<<","<<fullChroma[1]<<","<<fullChroma[2]<<" equivalentLimited="<<equivalent[0]<<","<<equivalent[1]<<","<<equivalent[2]
            <<" sameCodeLimited="<<limited[0]<<","<<limited[1]<<","<<limited[2]<<" relativeError="<<sameError<<" pass="<<ok<<std::endl;if(!ok)++failures;
+  // Per-device chroma centre (Elgato 4K Pro): grey sent at Cb=Cr=511 decodes
+  // neutral with a +1 code correction, and off-neutral (blue/red low) without.
+  float grey[3]{},offCentre[3]{},corrected[3]{};
+  bool centreOk=decode(512,false,grey)&&decode(511,false,offCentre,511)&&decode(511,false,corrected,511,1.0f,1.0f);
+  const auto spread=[](const float* v){return std::max({v[0],v[1],v[2]})-std::min({v[0],v[1],v[2]});};
+  double fixedError=0;for(unsigned c=0;c<3;++c)fixedError=std::max(fixedError,double(std::abs(corrected[c]-grey[c]))/std::max(.05,double(std::abs(grey[c]))));
+  centreOk=centreOk&&fixedError<.002&&spread(offCentre)>spread(grey)*4+1e-4f&&offCentre[2]<offCentre[1]&&offCentre[0]<offCentre[1];
+  std::cout<<"HDR_P010_CHROMA_CENTRE grey="<<grey[0]<<","<<grey[1]<<","<<grey[2]<<" offCentre="<<offCentre[0]<<","<<offCentre[1]<<","<<offCentre[2]
+           <<" corrected="<<corrected[0]<<","<<corrected[1]<<","<<corrected[2]<<" relativeError="<<fixedError<<" pass="<<centreOk<<std::endl;if(!centreOk)++failures;
  }
  if(argc>1)for(unsigned mode=0;mode<3;++mode)for(bool hardware:{false,true}){
   source::MediaFileSource source;source::SourceOpenDesc sd;sd.path=argv[1];sd.preferHardwareDecode=hardware;sd.d3d12Device=ctx.device();sd.d3d12Queue=ctx.directQueue();

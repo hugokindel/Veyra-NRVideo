@@ -13,6 +13,14 @@ struct ElgatoHdrPacket {
     float peak=0, maxCll=0, maxFall=0;
 };
 bool isElgatoMk2(std::wstring_view name);
+// Elgato 4K Pro (PCIe): standard limited-range chroma like the MK.2 (measured),
+// plus a small constant chroma centre offset that configure() corrects.
+bool isElgato4kPro(std::wstring_view name);
+// 4K Pro chroma centre correction in 10-bit codes (Cb, Cr), added before decode.
+// It cancels the measured neutral-grey error of Cb -0.94 / Cr -1.20 codes (flat
+// patches of three PS5 HDR pages and the PS5 SDR->HDR test pattern, P010,
+// Input range = Limited, 2026-11-24).
+inline constexpr float kElgato4kProChromaCentreCodes[2]={0.94f,1.2f};
 // Any Elgato capture filter: "Elgato ..." names and the "Game Capture ..." family.
 bool isElgatoDevice(std::wstring_view name);
 ElgatoHdrPacket parseElgatoHdrPacket(const std::array<unsigned char,32>& bytes);

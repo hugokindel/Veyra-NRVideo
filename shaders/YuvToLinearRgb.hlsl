@@ -9,7 +9,9 @@
 cbuffer YuvParams : register(b0)
 {
     float4 colorParams0; // x=range (0 full, 1 limited, 2 limited luma/full chroma) y=matrix z=transfer w=bit depth class
-    uint4 yuvDimensions; // x=width y=height z=bit0 nativeHDR, bit1 BT2020 primaries; w=chroma location
+    uint4 yuvDimensions; // x=width y=height z=bit0 nativeHDR, bit1 BT2020 primaries;
+                         // w=bits 0..7 chroma location, bits 8..15 / 16..23 signed Cb / Cr
+                         // centre correction in 1/16 10-bit code steps (per-device, usually 0)
     float4 toneMapParams; // x=validated source peak nits, y=SDR target peak nits
                           // Custom: z=exposure in EV, w=shoulder (1.0 = the
                           // previous fixed knee). z/w were unused before.
@@ -65,8 +67,11 @@ float3 YuvToRgb(float y, float2 uv)
     bool limitedLuma=colorParams0.x>0.5,limitedChroma=limitedLuma&&colorParams0.x<1.5;
     float yy=limitedLuma?(y*scale-black)/(white-black):y*scale/maximum;
     yy=saturate(yy);
-    float uu=(uv.x*scale-middle)/(limitedChroma?span:maximum);
-    float vv=(uv.y*scale-middle)/(limitedChroma?span:maximum);
+    // Per-device chroma centre correction, 10-bit codes rescaled to this depth.
+    const float codeUnit=(maximum+1.0)/1024.0/16.0;
+    const float2 centreFix=float2(asint(yuvDimensions.w<<16)>>24,asint(yuvDimensions.w<<8)>>24)*codeUnit;
+    float uu=(uv.x*scale+centreFix.x-middle)/(limitedChroma?span:maximum);
+    float vv=(uv.y*scale+centreFix.y-middle)/(limitedChroma?span:maximum);
 
     if(colorParams0.y>1.5){
         // BT.2020 non-constant-luminance coefficients.
@@ -146,7 +151,7 @@ float3 DoviP5ToPqBt2020(float luma,float2 chroma)
 
 float2 ReconstructChroma(uint2 pixel)
 {
-    uint location=yuvDimensions.w;
+    uint location=yuvDimensions.w&0xFFu;
     if(location==0)return chromaPlane[pixel/2];
     // Chroma sample origin in luma pixel-center coordinates. Respect MPEG
     // left, JPEG center and vertical top/bottom placement; no luma filtering.

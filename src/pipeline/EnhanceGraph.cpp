@@ -3563,7 +3563,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             resolved.matrix==YuvMatrix::BT2020NCL?2.0f:resolved.matrix==YuvMatrix::BT601?0.0f:1.0f,
             resolved.transfer==TransferFunction::HLG?5.0f:resolved.transfer==TransferFunction::PQ?4.0f:float(workingTransferCode(resolved)), (nv12Texture?(nv12Texture->GetDesc().Format==DXGI_FORMAT_P010?1.0f:0.0f):(desc_.captureBitDepth==16?2.0f:desc_.wideYuvInput()?1.0f:0.0f)),
             uintBits(srcW_), uintBits(srcH_), uintBits((desc_.hdrWorking()?1u:0u)|(resolved.primaries==ColorPrimaries::BT2020?2u:0u)),
-            uintBits(resolved.reconstructChroma?std::max(1u,unsigned(resolved.chromaLocation)):0u),toneMapPeakNits_,203.0f,0,0 };
+            uintBits(packYuvChromaWord(resolved.reconstructChroma?std::max(1u,unsigned(resolved.chromaLocation)):0u,resolved.chromaCentreCodes)),toneMapPeakNits_,203.0f,0,0 };
         if(grade)packColorGradeConstants(colorTables_,constants+12);
         // Dolby Vision profile 5: written on every frame because the enable flag
         // lives inside the block, so switching source content back to ordinary

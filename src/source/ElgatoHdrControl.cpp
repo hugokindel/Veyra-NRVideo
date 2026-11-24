@@ -37,6 +37,12 @@ bool isElgatoMk2(std::wstring_view name) {
         if(CompareStringOrdinal(name.data(),int(name.size()),alias,-1,TRUE)==CSTR_EQUAL)return true;
     return false;
 }
+bool isElgato4kPro(std::wstring_view name) {
+    // Exact filter names only: "4K60 Pro" (MK.1/MK.2) are different cards.
+    for(const auto* alias:{L"Elgato 4K Pro",L"Game Capture 4K Pro",L"Elgato Game Capture 4K Pro"})
+        if(CompareStringOrdinal(name.data(),int(name.size()),alias,-1,TRUE)==CSTR_EQUAL)return true;
+    return false;
+}
 bool isElgatoDevice(std::wstring_view name) {
     // Same identity rule as Nitlink plus the vendor's "Game Capture ..." filter
     // names (HD60 X/S+, 4K60 Pro/S+). Generic names never enter this path.
@@ -129,12 +135,24 @@ bool ElgatoHdrControl::configure(IUnknown* filter,std::wstring_view name,bool p0
     if(!validCaptureColorOverride(overrideValue))return false;
     const bool mk2=isElgatoMk2(name);
     const unsigned space=captureColorSpace(overrideValue);
+    const bool pro4k=isElgato4kPro(name);
     // Nitlink: Elgato cards other than the MK.2 send HDR P010 with limited luma
-    // and full-range chroma (MK.2 uses standard 64..960 chroma). An explicit
-    // range choice by the user stays authoritative.
-    if(p010&&!mk2&&!captureColorRange(overrideValue)&&color.range!=pipeline::ColorRange::Full) {
+    // and full-range chroma (MK.2 uses standard 64..960 chroma). The 4K Pro was
+    // measured with standard limited chroma (Cb gain 1.004, Cr 1.012 against a
+    // known pattern), so it is excluded as well. An explicit range choice by the
+    // user stays authoritative.
+    if(p010&&!mk2&&!pro4k&&!captureColorRange(overrideValue)&&color.range!=pipeline::ColorRange::Full) {
         color.fullRangeChroma=true;
         log::info("capture-elgato",std::format("non-MK.2 Elgato P010: limited luma, full-range chroma (Nitlink policy) device={}",narrowForLog(name)));
+    }
+    if(p010&&pro4k) {
+        // Constant code-level offset of this card's chroma centre (assigned, not
+        // accumulated, so a reconnect keeps the same value). Independent of the
+        // range choice: it shifts the codes, not their scale.
+        color.chromaCentreCodes[0]=kElgato4kProChromaCentreCodes[0];
+        color.chromaCentreCodes[1]=kElgato4kProChromaCentreCodes[1];
+        log::info("capture-elgato",std::format("Elgato 4K Pro P010: standard limited chroma, chroma centre correction Cb={:+.2f} Cr={:+.2f} codes",
+                                               color.chromaCentreCodes[0],color.chromaCentreCodes[1]));
     }
     auto hr=filter->QueryInterface(IID_PPV_ARGS(&properties_));
     record("QueryInterface",0,hr,0);
@@ -191,7 +209,7 @@ bool ElgatoHdrControl::configure(IUnknown* filter,std::wstring_view name,bool p0
         color.hdrMaxCllNits=packet.maxCll;
         color.hdrMaxFallNits=packet.maxFall;
     }
-    log::info("capture-elgato",std::format("P010 hardwareTonemap={} mk2={} manualSpace={} sourceEotf={} nativeHdrRequested={} fullRangeChroma={}",desired,mk2,space,packet.eotf,wantHdr,color.fullRangeChroma));
+    log::info("capture-elgato",std::format("P010 hardwareTonemap={} mk2={} manualSpace={} sourceEotf={} nativeHdrRequested={} fullRangeChroma={} chromaCentre={:+.2f}/{:+.2f}",desired,mk2,space,packet.eotf,wantHdr,color.fullRangeChroma,color.chromaCentreCodes[0],color.chromaCentreCodes[1]));
     return true;
 }
 ElgatoHdrControl::~ElgatoHdrControl() {
