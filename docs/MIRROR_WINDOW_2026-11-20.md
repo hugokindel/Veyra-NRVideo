@@ -91,7 +91,11 @@ Same source; only the build environment changed, so the exe matches the official
 - Chiaki-ng `0e169501` + patches 0001-0005 (CHIAKI_STAGE_EXACT_PATCHES_VERIFIED); moonlight-common-c
   `f900dd47` (MOONLIGHT_STAGE PASS); nanopb generator with protobuf 6.33 in a private venv.
 - DeckLink: Win IDL set of SDK 12.0 from obs-studio `0c790bd0` (plugins/decklink/win/decklink-sdk).
-- Not included: Magewell (the MWCapture SDK 3.3.1.1596 download needs Magewell registration) and the update
-  public key (left empty on purpose: in-app update would replace this exe with the official one).
+- Magewell (v2.2.1-mirror3): MWCapture SDK 3.3.1.1596 for Windows (vendor download, registration required;
+  installer unpacked with innoextract 1.9, ``VEYRA_MAGEWELL_SDK_DIR=<unpacked>/app/SDKv3``). Headers only;
+  the package's ``runtime\magewell\LibMWCapture.dll`` is loaded at run time. The exe's MW* API names equal
+  the official exe's (21/21).
+- Not included: the update public key (left empty on purpose: in-app update would replace this exe with
+  the official one).
 - Checks: mirror GPU test passed=1 debugErrors=0; VFG GPU test 2521 checks 0 failures; official 2.2.1 portable
   via Veyra.exe: VFG, mirror attach/fullscreen/close (801 presents), clean exit.
