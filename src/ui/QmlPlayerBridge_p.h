@@ -3,6 +3,7 @@
 // Public QML API, ownership, polling and settings contracts remain in QmlPlayerBridge.h.
 #include "veyra/media/FFmpegDeinterlacer.h"
 #include "veyra/ui/QmlPlayerBridge.h"
+#include "StartupFullscreenRequest.h"
 #include "veyra/gfx/PresentSink.h"
 #include "veyra/gfx/NvidiaVrr.h"
 #include "veyra/media/NetworkInput.h"
@@ -46,6 +47,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QPointer>
 #include <QHash>
 #include <QFile>
 #include <QSaveFile>
@@ -78,7 +80,7 @@
 #include "veyra/source/CaptureFrameRate.h"
 #include "veyra/source/MagewellCapture.h"
 #include "CapturePreferenceStore.h"
-#ifdef VEYRA_ENABLE_REMOTEPLAY
+#if defined(VEYRA_ENABLE_REMOTEPLAY) || defined(VEYRA_ENABLE_XBOX)
 // SDL3-static's system libraries (see CMakeLists: kept off the link line).
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "imm32.lib")
@@ -86,6 +88,8 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "dinput8.lib")
 #include "veyra/remoteplay/ControllerInput.h"
+#endif
+#ifdef VEYRA_ENABLE_REMOTEPLAY
 #include "veyra/remoteplay/Discovery.h"
 #include "veyra/remoteplay/ProfileStore.h"
 #include "veyra/source/RemotePlaySource.h"
@@ -93,8 +97,10 @@
 #ifdef VEYRA_ENABLE_XBOX
 #include "veyra/ui/XboxModel.h"
 #endif
+#if defined(VEYRA_ENABLE_REMOTEPLAY) || defined(VEYRA_ENABLE_MOONLIGHT) || defined(VEYRA_ENABLE_XBOX)
+#include "veyra/ui/StreamInputCapture.h"
+#endif
 #ifdef VEYRA_ENABLE_MOONLIGHT
-#include "veyra/ui/MoonlightInputCapture.h"
 #include "veyra/ui/MoonlightModel.h"
 #endif
 #include <future>
@@ -218,6 +224,7 @@ struct QmlPlayerBridge::Impl {
     QQmlEngine* qmlEngine = nullptr;
     engine::EngineController& engine;
     PlayerUiFacade facade;
+    QPointer<PlaybackServer> localCaptureServer;
 
     // Announce the effective format on the first picture and on format changes.
     std::unique_ptr<media::FormatBadgeWindow> formatBadge;
@@ -231,6 +238,7 @@ struct QmlPlayerBridge::Impl {
     bool haveSnapshot = false;
     bool openingSource = false;
     uint64_t openingSessionId = 0;
+    ui::StartupFullscreenRequest startupFullscreen;
     uint64_t vramNoticeSession = 0;   // the session the video-memory warning was shown for
     uint64_t tearingNoticeSession = 0;
 
@@ -267,7 +275,7 @@ struct QmlPlayerBridge::Impl {
     engine::ChainSession savedSession;
     QTimer* sessionSaveTimer = nullptr;
     // 音量 is a shell preference (2026-11-08); a drag is written once it settles.
-    QTimer* volumeSaveTimer = nullptr;
+    QTimer* prefsSaveTimer = nullptr;
     int selectedNr=-1;
     int nrIndex() const {
         if(selectedNr>=0&&uint32_t(selectedNr)<chain.nodeCount&&
@@ -355,7 +363,7 @@ struct QmlPlayerBridge::Impl {
     std::filesystem::path dataDir;
     PlaylistModel* playlist = nullptr;
     QString playlistPath;
-    uint64_t playlistSession = 0, playlistCompletedSession = 0;
+    uint64_t playlistSession = 0, playlistCompletedSession = 0, networkHistorySession = 0;
     // --- subtitles (ported from the Win32 shell, same semantics) ---
     std::unique_ptr<engine::SubtitleLoader> subLoader;
     // Embedded-subtitle scan of a file on a server (#48): reads only while playback has its own
@@ -405,6 +413,7 @@ struct QmlPlayerBridge::Impl {
   QString hdrProfileDisplay;
   // Custom: the title whose curve is currently applied (see syncHdrTitleProfile).
   QString hdrTitleApplied;
+  uint64_t hdrTitleLookupSession=0;
   HMONITOR hdrIdentityMonitor=nullptr;
   QString hdrIdentityKey;
   bool hdrRestoring=false,hdrCoverageObserved=false,hdrMemoryDirty=false;
@@ -431,11 +440,20 @@ struct QmlPlayerBridge::Impl {
     double resumeAt = 0;
     std::vector<sink::RenderEndpoint> audioEndpoints;
     // --- capture connection (P4-e) ---
-    struct CaptureQuery { int kind = 0; std::wstring device,requestedResolution; std::vector<source::CaptureDevice> video, audio; std::vector<source::CaptureFormat> formats;source::CaptureFormatQueryInfo info; };
+    struct CaptureQueryRequest { int kind = 0; std::wstring device; bool startupFullscreen = false; };
+    struct CaptureQuery : CaptureQueryRequest {
+        std::wstring requestedResolution;
+        std::vector<source::CaptureDevice> video, audio;
+        std::vector<source::CaptureFormat> formats;
+        source::CaptureFormatQueryInfo info;
+        bool virtualAudioInstalled = false;
+    };
     std::future<CaptureQuery> captureQuery;
-    std::optional<std::pair<int,std::wstring>> captureNextQuery;
-    bool captureBusy = false, captureListed = false, captureResumePending = false;
+    std::optional<CaptureQueryRequest> captureNextQuery;
+    bool captureBusy = false, captureListed = false;
     bool captureDriverSettingsOpen = false;
+    bool captureQueryTimedOut = false;
+    std::chrono::steady_clock::time_point captureQueryStarted{};
     std::wstring captureDriverFormatKey;
     int captureQueryKind = 0;   // 0 device list, 1 formats, 2 formats then connect (continue)
     std::vector<source::CaptureDevice> captureVideo, captureAudio;
@@ -492,6 +510,8 @@ struct QmlPlayerBridge::Impl {
     std::wstring ps5Profile;                 // file name inside profileDirectory()
     QVariantList ps5ProfileList;
     bool ps5Watching = false;
+    remoteplay::SessionInbox::LoginPinPrompt ps5Prompt,ps5ControlPrompt;
+    bool ps5PromptControlOnly=false;
     struct Ps5Outcome { std::wstring message; std::vector<std::pair<std::string, std::string>> hosts; std::wstring savedPath; bool refreshProfiles = false; };
     std::mutex ps5Mutex;
     Ps5Outcome ps5Outcome;
@@ -505,7 +525,7 @@ struct QmlPlayerBridge::Impl {
     QString ps5ControlNoticed;               // state the last notice was shown for
     int ps5ControlTicks = 0;
     bool ps5ControlNoPair = false;           // switched on without a pairing; cleared once pairings exist
-#ifdef VEYRA_ENABLE_REMOTEPLAY
+#if defined(VEYRA_ENABLE_REMOTEPLAY) || defined(VEYRA_ENABLE_XBOX)
     remoteplay::ControllerInput controller;
     // One SDL pad reader shared by PS5 stream, PS5 手柄控制, PC and Xbox streaming.
     // Each user acquires it and only the last release stops it, so the timer of a
@@ -541,7 +561,7 @@ struct QmlPlayerBridge::Impl {
     int audioPollTicks = 0;
     // --- protection drawing (#8) ---
     QString protDraw;                         // "" | rect | ellipse
-    bool protExclusion=false;
+    bool protHud=false;
     HWND protOverlay = nullptr;
     int exclusionSelected = -1;
     bool exclusionDragging = false;
@@ -650,6 +670,7 @@ struct QmlPlayerBridge::Impl {
     bool compareBase = false;
     double compareSplit = 0.5;
     int aspectMode = 0, aspectApplied = 0;
+    int adaptivePreservation = 87, adaptiveZoom = 0;
     uint64_t aspectSession = 0;
     std::jthread gpuSampler;                 // joined before gpuUtil goes away
     std::filesystem::path prefsFile() const { return dataDir / L"qml-preferences.v1.json"; }
@@ -672,6 +693,10 @@ struct QmlPlayerBridge::Impl {
             return;
         }
         prefs = doc.object().toVariantMap();
+        // Windows device interface paths are case-insensitive. A temporarily
+        // disconnected target remains saved for the next time it is present.
+        const auto target = prefs.find(QStringLiteral("fullscreenDisplay"));
+        if (target != prefs.end()) target.value() = target->toString().trimmed().toCaseFolded();
     }
     bool savePrefs() {
         if (prefsUnreadable) return false;
@@ -854,9 +879,21 @@ struct QmlPlayerBridge::Impl {
         return true;
     }
 
-    bool poll() {
+    bool poll(bool& enterStartupFullscreen) {
         const auto before=facade.pendingSettings();
         auto frame = facade.poll();
+        // Read the live presentation counter even when the facade coalesces
+        // this snapshot for the UI. A decoded frame is not necessarily drawn.
+        if (startupFullscreen.hasSession()) {
+            const auto& s = frame.snapshot;
+            const auto& flow = s.metrics.flow;
+            using T = engine::TransportState;
+            const bool terminal = s.failed || s.image || s.transport == T::Empty || s.transport == T::Failed ||
+                s.transport == T::Stopping || s.transport == T::Ended;
+            const auto presentedSession = flow.counters.realPresented ? flow.latest.sessionId : 0;
+            enterStartupFullscreen = startupFullscreen.take(s.sessionId, terminal,
+                s.running && s.transport == T::Playing, presentedSession);
+        }
         const auto restored=facade.pendingSettings();
         const bool fgRollback=before.frameGenerationBackend!=restored.frameGenerationBackend||before.multiplier!=restored.multiplier||before.vfgQuality!=restored.vfgQuality;
         const bool nrRollback=before.nrRuntime!=restored.nrRuntime;
@@ -958,7 +995,9 @@ struct QmlPlayerBridge::Impl {
             if (!projected->firstOf(engine::EffectType::SuperResolution)) {
                 s.srTarget = previous.srTarget; s.videoSrQuality = previous.videoSrQuality;
                 s.dlssSrModel = previous.dlssSrModel;
+                s.fsrSrSharpness=previous.fsrSrSharpness;
                 s.srPrescale = previous.srPrescale; s.srOutput = previous.srOutput;
+                s.smartSr = previous.smartSr;
                 s.dualSrEnabled=previous.dualSrEnabled;s.dualSrTarget=previous.dualSrTarget;s.dualSrQuality=previous.dualSrQuality;
             }
             if (!projected->firstOf(engine::EffectType::FrameGeneration)){
@@ -991,26 +1030,29 @@ struct QmlPlayerBridge::Impl {
         options = engine::PlayerOptions::from(s,order);
         return true;
     }
+    bool streamStatsVisible = false;
 #ifdef VEYRA_ENABLE_MOONLIGHT
     // --- PC streaming (Moonlight). Last, so they are destroyed first: the model joins its workers.
     QTimer* moonlightTimer = nullptr;
-    bool moonlightWantCapture = false, moonlightStatsVisible = false, moonlightWasActive = false;
+    bool moonlightWantCapture = false, moonlightWasActive = false;
     int moonlightStatsTicks = 0;
-    std::unique_ptr<ui::MoonlightInputCapture> moonlightCapture;
     std::unique_ptr<ui::MoonlightModel> moonlight;
 #endif
 #ifdef VEYRA_ENABLE_XBOX
     QTimer* xboxTimer = nullptr;
+    QVariantMap xboxControlState;
     bool xboxWasActive = false;
     int xboxStatsTicks = 0;
     std::unique_ptr<ui::XboxModel> xbox;   // last: joins its worker first
+#endif
+#if defined(VEYRA_ENABLE_REMOTEPLAY) || defined(VEYRA_ENABLE_MOONLIGHT) || defined(VEYRA_ENABLE_XBOX)
+    std::unique_ptr<ui::StreamInputCapture> streamInput;
 #endif
 
     // Last published snapshot and the revision it came from. Polling compares
     // revisions, so an unchanged snapshot costs one comparison per tick.
 
     // The chain the UI edits, kept in step with the facade's pending settings.
-    uint64_t fgAutoSession = 0;       // 已为哪个会话决定过档位
 };
 
 

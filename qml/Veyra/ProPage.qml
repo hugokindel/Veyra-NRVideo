@@ -26,6 +26,7 @@ VPage {
     // to the left of the picture, cut out of the native video window.
     property bool overlay: false
     property bool onboardingActive: false
+    property bool playlistActionEnabled: true
     function saveOnboardingView() {
         return { tab: tab, scroll: inspFlick.contentY, fgOpen: fgCard.open,
                  flowOpen: fgFlowGroup.expanded }
@@ -100,6 +101,17 @@ VPage {
     // Design's st.tab: quality / fg / color / audio / display.
     property string tab: "quality"
     property int selectedEffect: -1
+    // The list cards in processing order. Smart SR runs anti-aliasing behind the
+    // SR / NR / beauty group instead of in front of SR (compileChainExecutionPlan).
+    readonly property bool smartSrOrder: veyra.smartSrRunning === true && veyra.nodeMode !== 1
+    function processingOrder(chain, smartSr) {
+        if (!smartSr) return chain
+        const last = ["video-hdr", "exclusion", "frame-generation"]
+        const rest = chain.filter(n => n.type !== "aa")
+        let at = rest.findIndex(n => last.indexOf(n.type) >= 0)
+        if (at < 0) at = rest.length
+        return rest.slice(0, at).concat(chain.filter(n => n.type === "aa"), rest.slice(at))
+    }
     // 处理顺序 "点击定位": switch to the chip's tab, open its card and scroll
     // the inspector so the card sits at the top.
     function locateNode(chip) {
@@ -903,6 +915,17 @@ VPage {
                     visible: veyra.hasSource && (!veyra.isCapture || proAudioMenu.captureSource)
                     onTapped: proAudioMenu.openAt(proAudioButton, "up")
                 }
+                BarButton {
+                    id: proPlaylistButton
+                    objectName: "pro-playlist"
+                    glyph: "list"
+                    tip: qsTr("播放列表")
+                    enabled: root.playlistActionEnabled
+                    Accessible.role: Accessible.Button
+                    Accessible.name: tip
+                    Accessible.onPressAction: if (enabled) proPlaylistButton.tapped()
+                    onTapped: veyra.showPlaylist()
+                }
                 // Fullscreen, at the picture's bottom-right corner where players put it.
                 Item {
                     objectName: "pro-fullscreen"
@@ -1453,7 +1476,7 @@ VPage {
                             }
                         }
                         Repeater {
-                            model: veyra.chain
+                            model: root.processingOrder(veyra.chain, root.smartSrOrder)
                             delegate: Row {
                                 required property var modelData
                                 spacing: 2
@@ -1834,18 +1857,6 @@ VPage {
                             }
                         }
 
-                        VAccordion {
-                            objectName: "list-effect-exclusion"
-                            Layout.fillWidth: true
-                            visible: veyra.nodeMode===0
-                            title: qsTr("全效果剔除")
-                            glyph: "shield"; hue: Theme.accent
-                            summary: qsTr("区域内恢复原始画面与帧率")
-                            on: veyra.exclusionState.enabled===true
-                            onToggled: on=>veyra.setMaskEnabled(true,on)
-                            MaskEditor { allEffects: true; namePrefix: "list-exclusion" }
-                        }
-
                         // Beauty: face restore and skin smoothing, after the whole NR group
                         // (and its protection). Layers run in order; one face detection
                         // serves all of them.
@@ -1922,6 +1933,8 @@ VPage {
                         spacing: 6
                         visible: root.tab === "fg"
                         objectName: "list-fg-group"
+
+                        HudProtectControl { objectName: "list-hud-protect"; namePrefix: "list" }
 
                         VAccordion {
                             id: fgCard
@@ -2015,24 +2028,12 @@ VPage {
                                 }
                             }
                             VRow {
-                                label: qsTr("严格补帧节奏")
-                                hint: qsTr("帧同步 · 默认关闭")
+                                label: qsTr("文件播放：严格补帧节奏")
+                                visible: veyra.sourceKind === "file"
+                                hint: qsTr("首张生成帧赶不上显示时间时跳过本组，减少晚帧，可能降低输出帧率。")
                                 VSwitch {
                                     checked: veyra.fgStrict
                                     onToggled: checked => veyra.fgStrict = checked
-                                }
-                            }
-                            VRow {
-                                objectName: "list-fg-auto-multiplier"
-                                label: qsTr("自动选择倍率")
-                                visible: veyra.fgAutoMultiplierAvailable
-                                hint: veyra.fgAutoMultiplierEnabled
-                                      ? qsTr("按源帧率和输出上限自动选档；源帧率超过上限时关闭补帧")
-                                      : qsTr("关闭时按手动选的倍率 · 默认关闭")
-                                hintBelow: veyra.fgAutoMultiplierEnabled
-                                VSwitch {
-                                    checked: veyra.fgAutoMultiplierEnabled
-                                    onToggled: checked => veyra.fgAutoMultiplierEnabled = checked
                                 }
                             }
                             VRow {
@@ -2057,19 +2058,6 @@ VPage {
                                     onToggled: checked => veyra.pacingRepair = checked
                                 }
                             }
-                            VRow {
-                                objectName: "list-hud-lock"
-                                label: qsTr("HUD 自动锁定")
-                                visible: veyra.fgBackendName !== "xess"
-                                hint: qsTr("自动找出持续静止且有边缘的像素（文字、准星、血条、小地图），生成帧直接用真实帧的这些像素，减少 HUD 拖影和抖动，不需要画框 · 默认关闭")
-                                VSwitch {
-                                    objectName: "list-hud-lock-switch"
-                                    checked: veyra.hudLock
-                                    onToggled: checked => veyra.hudLock = checked
-                                }
-                            }
-                            HudProtectControl { objectName: "list-hud-protect" }
-                            DynamicHudRow { backend: veyra; namePrefix: "list" }
                             VSubGroup {
                                 id: fgFlowGroup
                                 objectName: "list-fg-flow-group"

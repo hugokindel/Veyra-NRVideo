@@ -3,6 +3,8 @@
 #include "veyra/RuntimePaths.h"
 #include "veyra/Log.h"
 #include "veyra/engine/PresetStore.h"
+#include "veyra/media/NetworkScheme.h"
+#include "veyra/ui/NetworkHistory.h"
 
 #include <windows.h>
 
@@ -15,6 +17,7 @@
 
 namespace veyra::ui {
 namespace {
+constexpr std::string_view protectedRecentPrefix = "dpapi:";
 std::string utf8(const std::wstring& s) {
     if (s.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0, nullptr, nullptr);
@@ -34,6 +37,7 @@ std::wstring wide(const std::string& s) {
 // refresh does not repaint on every poll.
 bool sameNetwork(const veyra::media::NetworkStats& a, const veyra::media::NetworkStats& b) {
     return a.active == b.active && a.live == b.live && a.state == b.state && a.bandwidthLow == b.bandwidthLow &&
+        a.httpMatroskaSubtitles == b.httpMatroskaSubtitles &&
         a.reconnects == b.reconnects && a.reconnectAttempt == b.reconnectAttempt && a.stalls == b.stalls &&
         a.corruptPackets == b.corruptPackets && a.corruptFrames == b.corruptFrames && a.skippedFrames == b.skippedFrames &&
         a.message == b.message &&
@@ -46,6 +50,7 @@ bool sameNetwork(const veyra::media::NetworkStats& a, const veyra::media::Networ
 // makes the UI repaint.
 bool sameSnapshot(const veyra::engine::PlayerSnapshot& a, const veyra::engine::PlayerSnapshot& b) {
     return sameNetwork(a.network, b.network) &&
+        (!a.network.active || (a.metrics.flow.counters.realPresented > 0) == (b.metrics.flow.counters.realPresented > 0)) &&
         a.displayVrrMinimumHz==b.displayVrrMinimumHz&&a.displayCompositionMode==b.displayCompositionMode&&
         a.presentationStatus==b.presentationStatus&&a.presentationEffective==b.presentationEffective&&
         a.presentationRevision==b.presentationRevision&&a.presentationProviderOwned==b.presentationProviderOwned&&
@@ -57,6 +62,8 @@ bool sameSnapshot(const veyra::engine::PlayerSnapshot& a, const veyra::engine::P
         a.rejectedRevision == b.rejectedRevision &&
         a.desired == b.desired && a.applied == b.applied && a.nrActive == b.nrActive &&
         a.srActive == b.srActive && a.fgActive == b.fgActive && a.failed == b.failed &&
+        a.smartSrActive == b.smartSrActive && a.smartSrSettled == b.smartSrSettled && a.smartSrBlocked == b.smartSrBlocked &&
+        a.smartSrWidth == b.smartSrWidth && a.smartSrHeight == b.smartSrHeight &&
         a.volume == b.volume && a.muted == b.muted && a.selectedAudioTrack == b.selectedAudioTrack &&
         a.audioTracks.size() == b.audioTracks.size() && a.running == b.running &&
         a.sourceWidth == b.sourceWidth && a.sourceHeight == b.sourceHeight &&
@@ -232,21 +239,27 @@ bool PlayerUiFacade::importLegacyStores() {
 }
 
 void PlayerUiFacade::noteRecentFile(const std::wstring& path) {
-    if (path.empty()) return;
-    recent_.erase(std::remove_if(recent_.begin(), recent_.end(),
-        [&](const RecentEntry& e) { return e.path == path; }), recent_.end());
-    RecentEntry entry;
-    entry.path = path;
+    if (path.empty() || media::networkMediaInput(path)) return;
     const auto slash = path.find_last_of(L"\\/");
-    entry.label = slash == std::wstring::npos ? path : path.substr(slash + 1);
-    entry.exists = true;
+    noteRecent({path, slash == std::wstring::npos ? path : path.substr(slash + 1), true, {}});
+}
+
+void PlayerUiFacade::noteRecentNetwork(const ProtectedNetworkAddress& address) {
+    noteRecent({address.address(), {}, true, address.storage()});
+}
+
+void PlayerUiFacade::noteRecent(RecentEntry entry) {
+    recent_.erase(std::remove_if(recent_.begin(), recent_.end(),
+        [&](const RecentEntry& old) { return old.path == entry.path; }), recent_.end());
     recent_.insert(recent_.begin(), std::move(entry));
     if (recent_.size() > 8) recent_.resize(8);
     savePreferences();
 }
 
 void PlayerUiFacade::refreshRecentFiles() {
-    for (auto& entry : recent_) entry.exists = std::filesystem::exists(entry.path);
+    for (auto& entry : recent_) {
+        if (!entry.isNetwork()) entry.exists = std::filesystem::exists(entry.path);
+    }
 }
 
 bool PlayerUiFacade::clearRecentFiles() {
@@ -273,7 +286,16 @@ bool PlayerUiFacade::savePreferencesLocked() {
     out.imbue(std::locale::classic());
     out << "VEYRA_UI_SESSION 1\n";
     out << recent_.size() << '\n';
-    for (const auto& entry : recent_) out << std::quoted(utf8(entry.path)) << ' ' << std::quoted(utf8(entry.label)) << '\n';
+    for (const auto& entry : recent_) {
+        // The legacy reader skips empty paths, so a downgrade still loads
+        // the surrounding local history and the capture and UI preferences.
+        if (entry.isNetwork()) {
+            out << std::quoted("") << ' '
+                << std::quoted(std::string(protectedRecentPrefix) + entry.protectedAddress) << '\n';
+        } else {
+            out << std::quoted(utf8(entry.path)) << ' ' << std::quoted(utf8(entry.label)) << '\n';
+        }
+    }
     out << (captureSession_.valid ? 1 : 0) << ' ' << std::quoted(utf8(captureSession_.devicePath)) << ' '
         << std::quoted(utf8(captureSession_.formatKey)) << ' ' << std::quoted(utf8(captureSession_.presetName)) << ' '
         << captureSession_.fps << '\n';
@@ -315,12 +337,17 @@ bool PlayerUiFacade::loadPreferences() {
     for (size_t i = 0; i < count; ++i) {
         std::string path, label;
         if (!(in >> std::quoted(path) >> std::quoted(label))) { error_ = L"界面状态条目损坏"; return false; }
-        RecentEntry entry;
-        entry.path = wide(path);
-        entry.label = wide(label);
-        if (entry.path.empty()) continue;
-        entry.exists = std::filesystem::exists(entry.path);
-        recent.push_back(std::move(entry));
+        if (path.empty()) {
+            if (std::string_view(label).starts_with(protectedRecentPrefix)) {
+                const auto network = ProtectedNetworkAddress::restore(std::string_view(label).substr(protectedRecentPrefix.size()));
+                if (network) recent.push_back({network->address(), {}, true, network->storage()});
+            }
+            continue;
+        }
+        auto local = wide(path);
+        if (local.empty() || media::networkMediaInput(local)) continue;
+        const bool exists = std::filesystem::exists(local);
+        recent.push_back({std::move(local), wide(label), exists, {}});
     }
     CaptureSession session;
     int valid = 0;

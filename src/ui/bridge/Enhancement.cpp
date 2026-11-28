@@ -27,6 +27,14 @@ namespace veyra::ui {
 
 int QmlPlayerBridge::videoSrQuality() const { return int(engine::currentVideoSrQuality(settings().videoSrQuality)); }
 int QmlPlayerBridge::dlssSrModel() const { return int(settings().dlssSrModel); }
+int QmlPlayerBridge::fsrSrSharpness() const { return int(settings().fsrSrSharpness); }
+void QmlPlayerBridge::setFsrSrSharpness(int value) {
+    if(value<0||value>100)return;
+    auto s=settings();
+    if(s.fsrSrSharpness==unsigned(value))return;
+    s.fsrSrSharpness=unsigned(value);
+    if(impl_->commit(s))emit settingsChanged();
+}
 QVariantList QmlPlayerBridge::dlssSrModelChoices() const {
     return {QVariantMap{{"id", "0"}, {"label", "DLSS 4 · K"}},
             QVariantMap{{"id", "1"}, {"label", "DLSS 4.5 · M"}},
@@ -119,6 +127,15 @@ QString QmlPlayerBridge::srQualityLabel(int quality,bool withFamily) const {
     return (family==engine::VideoSrFamily::HighBitrate?tr("高码率"):family==engine::VideoSrFamily::Streaming?tr("流媒体"):tr("标准"))+QLatin1Char(' ')+tier;
 }
 int QmlPlayerBridge::srOutput() const { return int(settings().srOutput); }
+bool QmlPlayerBridge::smartSr() const { return settings().smartSr; }
+// Smart SR descales and enlarges with the standard RTX Video SR family (NGX) only.
+void QmlPlayerBridge::setSmartSr(bool enabled) {
+    auto s = settings();
+    if (s.smartSr == enabled) return;
+    if (enabled && !engine::ngxVideoSr(s.videoSrQuality)) { emit notice(tr("智能超分目前仅支持 RTX 视频超分（标准）"), true); return; }
+    s.smartSr = enabled;
+    if (impl_->commit(s)) emit settingsChanged();
+}
 // The double SR reduction works with every SR backend; the supersample shrink
 // runs on RTX Video SR (every family) only.
 void QmlPlayerBridge::setSrPrescale(int value) {
@@ -420,9 +437,14 @@ void QmlPlayerBridge::flushHdrMemory(){
 }
 void QmlPlayerBridge::syncHdrTitleProfile(){
   auto& i=*impl_;
-  if(!i.snapshot.running||i.openingSource)return;
+  const auto session=i.snapshot.sessionId;
+  if(!i.snapshot.running||i.openingSource||i.snapshot.capture||!i.liveKind.isEmpty()||
+     !session||session!=i.openingSessionId||session==i.hdrTitleLookupSession)return;
+  // The file identity belongs to the source that finished opening. Resolving
+  // it once avoids file metadata and canonical path lookups on every UI tick.
+  i.hdrTitleLookupSession=session;
   const QFileInfo file(QString::fromStdWString(i.sourceLabel));
-  if(!file.isFile())return; // Capture/stream labels are not film identities.
+  if(!file.isFile())return;
   const QString title=file.canonicalFilePath();
   if(title.isEmpty()||title==i.hdrTitleApplied)return;
   flushHdrMemory();i.hdrTitleApplied=title;
@@ -821,7 +843,8 @@ bool QmlPlayerBridge::setAntiAliasParameter(const QString& key, double value) {
     if (c.mode != engine::ChainMode::List) { emit notice(tr("请先添加抗锯齿节点"), true); return false; }
     // The list card's instance exists once it is used, stored after the grades
     // where toChain() puts it; the list order (compileChainExecutionPlan) runs it
-    // behind the NR group when NR is on and in front of SR otherwise.
+    // behind the NR group when NR is on and in front of SR otherwise (behind it
+    // for smart SR).
     engine::ChainNode node; node.type = engine::EffectType::AntiAliasing;
     bool enabled = false;
     if (!applyAntiAliasKey(node.aa, enabled, key, value)) return false;
@@ -1164,7 +1187,12 @@ void QmlPlayerBridge::setColorEnabled(bool enabled){
 }
 
 bool QmlPlayerBridge::protectionEnabled() const {return maskState(false).value("enabled").toBool();}
-void QmlPlayerBridge::setProtectionEnabled(bool enabled) {setMaskEnabled(false,enabled);}
+void QmlPlayerBridge::setProtectionEnabled(bool enabled) {
+    editProtection([&](engine::ChainNode& node){
+        node.enabled=node.protection.enabled=enabled;
+        return true;
+    });
+}
 QVariantMap QmlPlayerBridge::protectionState() const {return maskState(false);}
 
 bool QmlPlayerBridge::setProtectionRegion(double left,double top,double right,double bottom,double feather) {
@@ -1308,7 +1336,7 @@ void QmlPlayerBridge::setVolume(double value) {
     const QString key = QStringLiteral("volume");
     if (impl_->prefs.contains(key) && impl_->prefs.value(key).toDouble() == volume) return;
     impl_->prefs[key] = volume;
-    if (impl_->volumeSaveTimer) impl_->volumeSaveTimer->start();
+    if (impl_->prefsSaveTimer) impl_->prefsSaveTimer->start();
 }
 bool QmlPlayerBridge::muted() const { return impl_->snapshot.muted; }
 void QmlPlayerBridge::setMuted(bool value) {
@@ -1316,7 +1344,7 @@ void QmlPlayerBridge::setMuted(bool value) {
     impl_->engine.setVolume(impl_->snapshot.volume, value);
     impl_->snapshot.muted=value;
     impl_->prefs[QStringLiteral("audioMuted")]=value;
-    if(impl_->volumeSaveTimer)impl_->volumeSaveTimer->start();
+    if(impl_->prefsSaveTimer)impl_->prefsSaveTimer->start();
     emit snapshotChanged();
 }
 double QmlPlayerBridge::playbackSpeed() const { return impl_->snapshot.playbackSpeed; }

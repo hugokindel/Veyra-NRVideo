@@ -58,6 +58,15 @@ QtObject {
     property string nrAutoStatus: ""
     property var nodeTimings: ({})
     property var preferences: ({exportStopsPlayback:false})
+    property bool hasCaptureSession: false
+    property string captureSessionSummary: ""
+    property string remotePlayHost: ""
+    property var ps5Control: ({enabled:false})
+    property var lastSource: ({})
+    property var recentFiles: []
+    property string homeOpenAction: ""
+    function openCaptureDialog() { homeOpenAction = "capture" }
+    function openXboxDialog() { homeOpenAction = "xbox" }
     property QtObject liveTranslation: QtObject {
         property bool supported: true
         property bool screenTextSupported: true
@@ -71,6 +80,11 @@ QtObject {
         property int recognitionThreads: 0
         property int recognitionEffectiveThreads: 3
         property string recognitionStatus: ""
+        property string recognitionDirectory: "test/live-asr"
+        property string recognitionInstallLayout: recognitionModel === 0
+            ? "models/parakeet-tdt-0.6b-v2-int8/encoder.int8.onnx"
+            : "models/whisper-large-v3-turbo-int8/turbo-tokens.txt"
+        property int recognitionOpenCount: 0
         property bool recognitionInstalled: false
         property bool recognitionDownloading: false
         property real recognitionProgress: 0
@@ -79,6 +93,7 @@ QtObject {
         property real averageTranslationMs: 0
         property int skippedSentences: 0
         function downloadRecognitionModel() { recognitionDownloading = true }
+        function openRecognitionDirectory() { recognitionOpenCount += 1; return true }
         function cancelRecognitionDownload() { recognitionDownloading = false }
         function deleteRecognitionModel() { recognitionInstalled = false }
         function openWindowsCaptions() {}
@@ -150,6 +165,8 @@ QtObject {
         // by Veyra/qmldir. Register it only here to test its real inline controls.
         qmlRegisterType(QUrl::fromLocalFile(QDir(QCoreApplication::applicationDirPath()).filePath(
             QStringLiteral("qml/Veyra/ProPage.qml"))), "VeyraTest", 1, 0, "ProPage");
+        qmlRegisterType(QUrl::fromLocalFile(QDir(QCoreApplication::applicationDirPath()).filePath(
+            QStringLiteral("qml/Veyra/HomePage.qml"))), "VeyraTest", 1, 0, "HomePage");
         qmlRegisterType(QUrl::fromLocalFile(QDir(QCoreApplication::applicationDirPath()).filePath(
             QStringLiteral("qml/Veyra/Ps5SourceDialog.qml"))), "VeyraTest", 1, 0, "Ps5SourceDialog");
         qmlRegisterType(QUrl::fromLocalFile(QDir(QCoreApplication::applicationDirPath()).filePath(

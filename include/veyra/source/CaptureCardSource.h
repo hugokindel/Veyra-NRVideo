@@ -6,6 +6,8 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 #include "veyra/sink/CaptureAudioSession.h"
@@ -52,6 +54,10 @@ public:
     CaptureCardSource();~CaptureCardSource()override;
     static std::vector<CaptureDevice> deviceDetails(bool audio=false);
     static std::vector<std::wstring> devices(bool audio=false);
+    // Uses the existing enumeration. The result is an audio input index or
+    // kCaptureAudioFromVideoDevice, and may be absent if the match is ambiguous.
+    static std::optional<int> recommendElgatoCaptureAudio(std::wstring_view videoPath,
+        std::span<const CaptureDevice> videoDevices, std::span<const CaptureDevice> audioDevices);
     static std::wstring makeCapturePath(unsigned videoIndex,const CaptureDevice& video,
         int format,int audioMode,const CaptureDevice* audio,unsigned colorOverride=0,double requestedFps=0,std::wstring_view formatKey={});
     static std::vector<CaptureFormat> formats(unsigned device);
@@ -68,9 +74,12 @@ public:
     void releaseForRetry();
     bool noVideoAfterRun() const { return noVideoAfterRun_; }
     void setDriverStageObserver(std::function<void(CaptureDriverStage)> observer);
-    // Owner-thread recovery of DirectShow audio pins; same video filter retained.
-    void recoverAudio(float gain,unsigned syncMode,int offsetMs);
-    bool setAudioGain(float); // call on the graph owner thread; never system volume
+    // Polling does not call the driver. Run the due recovery on the graph
+    // owner while the frame consumer is parked.
+    bool audioRecoveryNeeded();
+    void recoverAudio(float gain,unsigned syncMode,int offsetMs,bool due=false);
+    bool driverAudioGainNeeded(float gain) const;
+    bool setAudioGain(float); // application gain, never system volume
     // 0 automatic, 1 PCM only, 2 bitstream preferred. Takes effect on the next
     // connect/reconnect because the audio media type is negotiated there.
     void setAudioIngress(unsigned mode);
@@ -84,7 +93,7 @@ public:
     void setVerticalFlip(bool enabled);
     // Content dedup: compare every sample's whole picture with the last new one and
     // number the pictures (CaptureUploadFrame.h). Any thread; applies to the next sample.
-    void setPictureCompare(bool enabled);
+    void setPictureCompare(bool enabled, bool retainFirstUnread = false);
     // N1 diagnostic: keep the legacy per-pixel CPU unpack (BGR0/YUY2 targets)
     // instead of the GPU unpack path. Applied on the next connect.
     void setCpuUnpack(bool enabled);
@@ -100,6 +109,8 @@ public:
     // The selected media type is compressed (MJPEG, H.264, ...) and decoded by Veyra.
     bool compressedVideo()const;
     SourceReadStatus read(pipeline::FramePacket&,const AVFrame**)override;
+    bool videoFallbackNeeded() const;
+    bool resumeDirectShowVideo();
     SourceReadStatus tryRead(pipeline::FramePacket&,const AVFrame**);
     // Auto-reset event signalled after each delivered sample; lets the graph
     // owner wait on "frame or deadline" instead of a fixed 1 ms timer slice.
@@ -127,7 +138,7 @@ private:
     // AVerMedia capture cards need their installed vendor component to arm
     // non-PCM (Dolby/DTS) passthrough before the audio pin is negotiated.
     bool applyVendorAudioSwitch(const std::wstring& audioName,const std::wstring& audioPath);
-    SourceReadStatus readWithWait(pipeline::FramePacket&,const AVFrame**,unsigned milliseconds);
+    SourceReadStatus readWithWait(pipeline::FramePacket&,const AVFrame**,unsigned milliseconds,bool allowDriverFallback);
     struct Impl;std::unique_ptr<Impl> p_;
     SourceOpenDesc reconnectDesc_;
     std::wstring reconnectFormat_;

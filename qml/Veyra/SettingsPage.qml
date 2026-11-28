@@ -15,6 +15,7 @@ VPage {
     id: root
     signal requestPage(string page)
     property Item fullscreenBackground
+    property var fullscreenDisplays: []
 
     property string section: "look"
     property bool hdrAdvancedExpanded: false
@@ -24,11 +25,12 @@ VPage {
         capturingKey = ""
         if (settingsBodyScroll) settingsBodyScroll.contentY = settingsBodyScroll.originY
         if (section === "ps5") veyra.ps5Load()
+        if (section === "xbox") veyra.xbox?.load()
         // M32: the section's groups redraw one after another (pages-b.js
         // render(true): 480 ms, i*40 ms, y 12).
         Qt.callLater(() => stagger(sectionColumns[section] || null))
     }
-    readonly property var sectionColumns: ({ look: secLook, window: secWindow, play: secPlay, audio: secAudio, perf: secPerf, compat: secCompat, ps5: secPs5, keys: secKeys, comp: secComp, about: secAbout, sponsor: secSponsor })
+    readonly property var sectionColumns: ({ look: secLook, window: secWindow, play: secPlay, audio: secAudio, perf: secPerf, compat: secCompat, ps5: secPs5, xbox: secXbox, keys: secKeys, comp: secComp, about: secAbout, sponsor: secSponsor })
     readonly property var portableUpdate: veyra.updates.portable
     Component { id: staggerComp; VRise.Stagger {} }
     function stagger(col) {
@@ -50,12 +52,13 @@ VPage {
         { id: "perf",   label: qsTr("性能"), icon: "gauge" },
         { id: "compat", label: qsTr("兼容"), icon: "monitor" },
         { id: "ps5",   label: qsTr("PS5 串流"), icon: "gamepad" },
+        { id: "xbox",  label: qsTr("Xbox 串流"), icon: "gamepad" },
         { id: "keys",  label: qsTr("快捷键"), icon: "zap" },
         { id: "comp",  label: qsTr("组件与许可"), icon: "box" },
         { id: "about", label: qsTr("关于"), icon: "info" },
         // The one entry with a coloured icon, so it can be found.
         { id: "sponsor", label: qsTr("赞助作者"), icon: "heart", tint: "#FF6B81" }
-    ]
+    ].filter(entry => entry.id !== "xbox" || !!veyra.xbox)
 
     // --- nav ---------------------------------------------------------------
     Rectangle {
@@ -222,7 +225,7 @@ VPage {
                                   : qsTr("未找到音乐文件：程序目录下的 media/startup-music.mp3")
                             VSwitch {
                                 objectName: "set-intro-music"
-                                checked: veyra.preferences.introMusic !== false
+                                checked: veyra.preferences.introMusic === true
                                 onToggled: checked => {
                                     veyra.setPreference("introMusic", checked)
                                     if (!checked && typeof vyMusic !== "undefined") vyMusic.pause()
@@ -390,12 +393,45 @@ VPage {
                             }
                         }
                         VRow {
+                            visible: root.fullscreenDisplays.length > 1 || !!veyra.preferences.fullscreenDisplay
+                            label: qsTr("全屏显示器")
+                            hint: (veyra.preferences.fullscreenDisplay && !root.fullscreenDisplays.some(
+                                      screen => screen.id === veyra.preferences.fullscreenDisplay))
+                                  ? qsTr("所选显示器未连接，将使用当前显示器。") : qsTr("下次进入全屏时生效。")
+                            VSelect {
+                                objectName: "set-fullscreen-display"
+                                options: [{id: "", label: qsTr("当前显示器")}].concat(root.fullscreenDisplays)
+                                readonly property string selected: veyra.preferences.fullscreenDisplay || ""
+                                value: (options.find(o => o.id === selected) || options[0]).label
+                                onPicked: id => veyra.setPreference("fullscreenDisplay", id)
+                            }
+                        }
+                        VRow {
                             label: qsTr("启动后自动继续上次内容")
                             hint: qsTr("视频恢复上次进度；采集卡沿用上次设备与设置")
                             VSwitch {
                                 objectName: "set-auto-resume"
                                 checked: !!veyra.preferences.autoResume
                                 onToggled: v => veyra.setPreference("autoResume", v)
+                            }
+                        }
+                        VRow {
+                            label: qsTr("自动继续后进入全屏")
+                            hint: qsTr("自动继续的画面出现后直接全屏，无需按键；需开启上一项")
+                            VSwitch {
+                                objectName: "set-start-fullscreen"
+                                enabled: !!veyra.preferences.autoResume
+                                checked: !!veyra.preferences.startFullscreen
+                                onToggled: v => veyra.setPreference("startFullscreen", v)
+                            }
+                        }
+                        VRow {
+                            label: qsTr("登录 Windows 时启动 Veyra")
+                            hint: qsTr("为当前 Windows 账户添加启动项，是否运行也受 Windows 启动应用设置控制")
+                            VSwitch {
+                                objectName: "set-launch-at-login"
+                                checked: veyra.launchAtLogin
+                                onToggled: v => veyra.setLaunchAtLogin(v)
                             }
                         }
                         VRow {
@@ -664,6 +700,25 @@ VPage {
                     VGroup {
                         objectName: "set-recording"
                         VRow {
+                            visible: !!veyra.localCaptureControlAvailable
+                            label: qsTr("允许本机控制录制和截图")
+                            hint: qsTr("仅本次运行有效。将连接信息提供给信任的本机工具。")
+                            VSwitch {
+                                objectName: "set-local-capture-control"
+                                checked: !!veyra.localCaptureControlEnabled
+                                onToggled: v => veyra.setLocalCaptureControlEnabled(v)
+                            }
+                        }
+                        VRow {
+                            visible: !!veyra.localCaptureControlEnabled
+                            label: qsTr("本机控制连接")
+                            VButton {
+                                objectName: "copy-local-capture-connection"
+                                text: qsTr("复制连接信息")
+                                onClicked: veyra.copyLocalCaptureConnection()
+                            }
+                        }
+                        VRow {
                             label: qsTr("录制保存位置")
                             hint: veyra.recordingDirectory + qsTr("（MP4，录下处理后的画面和正在播放的声音）")
                             RowLayout {
@@ -684,7 +739,9 @@ VPage {
                         }
                         VRow {
                             label: qsTr("录制帧率")
-                            hint: qsTr("跟随显示可录到补帧后的画面；限速则按该帧率抽帧")
+                            hint: veyra.preferences.recordCfr === true
+                                  ? qsTr("恒定帧率按所选帧率录制。跟随会在录制开始时确定帧率，并在当前录制段内保持固定。")
+                                  : qsTr("跟随显示可录到补帧后的画面；限速则按该帧率抽帧")
                             VSeg {
                                 objectName: "set-recfps"
                                 options: [{ id: "0", label: qsTr("跟随") }, { id: "30", label: "30" }, { id: "60", label: "60" }, { id: "120", label: "120" }]
@@ -722,6 +779,17 @@ VPage {
                                 options: [{ id: "0", label: "H.264" }, { id: "1", label: "HEVC" }]
                                 current: veyra.recordingHevc ? "1" : "0"
                                 onPicked: id => veyra.setPreference("recordHevc", id === "1")
+                            }
+                        }
+                        VRow {
+                            label: qsTr("录制帧率模式")
+                            hint: qsTr("恒定帧率供剪辑软件使用。缺帧时重复上一画面；下次录制生效。")
+                            VSeg {
+                                objectName: "set-reccfr"
+                                options: [{ id: "vfr", label: "VFR" },
+                                          { id: "cfr", label: "CFR" }]
+                                current: veyra.preferences.recordCfr === true ? "cfr" : "vfr"
+                                onPicked: id => veyra.setPreference("recordCfr", id === "cfr")
                             }
                         }
                         VRow {
@@ -990,11 +1058,11 @@ VPage {
                     VGroup {
                         VRow {
                             label: qsTr("GPU 优先级")
-                            hint: veyra.gpuPriorityStatus + qsTr("；默认“高”，同时运行游戏或其他重负载程序变慢时可改为“普通”")
+                            hint: veyra.gpuPriorityStatus + qsTr("。默认使用“实时”。同时运行游戏或其他重负载程序变慢时，可选择“普通”。")
                             VSeg {
                                 objectName: "set-gpu-priority"
                                 options: [{ id: "normal", label: qsTr("普通") }, { id: "high", label: qsTr("高") }, { id: "realtime", label: qsTr("实时") }]
-                                current: veyra.preferences.gpuPriority || "high"
+                                current: veyra.preferences.gpuPriority || "realtime"
                                 onPicked: id => veyra.setPreference("gpuPriority", id)
                             }
                         }
@@ -1256,6 +1324,60 @@ VPage {
                     }
                 }
 
+                ColumnLayout {
+                    id: secXbox
+                    Layout.fillWidth: true
+                    spacing: 12
+                    visible: root.section === "xbox"
+                    readonly property var model: veyra.xbox
+                    readonly property var state: model ? model.state : ({})
+                    VH1 { text: qsTr("Xbox 串流") }
+                    VGroup {
+                        VRow {
+                            label: qsTr("账号")
+                            hint: secXbox.state.signedIn ? qsTr("已登录") : qsTr("未登录")
+                            VButton {
+                                objectName: "set-xbox-manage"
+                                text: qsTr("管理")
+                                onClicked: root.requestPage("xbox")
+                            }
+                        }
+                        VRow {
+                            label: qsTr("Xbox 主机")
+                            hint: secXbox.state.lastLabel || qsTr("请选择 Xbox 主机。")
+                        }
+                        VRow {
+                            label: qsTr("手柄")
+                            hint: qsTr("把电脑手柄当作主机上的手柄")
+                            VSwitch {
+                                objectName: "set-xbox-gamepad"
+                                checked: secXbox.state.gamepad !== false
+                                onToggled: enabled => secXbox.model?.set("gamepad", enabled)
+                            }
+                        }
+                        XboxResolutionRow { xboxModel: secXbox.model }
+                        VRow {
+                            label: qsTr("软件视频解码")
+                            hint: qsTr("兼容选项：画面出现持续花屏时尝试开启，断开后重新连接生效。可能增加 CPU 占用和延迟；超分和补帧仍使用 GPU。")
+                            VSwitch {
+                                objectName: "set-xbox-software-decode"
+                                checked: secXbox.state.softwareDecode === true
+                                onToggled: enabled => secXbox.model?.set("softwareDecode", enabled)
+                            }
+                        }
+                        VRow {
+                            label: qsTr("D3D11VA 硬件解码")
+                            hint: qsTr("部分 Intel 核显花屏时可尝试。关闭软件解码后重新连接生效。")
+                            VSwitch {
+                                objectName: "set-xbox-d3d11-decode"
+                                enabled: secXbox.state.softwareDecode !== true
+                                checked: enabled && secXbox.state.d3d11Decode === true
+                                onToggled: checked => secXbox.model?.set("d3d11Decode", checked)
+                            }
+                        }
+                    }
+                }
+
                 // --- 快捷键 ----------------------------------------------
                 ColumnLayout {
                     id: secKeys
@@ -1280,6 +1402,7 @@ VPage {
                                 { id: "record", a: qsTr("开始 / 停止录制") },
                                 { id: "replay", a: qsTr("保存即时回放"), note: qsTr("需先在「设置 → 播放」开启即时回放") },
                                 { id: "fullscreenStats", a: qsTr("显示 / 隐藏全屏帧率") },
+                                { id: "playlist", a: qsTr("播放列表") },
                                 { id: "toggleMode", a: qsTr("切换极简 / 专业") }
                             ]
                             delegate: VRow {
@@ -1388,14 +1511,16 @@ VPage {
                                 readonly property bool anr: modelData.id === "anr"
                                 readonly property var download: veyra.anrDownload || ({})
                                 readonly property bool downloading: anr && !!download.active
-                                readonly property bool downloadable: anr
-                                    && !!((veyra.effectCapabilities || {}).anr || {}).downloadable
+                                readonly property var capability: (veyra.effectCapabilities || {}).anr || ({})
+                                readonly property bool updateAvailable: anr && !!capability.updateAvailable
+                                readonly property bool downloadable: anr && (!!capability.downloadable || updateAvailable)
                                 label: modelData.name
                                 hint: downloading ? download.status : modelData.detail
                                 value: downloading ? download.percent + "%" : ""
                                 VButton {
                                     visible: componentRow.downloading || componentRow.downloadable
-                                    text: componentRow.downloading ? qsTr("取消") : qsTr("下载并启用")
+                                    text: componentRow.downloading ? qsTr("取消")
+                                          : componentRow.updateAvailable ? qsTr("更新组件") : qsTr("下载并启用")
                                     onClicked: {
                                         if (componentRow.downloading) veyra.cancelAnrDownload()
                                         else veyra.downloadAnr()
@@ -1471,18 +1596,20 @@ VPage {
                             }
                         }
                         VRow {
-                            visible: root.portableUpdate.available || root.portableUpdate.downloading || root.portableUpdate.scheduled
-                            label: root.portableUpdate.scheduled ? qsTr("更新已就绪，将在退出后安装")
-                                  : root.portableUpdate.downloading ? qsTr("正在下载更新 %1%").arg(root.portableUpdate.progress)
-                                  : qsTr("便携版更新 · %1").arg(root.portableUpdate.sizeText)
-                            hint: root.portableUpdate.available ? root.portableUpdate.releaseNotes : ""
-                            hintBelow: true
+                            visible: root.portableUpdate.available || root.portableUpdate.downloading
+                                     || root.portableUpdate.installing || root.portableUpdate.ready
+                            label: qsTr("软件更新 · %1").arg(root.portableUpdate.targetVersion)
+                            hint: root.portableUpdate.available ? root.portableUpdate.sizeText : ""
                             VButton {
                                 objectName: "portable-download"
-                                text: root.portableUpdate.available ? qsTr("下载并在退出后更新") : qsTr("取消更新")
+                                primary: true
+                                enabled: !root.portableUpdate.restarting
+                                text: root.portableUpdate.ready ? qsTr("重启完成更新")
+                                      : root.portableUpdate.available ? qsTr("立即更新")
+                                      : qsTr("查看更新进度")
                                 onClicked: {
-                                    if (root.portableUpdate.available) root.portableUpdate.downloadAndSchedule()
-                                    else root.portableUpdate.cancel()
+                                    root.requestPage("update")
+                                    if (root.portableUpdate.available) root.portableUpdate.start()
                                 }
                             }
                         }
@@ -1490,6 +1617,28 @@ VPage {
                             label: qsTr("反馈问题")
                             hint: qsTr("打开 GitHub Issues，诊断信息已自动复制")
                             VButton { text: qsTr("打开"); onClicked: veyra.openFeedbackPage() }
+                        }
+                        // 性能诊断: records frame times, system load and the log for a few
+                        // minutes, then writes a report and a package (PerfDiagnostics.h).
+                        VRow {
+                            objectName: "set-perf-diagnostics"
+                            readonly property var diag: veyra.perfDiagnostics
+                            function clock(seconds) {
+                                const s = Math.max(0, Math.floor(seconds))
+                                return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0")
+                            }
+                            label: qsTr("性能诊断")
+                            hint: !diag ? ""
+                                  : diag.state === "recording" ? qsTr("记录中 %1 / %2 · 觉得卡时按 Ctrl+Alt+M 标记").arg(clock(diag.elapsedSeconds)).arg(clock(diag.durationSeconds))
+                                  : diag.state === "analyzing" ? qsTr("正在分析…")
+                                  : diag.state === "done" ? diag.headline
+                                  : diag.state === "failed" ? diag.message
+                                  : qsTr("录 3–10 分钟，自动分析卡顿原因并生成报告，反馈时附上")
+                            VButton {
+                                objectName: "set-perf-diagnostics-open"
+                                text: parent.diag && parent.diag.state === "idle" ? qsTr("开始…") : qsTr("查看")
+                                onClicked: root.requestPage("perf-diagnostics")
+                            }
                         }
                         VRow {
                             label: qsTr("赞助作者")

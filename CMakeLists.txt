@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(veyra VERSION 2.2.1 LANGUAGES C CXX)
+project(veyra VERSION 2.2.2 LANGUAGES C CXX)
 
 # The Windows runtime needs the resource compiler; Linux does not have one.
 if(WIN32)
@@ -30,16 +30,16 @@ if(NOT WIN32)
 endif()
 add_subdirectory(src/virtualcam)
 
-# Decode the localized compiler output using the current console code page.
-# CMake needs UTF-8 internally to write rules.ninja; the generator then emits
-# the matching native prefix so Ninja records header dependencies.
+# Ninja matches the localized /showIncludes prefix against the compiler's
+# piped output. Keep the bytes as emitted, which may differ from the console
+# code page.
 if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
   set(VEYRA_INCLUDE_PROBE "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/veyra-include-probe")
   file(WRITE "${VEYRA_INCLUDE_PROBE}.h" "// Dependency parser probe\n")
   file(WRITE "${VEYRA_INCLUDE_PROBE}.cpp" "#include \"veyra-include-probe.h\"\n")
   execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /nologo /utf-8 /showIncludes /c /TP "${VEYRA_INCLUDE_PROBE}.cpp" "/Fo${VEYRA_INCLUDE_PROBE}.obj"
     OUTPUT_VARIABLE VEYRA_INCLUDE_OUTPUT ERROR_VARIABLE VEYRA_INCLUDE_OUTPUT
-    RESULT_VARIABLE VEYRA_INCLUDE_RESULT ENCODING AUTO)
+    RESULT_VARIABLE VEYRA_INCLUDE_RESULT ENCODING NONE)
   if(NOT VEYRA_INCLUDE_RESULT EQUAL 0 OR NOT VEYRA_INCLUDE_OUTPUT MATCHES "(^|[\r\n])([^\r\n]*: )[ ]*[A-Za-z]:[^\r\n]*veyra-include-probe.h")
     message(FATAL_ERROR "Unable to verify MSVC/Ninja header dependency prefix")
   endif()
@@ -75,7 +75,12 @@ option(VEYRA_ENABLE_NVOF "Enable NVIDIA Optical Flow guidance" OFF)
 option(VEYRA_ENABLE_D3D12_DEBUG "Enable D3D12 debug layer" ON)
 set(VEYRA_FIDELITYFX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party_local/amd/FidelityFX-SDK/sdk" CACHE PATH "Local official FidelityFX SDK 1.1.4")
 set(VEYRA_XESS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party_local/intel/xess-3.0.2" CACHE PATH "Local Intel XeSS SDK 3.0.2")
-set(VEYRA_FIDELITYFX2_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party_local/amd/FidelityFX-SDK-2.3.0/Kits/FidelityFX" CACHE PATH "Local AMD FidelityFX SDK 2.3.0 Kits/FidelityFX tree")
+set(_veyra_fidelityfx_default "${CMAKE_CURRENT_SOURCE_DIR}/third_party_local/amd/FidelityFX-SDK-2.4.0/Kits/FidelityFX")
+if(NOT EXISTS "${_veyra_fidelityfx_default}/api/include/ffx_api_loader.h" AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party_local/amd/FidelityFX-SDK-2.3.0/Kits/FidelityFX/api/include/ffx_api_loader.h")
+  set(_veyra_fidelityfx_default "${CMAKE_CURRENT_SOURCE_DIR}/third_party_local/amd/FidelityFX-SDK-2.3.0/Kits/FidelityFX")
+endif()
+set(VEYRA_FIDELITYFX2_ROOT "${_veyra_fidelityfx_default}" CACHE PATH "Local AMD FidelityFX SDK Kits/FidelityFX tree")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(VeyraWarnings)
@@ -112,8 +117,10 @@ add_library(veyra_base STATIC
   src/base/PrivateFrameTrace.cpp
   src/base/NgxResult.cpp
   src/base/FileIdentity.cpp
+  src/base/LauncherInstance.cpp
   src/base/InstanceWindow.cpp
   src/base/RuntimePaths.cpp
+  src/base/NetworkHistory.cpp
   src/base/ThunkHook.cpp
   # .cube parsing, the runtime LUT store and named colour looks: low level, no
   # D3D12, shared by the ingest pipeline and the settings/import paths.
@@ -140,6 +147,27 @@ veyra_apply_warnings(veyra_logger_tests)
 add_executable(veyra_private_frame_trace_tests tests/unit/PrivateFrameTraceTests.cpp)
 target_compile_features(veyra_private_frame_trace_tests PRIVATE cxx_std_20)
 target_link_libraries(veyra_private_frame_trace_tests PRIVATE veyra_base)
+
+# 性能诊断 analysis (docs/PERF_DIAGNOSTICS.md): standard C++ only, shipped as
+# veyra_frame_analyzer.exe next to the player, which runs it as a child process.
+add_library(veyra_frame_analysis STATIC
+  src/diagnostics/FrameAnalysis.cpp
+  src/diagnostics/FrameReport.cpp
+  src/diagnostics/FrameAnalysisInternal.h
+  src/diagnostics/MiniJson.h
+  include/veyra/diagnostics/FrameAnalysis.h)
+target_compile_features(veyra_frame_analysis PUBLIC cxx_std_20)
+target_compile_options(veyra_frame_analysis PRIVATE /utf-8)
+target_compile_definitions(veyra_frame_analysis PRIVATE UNICODE _UNICODE NOMINMAX)
+target_include_directories(veyra_frame_analysis PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_executable(veyra_frame_analyzer apps/frame-analyzer/main.cpp)
+target_compile_options(veyra_frame_analyzer PRIVATE /utf-8)
+target_compile_definitions(veyra_frame_analyzer PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(veyra_frame_analyzer PRIVATE veyra_frame_analysis)
+add_executable(veyra_frame_analysis_tests tests/unit/FrameAnalysisTests.cpp)
+target_compile_options(veyra_frame_analysis_tests PRIVATE /utf-8)
+target_compile_definitions(veyra_frame_analysis_tests PRIVATE UNICODE _UNICODE NOMINMAX)
+target_link_libraries(veyra_frame_analysis_tests PRIVATE veyra_frame_analysis)
 
 # On-screen text reading for live translation (OCR passes, cleanup, line timing),
 # with a scripted OCR engine: no GPU, no Windows OCR language needed.
@@ -170,6 +198,7 @@ add_library(veyra_gfx STATIC
   src/gfx/RifeDmlBackend.cpp
   src/gfx/AmfVideoSrBackend.cpp
   src/gfx/FsrSrBackend.cpp
+  src/gfx/XessSrBackend.cpp
 )
 veyra_apply_warnings(veyra_gfx)
 target_compile_features(veyra_gfx PUBLIC cxx_std_20)
@@ -184,6 +213,10 @@ veyra_apply_warnings(veyra_vrr_profile_tests)
 if(EXISTS "${VEYRA_XESS_ROOT}/inc/xess_fg/xefg_swapchain_d3d12.h")
   target_include_directories(veyra_gfx PRIVATE "${VEYRA_XESS_ROOT}/inc")
   target_compile_definitions(veyra_gfx PRIVATE VEYRA_HAS_XESS=1)
+endif()
+if(EXISTS "${VEYRA_XESS_ROOT}/inc/xess/xess_d3d12.h")
+  target_include_directories(veyra_gfx PRIVATE "${VEYRA_XESS_ROOT}/inc")
+  target_compile_definitions(veyra_gfx PRIVATE VEYRA_HAS_XESS_SR=1)
 endif()
 # AMD AMF SDK headers (MIT) for AMD FRC; the runtime comes with the AMD driver.
 set(VEYRA_AMF_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party_local/amd/AMF-SDK-1.5.3" CACHE PATH "AMD AMF SDK (include/core, include/components)")
@@ -207,10 +240,11 @@ else()
   message(STATUS "ONNX Runtime DirectML headers not found at ${VEYRA_ORT_DML_ROOT}; RIFE is unavailable in this build")
 endif()
 if(EXISTS "${VEYRA_FIDELITYFX2_ROOT}/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h")
-  target_include_directories(veyra_gfx PRIVATE
+  set(VEYRA_FIDELITYFX2_INCLUDE_DIRS
     "${VEYRA_FIDELITYFX2_ROOT}/api/include"
     "${VEYRA_FIDELITYFX2_ROOT}/framegeneration/include"
     "${VEYRA_FIDELITYFX2_ROOT}/upscalers/include")
+  target_include_directories(veyra_gfx PRIVATE ${VEYRA_FIDELITYFX2_INCLUDE_DIRS})
   target_compile_definitions(veyra_gfx PRIVATE VEYRA_HAS_FSR=1)
 endif()
 if(VEYRA_ENABLE_D3D12_DEBUG)
@@ -224,7 +258,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(VEYRA_ENABLE_EXPERIMENTAL_DLSSNR)
   if(NOT VEYRA_DLSS_SDK_ROOT OR NOT EXISTS "${VEYRA_DLSS_SDK_ROOT}/include/nvsdk_ngx.h")
-    message(FATAL_ERROR "VEYRA_ENABLE_EXPERIMENTAL_DLSSNR requires VEYRA_DLSS_SDK_ROOT pointing at NVIDIA DLSS SDK 310.7 (include/nvsdk_ngx.h missing)")
+    message(FATAL_ERROR "VEYRA_ENABLE_EXPERIMENTAL_DLSSNR requires VEYRA_DLSS_SDK_ROOT pointing at a local NVIDIA DLSS SDK (include/nvsdk_ngx.h missing)")
   endif()
 add_library(veyra_ngx STATIC
   src/ngx/NgxCoreHost.cpp
@@ -307,7 +341,7 @@ target_compile_features(veyra_present_scaling_tests PRIVATE cxx_std_20)
 target_compile_options(veyra_present_scaling_tests PRIVATE /utf-8)
 target_compile_definitions(veyra_present_scaling_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(veyra_present_scaling_tests PRIVATE d3d12 dxgi)
-add_dependencies(veyra_present_scaling_tests veyra_shader_present_blit)
+add_dependencies(veyra_present_scaling_tests veyra_shader_present_blit veyra_shader_adaptive_blit)
 veyra_apply_warnings(veyra_runtime_probe)
 target_compile_features(veyra_runtime_probe PRIVATE cxx_std_20)
 target_compile_definitions(veyra_runtime_probe PRIVATE
@@ -319,6 +353,7 @@ veyra_add_compute_shader(veyra_shader_parity_decode ParityDecode)
 veyra_add_compute_shader(veyra_shader_rdna3_nr_decode Rdna3NrDecode)
 veyra_add_compute_shader(veyra_shader_hdr_video_sr HdrVideoSrRestore)
 veyra_add_compute_shader(veyra_shader_sr_resolve SrResolve)
+veyra_add_compute_shader_variant(veyra_shader_sr_resolve_2x SrResolve SrResolve2x VEYRA_RESOLVE_2X)
 veyra_add_compute_shader(veyra_shader_hdr_amd_nr_encode HdrAmdNrEncode)
 veyra_add_compute_shader(veyra_shader_hdr_amd_nr_restore HdrAmdNrRestore)
 if(VEYRA_ENABLE_EXPERIMENTAL_DLSSNR)
@@ -375,6 +410,7 @@ endif()
 
 # YUV→RGB shader is shared between the media pipeline and the harness.
 veyra_add_compute_shader(veyra_shader_yuv_to_rgb YuvToLinearRgb)
+veyra_add_compute_shader_variant(veyra_shader_p210_input YuvToLinearRgb P210ToLinearRgb VEYRA_P210)
 veyra_add_compute_shader(veyra_shader_rgb_to_linear RgbToLinear)
 veyra_add_compute_shader(veyra_shader_color_grade ColorGradePass)
 # 纹理 / 清晰度 / 去朦胧: block statistics, blur, apply (ColorDetailPass).
@@ -383,9 +419,14 @@ veyra_add_compute_shader(veyra_shader_color_detail_blur ColorDetailBlur)
 veyra_add_compute_shader(veyra_shader_color_detail_apply ColorDetailApply)
 veyra_add_compute_shader(veyra_shader_yuy2_to_linear Yuy2ToLinear)
 veyra_add_compute_shader(veyra_shader_packed_capture PackedCaptureToLinear)
+veyra_add_compute_shader_variant(veyra_shader_y210_input PackedCaptureToLinear Y210ToLinearRgb VEYRA_Y210)
 add_dependencies(veyra_shader_rgb_to_linear veyra_shader_yuy2_to_linear)
 # ScaleBlit: working frame -> swapchain backbuffer (Phase 6 present path).
 veyra_add_compute_shader(veyra_shader_scale_blit ScaleBlit)
+# Smart SR: descale (inverse of a source's own bilinear upscale) and render detection probes.
+veyra_add_compute_shader(veyra_shader_smart_sr_reduce SmartSrReduce)
+veyra_add_compute_shader(veyra_shader_smart_sr_probe_reduce SmartSrProbeReduce)
+veyra_add_compute_shader(veyra_shader_smart_sr_probe_residual SmartSrProbeResidual)
 veyra_add_nis_shaders(veyra_shader_nis)
 enable_testing()
 
@@ -393,6 +434,9 @@ add_subdirectory(tests/hdmi-bitstream)
 add_subdirectory(tests/screenshot-alpha)
 veyra_add_compute_shader(veyra_shader_effect_exclusion EffectExclusion)
 # Live HUD Lock (ported from PushFPS, GPL-3.0-or-later): per-pixel HUD mask and compose.
+veyra_add_compute_shader(veyra_shader_subtitle_hold PushOverlay)
+veyra_add_compute_shader(veyra_shader_subtitle_hold_fill PushOverlayFill)
+veyra_add_compute_shader(veyra_shader_subtitle_hold_compose PushOverlayCompose)
 veyra_add_compute_shader(veyra_shader_hud_lock_update HudLockUpdate)
 veyra_add_compute_shader(veyra_shader_hud_lock_dynamic HudLockDynamic)
 veyra_add_compute_shader(veyra_shader_hud_lock_fill HudLockFill)
@@ -408,7 +452,10 @@ veyra_add_compute_shader(veyra_shader_nv12_upload Nv12Upload)
 veyra_add_graphics_shader_pair(veyra_shader_present_blit PresentBlit)
 veyra_add_graphics_shader_pair(veyra_shader_fullscreen_frame_stats FullscreenFrameStats)
 veyra_add_compute_shader(veyra_shader_present_motion PresentMotion)
+veyra_add_pixel_shader_variant(veyra_shader_adaptive_blit PresentBlit PresentAdaptive_ps VEYRA_ADAPTIVE_WIDTH)
+veyra_add_compute_shader_variant(veyra_shader_adaptive_motion PresentMotion PresentAdaptiveMotion VEYRA_ADAPTIVE_WIDTH)
 veyra_add_compute_shader(veyra_shader_hdr_coverage HdrCurveCoverage)
+veyra_add_compute_shader(veyra_shader_console_aim_luma ConsoleAimLuma)
 # NvofDensify: SHORT2 S10.5 raw flow -> workingExtent float2 + confidence.
 veyra_add_compute_shader(veyra_shader_nvof_densify NvofDensify)
 veyra_add_compute_shader(veyra_shader_nr_downsample NrDownsample)
@@ -693,14 +740,14 @@ endif()
 # EnhanceGraph (the real GPU chain) needs the NGX + NVOF backends; wire it
 # into veyra_pipeline only when both exist so bare contract builds still work.
 if(TARGET veyra_ngx AND TARGET veyra_nvof AND VEYRA_FFMPEG_ROOT)
-  target_sources(veyra_pipeline PRIVATE src/pipeline/EnhanceGraph.cpp src/pipeline/NisScaler.cpp src/pipeline/HudLock.cpp src/pipeline/HudProtect.cpp src/pipeline/NrTemporalPass.cpp src/pipeline/NrHoldPass.cpp src/pipeline/NrReusePass.cpp src/core/SceneCadenceAnalyzer.cpp)
+  target_sources(veyra_pipeline PRIVATE src/pipeline/EnhanceGraph.cpp src/pipeline/NisScaler.cpp src/pipeline/HudLock.cpp src/pipeline/SubtitleHold.cpp src/pipeline/HudProtect.cpp src/pipeline/NrTemporalPass.cpp src/pipeline/NrHoldPass.cpp src/pipeline/NrReusePass.cpp src/core/SceneCadenceAnalyzer.cpp)
   target_include_directories(veyra_pipeline PRIVATE ${FFMPEG_INCLUDE_DIRS})
   target_link_libraries(veyra_pipeline PRIVATE veyra_ngx veyra_nvof ${FFMPEG_LIBRARIES})
   add_dependencies(veyra_pipeline
     veyra_shader_yuv_to_rgb veyra_shader_rgb_to_linear veyra_shader_parity_encode
-    veyra_shader_parity_decode veyra_shader_scale_blit veyra_shader_nis
+    veyra_shader_parity_decode veyra_shader_scale_blit veyra_shader_nis veyra_shader_smart_sr_reduce veyra_shader_smart_sr_probe_reduce veyra_shader_smart_sr_probe_residual
     veyra_shader_hdr_amd_nr_encode veyra_shader_hdr_amd_nr_restore
-    veyra_shader_nv12_upload veyra_shader_nvof_densify veyra_shader_packed_capture)
+    veyra_shader_nv12_upload veyra_shader_nvof_densify veyra_shader_packed_capture veyra_shader_p210_input veyra_shader_y210_input)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -795,9 +842,9 @@ if(VEYRA_FFMPEG_ROOT AND EXISTS "${VEYRA_FFMPEG_ROOT}/include/libavformat/avform
   set_source_files_properties(src/sink/HdmiBitstreamOutput.cpp PROPERTIES COMPILE_DEFINITIONS VEYRA_HDMI_BITSTREAM_DIAGNOSTICS)
   target_include_directories(veyra_sinks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_include_directories(veyra_sinks PRIVATE ${FFMPEG_INCLUDE_DIRS})
-  set(VEYRA_NVENC_HEADERS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party_local/nvidia/nv-codec-headers-13.0" CACHE PATH "NVENC 13.0 ABI headers (nv-codec-headers n13.0.19.0)")
+  set(VEYRA_NVENC_HEADERS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party_local/nvidia/nv-codec-headers-13.0" CACHE PATH "NVENC 13.0 ABI headers (nv-codec-headers n13.0.19.1)")
   if(NOT EXISTS "${VEYRA_NVENC_HEADERS_ROOT}/include/ffnvcodec/nvEncodeAPI.h")
-    message(FATAL_ERROR "Stage nv-codec-headers n13.0.19.0 at VEYRA_NVENC_HEADERS_ROOT; see THIRD_PARTY_NOTICES.md")
+    message(FATAL_ERROR "Stage nv-codec-headers n13.0.19.1 at VEYRA_NVENC_HEADERS_ROOT; see THIRD_PARTY_NOTICES.md")
   endif()
   target_include_directories(veyra_sinks PRIVATE "${VEYRA_NVENC_HEADERS_ROOT}/include")
   target_compile_definitions(veyra_sinks PRIVATE VEYRA_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
@@ -812,7 +859,7 @@ if(VEYRA_FFMPEG_ROOT AND EXISTS "${VEYRA_FFMPEG_ROOT}/include/libavformat/avform
 
   # veyra_sources: product input sources (Playbook R3/R7). MediaFileSource
   # composes veyra_media; no second decode implementation exists.
-  add_dependencies(veyra_pipeline veyra_shader_effect_exclusion veyra_shader_hud_lock_update veyra_shader_hud_lock_dynamic veyra_shader_hud_lock_fill veyra_shader_hud_lock_compose veyra_shader_hud_protect_motion veyra_shader_hud_protect_detect veyra_shader_hud_protect_repair veyra_shader_hud_protect_flow veyra_shader_hud_protect_compose veyra_shader_sr_resolve veyra_shader_nr_downsample veyra_shader_nr_residual veyra_shader_nr_temporal veyra_shader_nr_hold veyra_shader_nr_reuse_compose veyra_shader_nr_reuse_warp veyra_shader_flow_adapt veyra_shader_flow_refine veyra_shader_flow_fill veyra_shader_flow_claim veyra_shader_vfg_shot_change veyra_shader_rife_pack veyra_shader_rife_unpack veyra_shader_rife_shot_change)
+  add_dependencies(veyra_pipeline veyra_shader_subtitle_hold veyra_shader_subtitle_hold_fill veyra_shader_subtitle_hold_compose veyra_shader_effect_exclusion veyra_shader_hud_lock_update veyra_shader_hud_lock_dynamic veyra_shader_hud_lock_fill veyra_shader_hud_lock_compose veyra_shader_hud_protect_motion veyra_shader_hud_protect_detect veyra_shader_hud_protect_repair veyra_shader_hud_protect_flow veyra_shader_hud_protect_compose veyra_shader_sr_resolve veyra_shader_sr_resolve_2x veyra_shader_nr_downsample veyra_shader_nr_residual veyra_shader_nr_temporal veyra_shader_nr_hold veyra_shader_nr_reuse_compose veyra_shader_nr_reuse_warp veyra_shader_flow_adapt veyra_shader_flow_refine veyra_shader_flow_fill veyra_shader_flow_claim veyra_shader_vfg_shot_change veyra_shader_rife_pack veyra_shader_rife_unpack veyra_shader_rife_shot_change)
   add_library(veyra_sources STATIC
     src/source/NativeCaptureSink.cpp
     src/source/MediaFileSource.cpp
@@ -1044,11 +1091,15 @@ include_directories(${FFMPEG_INCLUDE_DIRS})
     target_compile_features(veyra_fsr_probe PRIVATE cxx_std_20)
     target_compile_options(veyra_fsr_probe PRIVATE /utf-8 /WX-)
     target_compile_definitions(veyra_fsr_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_include_directories(veyra_fsr_probe PRIVATE ${VEYRA_FIDELITYFX2_INCLUDE_DIRS})
+    target_compile_definitions(veyra_fsr_probe PRIVATE VEYRA_FFX_LOADER=L"${VEYRA_FIDELITYFX2_ROOT}/signedbin/amd_fidelityfx_loader_dx12.dll")
     target_link_libraries(veyra_fsr_probe PRIVATE d3d12 dxgi dxguid)
     add_executable(veyra_fsr_upscale_probe tools/fsr_upscale_probe/main.cpp)
     target_compile_features(veyra_fsr_upscale_probe PRIVATE cxx_std_20)
     target_compile_options(veyra_fsr_upscale_probe PRIVATE /utf-8 /WX-)
     target_compile_definitions(veyra_fsr_upscale_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_include_directories(veyra_fsr_upscale_probe PRIVATE ${VEYRA_FIDELITYFX2_INCLUDE_DIRS})
+    target_compile_definitions(veyra_fsr_upscale_probe PRIVATE VEYRA_FFX_LOADER=L"${VEYRA_FIDELITYFX2_ROOT}/signedbin/amd_fidelityfx_loader_dx12.dll")
     target_link_libraries(veyra_fsr_upscale_probe PRIVATE d3d12 dxgi dxguid)
   endif()
   add_executable(veyra_capture_color_tests tests/unit/CaptureColorContractTests.cpp)
@@ -1108,7 +1159,9 @@ include_directories(${FFMPEG_INCLUDE_DIRS})
   add_executable(veyra_capture_audio_tests tests/integration/CaptureAudioTests.cpp)
   add_test(NAME veyra_capture_audio_hdmi_branch COMMAND veyra_capture_audio_tests --hdmi-branch)
   add_test(NAME veyra_capture_audio_bitstream_reservation COMMAND veyra_capture_audio_tests --bitstream-reservation)
-  set_tests_properties(veyra_capture_audio_hdmi_branch veyra_capture_audio_bitstream_reservation PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(NAME veyra_capture_audio_ps5_startup COMMAND veyra_capture_audio_tests --ps5-audio-startup)
+  set_tests_properties(veyra_capture_audio_hdmi_branch veyra_capture_audio_bitstream_reservation
+    veyra_capture_audio_ps5_startup PROPERTIES SKIP_RETURN_CODE 77)
   target_include_directories(veyra_capture_audio_tests PRIVATE ${FFMPEG_INCLUDE_DIRS})
   add_executable(veyra_avermedia_switch_tests tests/unit/AverMediaAudioSwitchTests.cpp)
   target_compile_features(veyra_avermedia_switch_tests PRIVATE cxx_std_20)
@@ -1400,12 +1453,12 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   target_include_directories(veyra_portable_manifest PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_link_libraries(veyra_portable_manifest PUBLIC Qt6::Core PRIVATE OpenSSL::Crypto ws2_32 crypt32)
 
-  add_executable(veyra_portable_launcher WIN32 apps/veyra-portable/Launcher.cpp)
+  add_executable(veyra_portable_launcher WIN32 apps/veyra-portable/Launcher.cpp src/base/LauncherInstance.cpp)
   target_compile_features(veyra_portable_launcher PRIVATE cxx_std_20)
   target_compile_options(veyra_portable_launcher PRIVATE /utf-8)
   target_compile_definitions(veyra_portable_launcher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_include_directories(veyra_portable_launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-  target_link_libraries(veyra_portable_launcher PRIVATE veyra_base shell32 user32)
+  target_link_libraries(veyra_portable_launcher PRIVATE shell32 user32)
   add_executable(veyra_update_worker apps/veyra-portable/UpdateWorker.cpp)
   target_compile_definitions(veyra_update_worker PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_link_libraries(veyra_update_worker PRIVATE veyra_portable_manifest ole32 uuid)
@@ -1415,7 +1468,9 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   target_compile_features(veyra_update_checker PUBLIC cxx_std_20)
   target_compile_options(veyra_update_checker PRIVATE /utf-8)
   target_include_directories(veyra_update_checker PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(veyra_update_checker PUBLIC Qt6::Core Qt6::Gui Qt6::Network veyra_portable_manifest)
+  target_link_libraries(veyra_update_checker
+    PUBLIC Qt6::Core Qt6::Gui Qt6::Network veyra_portable_manifest
+    PRIVATE OpenSSL::Crypto)
   add_library(veyra_qml_bridge STATIC src/ui/QmlExportQueueModel.cpp include/veyra/ui/QmlExportQueueModel.h src/ui/QmlPlayerBridge.cpp src/ui/ThumbnailProvider.cpp
     src/ui/PlaylistModel.cpp include/veyra/ui/PlaylistModel.h
     src/ui/LiveTranslation.cpp src/ui/LiveTranslation.h
@@ -1463,7 +1518,14 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
     # Custom (Chrome bridge): local HTTP endpoint the browser extension posts to.
     src/ui/bridge/PlaybackServer.cpp
     include/veyra/ui/PlaybackServer.h
+    # 性能诊断 (设置 → 关于): session, system snapshot and sampler.
+    src/ui/bridge/Diagnostics.cpp
+    src/ui/PerfDiagnostics.cpp
+    include/veyra/ui/PerfDiagnostics.h
+    src/ui/PerfDiagnosticsSystem.cpp
+    src/ui/PerfDiagnosticsSystem.h
     src/ui/QmlPlayerBridge_p.h)
+  target_link_libraries(veyra_qml_bridge PRIVATE pdh powrprof dxgi)
   set_target_properties(veyra_qml_bridge PROPERTIES AUTOMOC ON)
   # Interface language (UiLanguage.h): its own small library so the streaming models,
   # which are tested without the player, translate their messages too.
@@ -1481,8 +1543,19 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   target_compile_options(veyra_ui_i18n_tests PRIVATE /utf-8)
   target_link_libraries(veyra_ui_i18n_tests PRIVATE veyra_ui_i18n)
   qt_add_resources(veyra_ui_i18n_tests "veyra_i18n_tests" PREFIX "/i18n" BASE "${CMAKE_CURRENT_SOURCE_DIR}/i18n" FILES i18n/catalog.json)
+  if(VEYRA_ENABLE_MOONLIGHT OR VEYRA_ENABLE_REMOTEPLAY OR VEYRA_ENABLE_XBOX)
+    target_sources(veyra_qml_bridge PRIVATE src/ui/StreamInputCapture.cpp include/veyra/ui/StreamInputCapture.h)
+  endif()
+  if(VEYRA_ENABLE_XBOX)
+    add_library(veyra_xbox_model STATIC src/ui/XboxModel.cpp include/veyra/ui/XboxModel.h)
+    set_target_properties(veyra_xbox_model PROPERTIES AUTOMOC ON)
+    target_compile_features(veyra_xbox_model PUBLIC cxx_std_20)
+    target_include_directories(veyra_xbox_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${FFMPEG_INCLUDE_DIRS})
+    target_compile_definitions(veyra_xbox_model PUBLIC VEYRA_ENABLE_XBOX=1 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(veyra_xbox_model PUBLIC veyra_xbox_protocol veyra_base veyra_ui_i18n Qt6::Core Qt6::Gui)
+    target_link_libraries(veyra_qml_bridge PUBLIC veyra_xbox_model)
+  endif()
   if(VEYRA_ENABLE_MOONLIGHT)
-    target_sources(veyra_qml_bridge PRIVATE src/ui/MoonlightInputCapture.cpp include/veyra/ui/MoonlightInputCapture.h)
     # The PC streaming model (hosts, pairing, apps, settings) is its own small library so it can be
     # tested against the mock host without the whole player.
     add_library(veyra_moonlight_model STATIC src/ui/MoonlightModel.cpp include/veyra/ui/MoonlightModel.h)
@@ -1492,15 +1565,6 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
     target_compile_definitions(veyra_moonlight_model PUBLIC VEYRA_ENABLE_MOONLIGHT=1 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(veyra_moonlight_model PUBLIC veyra_moonlight_protocol veyra_base veyra_ui_i18n Qt6::Core Qt6::Gui)
     target_link_libraries(veyra_qml_bridge PUBLIC veyra_moonlight_model)
-    if(VEYRA_ENABLE_XBOX)
-      add_library(veyra_xbox_model STATIC src/ui/XboxModel.cpp include/veyra/ui/XboxModel.h)
-      set_target_properties(veyra_xbox_model PROPERTIES AUTOMOC ON)
-      target_compile_features(veyra_xbox_model PUBLIC cxx_std_20)
-      target_include_directories(veyra_xbox_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${FFMPEG_INCLUDE_DIRS})
-      target_compile_definitions(veyra_xbox_model PUBLIC VEYRA_ENABLE_XBOX=1 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-      target_link_libraries(veyra_xbox_model PUBLIC veyra_xbox_protocol veyra_base veyra_ui_i18n Qt6::Core Qt6::Gui)
-      target_link_libraries(veyra_qml_bridge PUBLIC veyra_xbox_model)
-    endif()
 
     add_executable(veyra_moonlight_model_tests tests/moonlight/ModelTests.cpp)
     target_compile_features(veyra_moonlight_model_tests PRIVATE cxx_std_20)
@@ -1520,7 +1584,7 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   target_compile_features(veyra_playlist_tests PRIVATE cxx_std_20)
   target_compile_options(veyra_playlist_tests PRIVATE /utf-8)
   target_include_directories(veyra_playlist_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(veyra_playlist_tests PRIVATE Qt6::Core)
+  target_link_libraries(veyra_playlist_tests PRIVATE Qt6::Core veyra_base)
   find_package(Qt6 COMPONENTS Test)
   if(TARGET Qt6::Test)
     add_executable(veyra_live_translation_tests tests/integration/LiveTranslationTests.cpp)
@@ -1532,6 +1596,17 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
     target_compile_options(veyra_audio_volume_bridge_tests PRIVATE /utf-8)
     target_link_options(veyra_audio_volume_bridge_tests PRIVATE /STACK:8388608)
     target_link_libraries(veyra_audio_volume_bridge_tests PRIVATE veyra_qml_bridge Qt6::Test)
+    add_executable(veyra_capture_query_bridge_tests tests/integration/CaptureQueryBridgeTests.cpp)
+    target_compile_features(veyra_capture_query_bridge_tests PRIVATE cxx_std_20)
+    target_compile_options(veyra_capture_query_bridge_tests PRIVATE /utf-8)
+    target_link_options(veyra_capture_query_bridge_tests PRIVATE /STACK:8388608)
+    target_include_directories(veyra_capture_query_bridge_tests PRIVATE ${FFMPEG_INCLUDE_DIRS} apps/veyra/ui)
+    target_link_libraries(veyra_capture_query_bridge_tests PRIVATE veyra_qml_bridge)
+    add_executable(veyra_record_multipass_pref_tests tests/integration/RecordMultipassPreferenceTests.cpp)
+    target_compile_features(veyra_record_multipass_pref_tests PRIVATE cxx_std_20)
+    target_compile_options(veyra_record_multipass_pref_tests PRIVATE /utf-8)
+    target_link_options(veyra_record_multipass_pref_tests PRIVATE /STACK:8388608)
+    target_link_libraries(veyra_record_multipass_pref_tests PRIVATE veyra_qml_bridge Qt6::Test)
     add_executable(veyra_qml_rife_availability_tests tests/integration/QmlRifeAvailabilityTests.cpp)
     target_compile_features(veyra_qml_rife_availability_tests PRIVATE cxx_std_20)
     target_compile_options(veyra_qml_rife_availability_tests PRIVATE /utf-8)
@@ -1579,6 +1654,8 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   add_executable(veyra_qml_ui WIN32 apps/veyra-qml/main.cpp apps/veyra-qml/ProfileInstance.cpp
     src/ui/QmlDataDirectory.cpp src/ui/QmlDiskCache.cpp)
   add_dependencies(veyra_qml_ui veyra_virtualcam_components)
+  # The diagnostics dialog runs it from the program folder.
+  add_dependencies(veyra_qml_ui veyra_frame_analyzer)
   if(VEYRA_UPDATE_PUBLIC_KEY)
     add_dependencies(veyra_qml_ui veyra_portable_launcher veyra_update_worker)
   endif()
@@ -1619,7 +1696,7 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   # Reserve only: pages are committed as they are touched.
   target_link_options(veyra_qml_ui PRIVATE /STACK:8388608)
   # Qt6::CorePrivate only for QUnifiedTimer's slow mode behind --slow-animations.
-  target_link_libraries(veyra_qml_ui PRIVATE veyra_qml_bridge veyra_engine veyra_startup_music Qt6::CorePrivate dbghelp ole32 rstrtmgr)
+  target_link_libraries(veyra_qml_ui PRIVATE veyra_qml_bridge veyra_engine veyra_startup_music Qt6::CorePrivate dbghelp ole32)
 
   add_executable(veyra_qml_data_tests tests/unit/QmlDataDirectoryTests.cpp src/ui/QmlDataDirectory.cpp)
   add_executable(veyra_capture_capability_tests tests/unit/CaptureCapabilityTests.cpp)
@@ -1815,7 +1892,7 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
   target_link_libraries(veyra_repair_fg_tests PRIVATE veyra_pipeline veyra_sinks veyra_nvof)
 
   # Headless quality-core runner (Playbook R3.3): the phase5 gate's quality
-  add_library(veyra_engine STATIC src/engine/EngineController.cpp src/engine/EngineWatchdog.cpp src/engine/PreviewGpuSession.cpp src/engine/CaptureGraphPreparation.cpp src/engine/EngineControllerImage.cpp src/engine/PosterFrame.cpp src/engine/EffectChain.cpp src/engine/PresetLibrary.cpp src/ui/PlayerUiFacade.cpp src/engine/TiledImageProcessor.cpp src/engine/PresetStore.cpp src/engine/VideoPresenter.cpp src/engine/DisplayStateService.cpp src/engine/VideoExportJob.cpp src/engine/ExportStreams.cpp src/engine/ExportQueue.cpp src/engine/ExportJobManager.cpp src/engine/Subtitles.cpp src/engine/FgCompatibilityProbe.cpp src/engine/LiveRecorder.cpp src/engine/ReplayBuffer.cpp src/engine/MicrophoneCapture.cpp)
+  add_library(veyra_engine STATIC src/engine/EngineController.cpp src/engine/EngineWatchdog.cpp src/engine/CaptureDriverWorker.cpp src/engine/PreviewGpuSession.cpp src/engine/CaptureGraphPreparation.cpp src/engine/EngineControllerImage.cpp src/engine/PosterFrame.cpp src/engine/EffectChain.cpp src/engine/PresetLibrary.cpp src/ui/PlayerUiFacade.cpp src/engine/TiledImageProcessor.cpp src/engine/PresetStore.cpp src/engine/VideoPresenter.cpp src/engine/DisplayStateService.cpp src/engine/VideoExportJob.cpp src/engine/ExportStreams.cpp src/engine/ExportQueue.cpp src/engine/ExportJobManager.cpp src/engine/Subtitles.cpp src/engine/FgCompatibilityProbe.cpp src/engine/LiveRecorder.cpp src/engine/LiveScreenshot.cpp src/engine/ReplayBuffer.cpp src/engine/MicrophoneCapture.cpp)
   target_sources(veyra_pipeline PRIVATE src/guidance/AmdOpticalFlow.cpp
     src/guidance/GpuDisOpticalFlow.cpp third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp)
   target_include_directories(veyra_pipeline PRIVATE third_party/gpu-dis/src/gpu)
@@ -1841,6 +1918,7 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
   target_compile_options(veyra_engine PRIVATE /utf-8)
   target_compile_definitions(veyra_engine PUBLIC VEYRA_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}" VEYRA_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
   target_link_libraries(veyra_engine PUBLIC veyra_pipeline veyra_sources veyra_sinks veyra_ngx veyra_nvof)
+  target_sources(veyra_engine PRIVATE src/engine/ConsoleAimReadback.cpp)
   add_executable(veyra_vfg_export_probe tests/integration/VfgExportProbe.cpp)
   target_compile_features(veyra_vfg_export_probe PRIVATE cxx_std_20)
   target_compile_options(veyra_vfg_export_probe PRIVATE /utf-8)
@@ -1961,6 +2039,7 @@ target_link_options(veyra_hdr_tuning_tests PRIVATE /STACK:33554432)
   target_compile_options(veyra_ui_contract_tests PRIVATE /utf-8)
   target_compile_definitions(veyra_ui_contract_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_include_directories(veyra_ui_contract_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(veyra_ui_contract_tests PRIVATE advapi32)
   add_executable(veyra_popup_selector_tests tests/integration/PopupSelectorTests.cpp)
   add_executable(veyra_subtitle_panel_tests tests/integration/SubtitlePanelTests.cpp)
   add_executable(veyra_subtitle_overlay_tests tests/integration/SubtitleOverlayTests.cpp)
@@ -1976,7 +2055,9 @@ target_link_options(veyra_hdr_tuning_tests PRIVATE /STACK:33554432)
   target_compile_options(veyra_popup_selector_tests PRIVATE /utf-8)
   target_compile_definitions(veyra_popup_selector_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
   target_link_libraries(veyra_popup_selector_tests PRIVATE veyra_base comctl32)
-  add_dependencies(veyra_engine veyra_shader_hdr_video_sr veyra_shader_present_motion veyra_shader_present_blit veyra_shader_hdr_coverage veyra_shader_fullscreen_frame_stats)
+  add_dependencies(veyra_engine veyra_shader_adaptive_blit veyra_shader_adaptive_motion
+    veyra_shader_hdr_video_sr veyra_shader_present_motion veyra_shader_present_blit veyra_shader_hdr_coverage veyra_shader_fullscreen_frame_stats)
+  add_dependencies(veyra_engine veyra_shader_console_aim_luma)
   add_executable(veyra_hdr_color_tests tests/integration/HdrColorTests.cpp)
   add_executable(veyra_hdr_output_tuning_gpu_tests tests/integration/HdrOutputTuningGpuTests.cpp)
   target_compile_features(veyra_hdr_output_tuning_gpu_tests PRIVATE cxx_std_20)
@@ -2030,17 +2111,6 @@ target_link_options(veyra_hdr_tuning_tests PRIVATE /STACK:33554432)
     target_compile_definitions(veyra_ps5_hw_image_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(veyra_ps5_hw_image_tests PRIVATE veyra_engine)
     find_package(SDL3 3.4.14 EXACT CONFIG REQUIRED)
-    # P4-e: the QML front end forwards the PC controller to the PS5 the same way.
-    # Only the SDL library file and headers: SDL3::SDL3's own system-library list
-    # pushed the veyra_qml_ui link line over CMake's response-file threshold, and
-    # link.exe reads response files in the ANSI code page, which breaks the UTF-8
-    # Qt paths under E:/项目. Those system libraries come from #pragma comment in
-    # the private QmlPlayerBridge_p.h instead.
-    if(TARGET veyra_qml_bridge)
-      target_sources(veyra_qml_bridge PRIVATE src/remoteplay/ControllerInput.cpp)
-      target_link_libraries(veyra_qml_bridge PUBLIC $<TARGET_LINKER_FILE:SDL3::SDL3-static>)
-      target_link_libraries(veyra_qml_bridge PRIVATE SDL3::Headers)
-    endif()
     add_executable(veyra_remoteplay_source_tests tests/remoteplay/SourceTests.cpp)
     target_compile_features(veyra_remoteplay_source_tests PRIVATE cxx_std_20)
     target_compile_options(veyra_remoteplay_source_tests PRIVATE /utf-8)
@@ -2057,6 +2127,16 @@ target_link_options(veyra_hdr_tuning_tests PRIVATE /STACK:33554432)
     target_compile_features(veyra_remoteplay_profile_tests PRIVATE cxx_std_20)
     target_compile_definitions(veyra_remoteplay_profile_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(veyra_remoteplay_profile_tests PRIVATE veyra_remoteplay_chiaki)
+  endif()
+  if(TARGET veyra_qml_bridge AND (VEYRA_ENABLE_REMOTEPLAY OR VEYRA_ENABLE_XBOX))
+    if(NOT TARGET SDL3::SDL3-static)
+      find_package(SDL3 3.4.14 EXACT CONFIG REQUIRED)
+    endif()
+    # Keep the system library pragmas in QmlPlayerBridge_p.h so MSVC does
+    # not put Unicode Qt paths in a response file.
+    target_sources(veyra_qml_bridge PRIVATE src/remoteplay/ControllerInput.cpp)
+    target_link_libraries(veyra_qml_bridge PUBLIC $<TARGET_LINKER_FILE:SDL3::SDL3-static>)
+    target_link_libraries(veyra_qml_bridge PRIVATE SDL3::Headers)
   endif()
 
   # matrix executes through the shared product libraries only.
@@ -2076,7 +2156,7 @@ target_link_options(veyra_hdr_tuning_tests PRIVATE /STACK:33554432)
     ${FFMPEG_LIBRARIES} psapi dxgi shell32)
   add_dependencies(veyra_quality_probe
     veyra_shader_yuv_to_rgb veyra_shader_parity_encode
-    veyra_shader_parity_decode veyra_shader_scale_blit
+    veyra_shader_parity_decode veyra_shader_scale_blit veyra_shader_smart_sr_reduce veyra_shader_smart_sr_probe_reduce veyra_shader_smart_sr_probe_residual
     veyra_shader_nv12_upload veyra_shader_nvof_densify)
 
   # UI migration guard: per-frame output hashes for fixed stage configurations.
@@ -2118,7 +2198,7 @@ target_link_options(veyra_hdr_tuning_tests PRIVATE /STACK:33554432)
       ${FFMPEG_LIBRARIES} psapi ole32 mmdevapi avrt)
     add_dependencies(veyra_player_probe
       veyra_shader_yuv_to_rgb veyra_shader_parity_encode
-      veyra_shader_parity_decode veyra_shader_scale_blit veyra_shader_nv12_upload
+      veyra_shader_parity_decode veyra_shader_scale_blit veyra_shader_smart_sr_reduce veyra_shader_smart_sr_probe_reduce veyra_shader_smart_sr_probe_residual veyra_shader_nv12_upload
       veyra_shader_present_blit veyra_shader_nvof_densify)
   endif()
 endif()
@@ -2142,12 +2222,18 @@ endif()
 
 # Layered child subtitle windows require a modern-Windows compatibility manifest.
 if(TARGET veyra_qml_ui)
+  set(VEYRA_RESOURCE_DESCRIPTION "Veyra Video Player")
+  set(VEYRA_RESOURCE_INTERNAL_NAME "veyra_qml_ui")
   set(VEYRA_RESOURCE_FILENAME "veyra_qml_ui.exe")
   configure_file(apps/veyra/version.rc.in ${CMAKE_CURRENT_BINARY_DIR}/veyra-qml-version.rc @ONLY)
   target_sources(veyra_qml_ui PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/veyra-qml-version.rc)
+  set(VEYRA_RESOURCE_DESCRIPTION "Veyra Launcher")
+  set(VEYRA_RESOURCE_INTERNAL_NAME "Veyra")
   set(VEYRA_RESOURCE_FILENAME "Veyra.exe")
   configure_file(apps/veyra/version.rc.in ${CMAKE_CURRENT_BINARY_DIR}/veyra-portable-version.rc @ONLY)
   target_sources(veyra_portable_launcher PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/veyra-portable-version.rc)
+  set(VEYRA_RESOURCE_DESCRIPTION "Veyra Update Worker")
+  set(VEYRA_RESOURCE_INTERNAL_NAME "veyra_update_worker")
   set(VEYRA_RESOURCE_FILENAME "veyra_update_worker.exe")
   configure_file(apps/veyra/version.rc.in ${CMAKE_CURRENT_BINARY_DIR}/veyra-updater-version.rc @ONLY)
   target_sources(veyra_update_worker PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/veyra-updater-version.rc)
@@ -2155,7 +2241,11 @@ endif()
 configure_file(apps/veyra/resource.h ${CMAKE_CURRENT_BINARY_DIR}/veyra-resource.h COPYONLY)
 configure_file(assets/veyra.ico ${CMAKE_CURRENT_BINARY_DIR}/veyra.ico COPYONLY)
 if(TARGET veyra_qml_ui)
-  set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/veyra-qml-version.rc PROPERTIES
+  set_source_files_properties(
+    ${CMAKE_CURRENT_BINARY_DIR}/veyra-qml-version.rc
+    ${CMAKE_CURRENT_BINARY_DIR}/veyra-portable-version.rc
+    ${CMAKE_CURRENT_BINARY_DIR}/veyra-updater-version.rc
+    PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/veyra.ico;${CMAKE_CURRENT_SOURCE_DIR}/apps/veyra/resource.h")
 endif()
 # P4-c: the QML front end hosts the same layered child subtitle window.
@@ -2163,5 +2253,7 @@ if(TARGET veyra_qml_ui)
   # Copied next to the link step and named relatively: a short link line keeps
   # link.exe off the (ANSI-decoded) response file.
   configure_file(apps/veyra/veyra.manifest ${CMAKE_CURRENT_BINARY_DIR}/veyra-qml.manifest COPYONLY)
-  target_link_options(veyra_qml_ui PRIVATE "/MANIFESTINPUT:veyra-qml.manifest")
+  target_link_options(veyra_qml_ui PRIVATE "/MANIFESTUAC:NO" "/MANIFESTINPUT:veyra-qml.manifest")
+  target_link_options(veyra_portable_launcher PRIVATE "/MANIFESTUAC:NO" "/MANIFESTINPUT:veyra-qml.manifest")
+  target_link_options(veyra_update_worker PRIVATE "/MANIFESTUAC:NO" "/MANIFESTINPUT:veyra-qml.manifest")
 endif()

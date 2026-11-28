@@ -277,8 +277,10 @@ QVariantList QmlPlayerBridge::recentFiles() const {
     QVariantList out;
     for (const auto& entry : impl_->facade.recentFiles()) {
         QVariantMap item;
-        item["path"] = utf8Of(entry.path);
-        item["label"] = utf8Of(entry.label);
+        const QString path = utf8Of(entry.path);
+        item["path"] = path;
+        item["label"] = entry.isNetwork() ? PlaylistModel::networkLabel(path) : utf8Of(entry.label);
+        item["network"] = entry.isNetwork();
         item["exists"] = entry.exists;
         out << item;
     }
@@ -368,15 +370,17 @@ QString QmlPlayerBridge::captureSessionSummary() const {
     return parts.join(QStringLiteral(" · "));
 }
 
-void QmlPlayerBridge::resumeCaptureSession() {
+void QmlPlayerBridge::resumeCaptureSession() { resumeCaptureSession(false); }
+
+void QmlPlayerBridge::resumeCaptureSession(bool startupFullscreen) {
+    if (!acceptSourceRequest(startupFullscreen)) return;
     // "Continue": the remembered device, format, audio and colour, re-checked
     // against what the machine reports now; nothing else is picked for the user.
     impl_->capturePrefs = ui::CapturePreferenceStore(impl_->dataDir).load();
     if (impl_->capturePrefs.videoPath.empty()) { emit notice(tr("还没有采集记录"), true); return; }
     impl_->captureDevice = impl_->capturePrefs.videoPath;
     impl_->captureColor = impl_->capturePrefs.colorForDevice(impl_->captureDevice);
-    impl_->captureResumePending = true;
-    queryCapture(2, impl_->captureDevice);
+    queryCapture(2, impl_->captureDevice, startupFullscreen);
 }
 
 QString QmlPlayerBridge::colorStatus() const { return uiText(impl_->snapshot.colorStatus); }
@@ -629,8 +633,10 @@ bool QmlPlayerBridge::resetNode(uint id) {
         impl_->draftGlobals.srTarget = defaults.srTarget;
         impl_->draftGlobals.videoSrQuality = defaults.videoSrQuality;
         impl_->draftGlobals.dlssSrModel = defaults.dlssSrModel;
+        impl_->draftGlobals.fsrSrSharpness=defaults.fsrSrSharpness;
         impl_->draftGlobals.srPrescale = defaults.srPrescale;
         impl_->draftGlobals.srOutput = defaults.srOutput;
+        impl_->draftGlobals.smartSr = defaults.smartSr;
         impl_->draftGlobals.dualSrEnabled=false;impl_->draftGlobals.dualSrTarget=defaults.dualSrTarget;impl_->draftGlobals.dualSrQuality=defaults.dualSrQuality;
     }
     if (!impl_->revalidate(true, &previous)) {
@@ -914,6 +920,8 @@ bool QmlPlayerBridge::applyPresetIndex(int index) {
         auto document = std::make_unique<engine::NodeEditorDocument>();
         document->nodes = candidate; document->layout = nextLayout; document->globals = oldGlobals;
         validation = engine::PresetLibrary::applyToEditor(entry, *document, settings);
+        if (validation.accepted)
+            engine::moveLegacyExclusionToFrameGeneration(document->nodes, &document->layout);
         candidate = document->nodes; nextLayout = document->layout;
         nextGlobals = document->globals.value_or(engine::ChainGlobalSettings::capture(settings));
         // Keep the facade on accepted values until revalidate projects the new
@@ -925,7 +933,11 @@ bool QmlPlayerBridge::applyPresetIndex(int index) {
         const auto keepMetadata = settings.hdrMetadata;
         engine::ChainGlobalSettings::capture(previous).apply(settings);
         settings.hdrCurve = keepCurve; settings.hdrMetadata = keepMetadata;
-    } else validation = engine::PresetLibrary::applyToChain(entry, candidate, settings);
+    } else {
+        validation = engine::PresetLibrary::applyToChain(entry, candidate, settings);
+        if (validation.accepted && engine::moveLegacyExclusionToFrameGeneration(candidate))
+            engine::fromChain(candidate, settings);
+    }
     if (!validation.accepted) { emit notice(uiText(validation.message), true); return false; }
     if (const auto error = settings.validate(); !error.empty()) {
         veyra::log::error("qml-preset", error);

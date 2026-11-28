@@ -80,7 +80,7 @@ struct ChainNode {
     float viewX = 0, viewY = 0;
     // Per-type payload; only the fields that belong to `type` are meaningful.
     ChainNrParams nr{};
-    ProtectionSettings protection{};
+    ProtectionSettings protection{}; // also holds the manual regions on a frame-generation node
     float holdStrength = 0.8f, holdTolerance = 0.02f;
     ColorSettings color{};
     VideoHdrSettings videoHdr{};
@@ -101,10 +101,6 @@ struct EffectChain {
     // Frame-generation detail: the node says whether it runs, this says how many
     // frames it produces. Only meaningful when a frame-generation node is on.
     uint32_t fgMultiplier = 2;
-    // 自动选择倍率开关（2026-10-24）：开启时 fgMultiplier 只是占位/上次手动值，
-    // 真正的档位在运行期由 displayFgAutoMultiplier() 按源帧率和输出上限算出；
-    // 关闭时完全按 fgMultiplier 跑（作者原版逻辑）。
-    bool fgAutoMultiplier = false;
     // Non-stage settings that still belong to a job description (they were in
     // EnhancementSettings before and stay there; copied here for completeness).
     bool fgStrictAdmission = false;
@@ -170,6 +166,8 @@ struct NodeGraphLayout {
 // Legacy node chains are ordered arrays, so removing a stage unambiguously
 // bypasses it. List chains and all remaining payload/layout fields are retained.
 uint32_t removeLegacyNodeProtection(EffectChain&, int* selectedNr = nullptr, int* selectedColour = nullptr);
+bool moveLegacyExclusionToFrameGeneration(EffectChain&, NodeGraphLayout* = nullptr,
+                                          int* selectedNr = nullptr, int* selectedColour = nullptr);
 
 // In-process topology envelope. Parameters remain in EnhancementSettings;
 // editor coordinates and persistent/export-worker layouts are unchanged.
@@ -195,6 +193,9 @@ struct ChainExecutionRequest {
     pipeline::SrOutput srOutput = pipeline::SrOutput::Target;
     bool dualSrEnabled = false;
     pipeline::SrTarget dualSrTarget = pipeline::SrTarget::Uhd4K;
+    // Smart SR: SR has its step at the same size too, and the list order runs
+    // anti-aliasing behind it (SR reads the source's own scaled picture).
+    bool smartSr = false;
 };
 struct ChainExecutionStep {
     EffectType type = EffectType::NrEnhance;
@@ -213,7 +214,8 @@ struct ChainExecutionPlan {
 };
 // Node mode preserves inter-effect order; list mode uses the existing fixed
 // default/NR-first schedules. Each NR size is relative to its actual input,
-// not a global nrBeforeSr flag. Disabled nodes and identity SR need no step.
+// not a global nrBeforeSr flag. Disabled nodes and identity SR need no step
+// (smart SR keeps its identity step: it bounds what runs ahead of SR).
 // Failure is atomic. Hardware admission and port connectivity are not inferred
 // here: callers must establish those before allocating/executing this plan.
 ChainValidation compileChainExecutionPlan(const EffectChain&, const ChainExecutionRequest&, ChainExecutionPlan&);
@@ -224,8 +226,10 @@ struct ChainGlobalSettings {
     pipeline::SrTarget srTarget = pipeline::SrTarget::Uhd4K;
     uint32_t videoSrQuality = kDefaultVideoSrQuality;
     uint32_t dlssSrModel = 0;   // EnhancementSettings::dlssSrModel
+    uint32_t fsrSrSharpness = 0; // EnhancementSettings::fsrSrSharpness
     pipeline::SrPrescale srPrescale = pipeline::SrPrescale::Off;   // EnhancementSettings::srPrescale
     pipeline::SrOutput srOutput = pipeline::SrOutput::Target;      // EnhancementSettings::srOutput
+    bool smartSr = false;                                           // EnhancementSettings::smartSr
     bool dualSrEnabled = false;
     pipeline::SrTarget dualSrTarget = pipeline::SrTarget::Uhd4K;
     uint32_t dualSrQuality = kDefaultVideoSrQuality;

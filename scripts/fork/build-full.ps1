@@ -1,7 +1,7 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param([string]$Source='D:\Projects\Veyra-NRVideo',[string]$Build='D:\Projects\Veyra-work\build\full',[int]$Jobs=2,
       [string[]]$Targets=@('veyra_qml_ui'),[string]$MagewellSdk='D:\Projects\Veyra-work\deps\magewell-sdk-3.3.1.1596\extracted\app\SDKv3',[string]$UpdatePublicKey='')
-# Full-feature Release build: every optional SDK/dependency the official 2.2.1 exe has.
+# Full-feature Release build: every optional SDK/dependency the official exe has.
 # All inputs live under D:\Projects\Veyra-work\deps (see fetch-sdks.ps1, vcpkg-installed, chiaki-stage, ...).
 # Environment changes are for the child cmd only.
 $ErrorActionPreference='Stop'
@@ -10,14 +10,14 @@ $vcvars='C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxil
 $py="$D\py-nanopb\Scripts\python.exe"
 $cfg=@('-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DVEYRA_ENABLE_D3D12_DEBUG=OFF','-DVEYRA_BUILD_QML_UI=ON',
  "-DCMAKE_PREFIX_PATH=$D\qt\6.8.3\msvc2022_64;$vi",
- "-DVEYRA_FFMPEG_ROOT=$D\ffmpeg-root","-DVEYRA_NVENC_HEADERS_ROOT=$D\nvch\nv-codec-headers-n13.0.19.0",
+ "-DVEYRA_FFMPEG_ROOT=$D\ffmpeg-root","-DVEYRA_NVENC_HEADERS_ROOT=$D\nvch\nv-codec-headers-n13.0.19.1",
  "-DOPENSSL_ROOT_DIR=$vi",'-DOPENSSL_USE_STATIC_LIBS=ON',
- '-DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON',"-DVEYRA_DLSS_SDK_ROOT=$D\dlss\DLSS-310.7.0",
+ '-DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON',"-DVEYRA_DLSS_SDK_ROOT=$D\dlss\DLSS-310.9.16",
  "-DVEYRA_NVOF_SDK_ROOT=$D\Optical_Flow_SDK_5.0.7\Optical_Flow_SDK_5.0.7",
  "-DVEYRA_CUDA_DRIVER_INCLUDE_DIR=$D\cuda-cudart-12.8.90\cuda_cudart-windows-x86_64-12.8.90-archive\include",
  "-DVEYRA_XESS_ROOT=$S\intel\xess-3.0.2",
  "-DVEYRA_FIDELITYFX_ROOT=$D\sdk-src\FidelityFX-SDK-1.1.4\sdk",
- "-DVEYRA_FIDELITYFX2_ROOT=$S\amd\FidelityFX-SDK-2.3.0\Kits\FidelityFX",
+ "-DVEYRA_FIDELITYFX2_ROOT=$S\amd\FidelityFX-SDK-2.4.0\Kits\FidelityFX",
  "-DVEYRA_AMF_SDK_ROOT=$S\amd\AMF-SDK-1.5.3","-DVEYRA_ORT_DML_ROOT=$S\ort-dml",
  '-DVEYRA_ENABLE_LIBDOVI=ON',"-DVEYRA_LIBDOVI_ROOT=$D\libdovi-3.4.0",
  "-DVEYRA_LIBASS_ROOT=$vi",

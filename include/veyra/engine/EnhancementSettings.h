@@ -96,6 +96,7 @@ inline constexpr uint32_t kVideoSrFsr=5;
 inline constexpr uint32_t kVideoSrNis=24;
 inline constexpr uint32_t kVideoSrAmf10=25;
 inline constexpr uint32_t kVideoSrAmf11=26;
+inline constexpr uint32_t kVideoSrXess=27; // ID 6 remains reserved for the retired FSR experiment.
 // Fresh SR selections use RTX Video SR medium; explicit saved selections retain
 // their numeric IDs. The UI seeds FSR separately on AMD/Intel adapters.
 inline constexpr uint32_t kDefaultVideoSrQuality=2;
@@ -121,13 +122,17 @@ constexpr uint32_t currentVideoSrQuality(uint32_t quality) {
 }
 constexpr bool amdVideoSr(uint32_t q){return q==kVideoSrAmf10||q==kVideoSrAmf11;}
 constexpr bool spatialVideoSr(uint32_t q){return q==kVideoSrNis||amdVideoSr(q);}
-constexpr bool validVideoSrQuality(uint32_t q){return q<=kVideoSrFsr||vfxVideoSr(q)||spatialVideoSr(q);}
+constexpr bool lowResolutionMotionSr(uint32_t q){return q==kVideoSrFsr||q==kVideoSrXess;}
+constexpr bool validVideoSrQuality(uint32_t q){return q<=kVideoSrFsr||vfxVideoSr(q)||spatialVideoSr(q)||q==kVideoSrXess;}
+constexpr bool videoSrAvailableForSource(uint32_t q,bool stillImage,bool liveSource){
+    return q!=kVideoSrXess||(!stillImage&&!liveSource);
+}
 constexpr bool videoSrRunsOn(uint32_t q,bool nvidia,bool amd){
     if (amdVideoSr(q)) return amd;
-    return validVideoSrQuality(q) && (nvidia || q==kVideoSrFsr || q==kVideoSrNis);
+    return validVideoSrQuality(q) && (nvidia || lowResolutionMotionSr(q) || q==kVideoSrNis);
 }
-// DLSS SR and FSR are temporal: they read the SR motion source. RTX Video SR is spatial.
-constexpr bool temporalVideoSr(uint32_t q){return q==0||q==kVideoSrFsr;}
+// Temporal SR reads the configured SR motion source.
+constexpr bool temporalVideoSr(uint32_t q){return q==0||lowResolutionMotionSr(q);}
 inline constexpr uint32_t kVfxVideoSrQualities[]={16,17,18,19,21,23};
 constexpr VideoSrFamily videoSrFamily(uint32_t q){
     return q>=16&&q<=19?VideoSrFamily::HighBitrate:q==21||q==23?VideoSrFamily::Streaming:VideoSrFamily::Standard;
@@ -414,10 +419,7 @@ struct EnhancementSettings {
     //     frame at 6X against 1.4.0 hitting the full 3.0 of 3 at 4X.
     // Users reported 1.4.0 feeling better, so the looser rule is the default.
     bool fgStrictAdmission=false;
-    // 自动选择倍率开关（2026-10-24）：开启时 multiplier 只是占位/上次手动值，
-    // 实际档位在运行期由 displayFgAutoMultiplier(backend, 源帧率, 输出上限) 算出；
-    // 关闭时按 multiplier 走作者原版逻辑。只对 DLSS 和 VFG 开放。
-    bool fgAutoMultiplier=false;
+    bool reservedMultiplierFlag=false; // Preserve the binary settings layout used by export workers.
     bool captureCompatible=false;
     // Capture audio ingress; requires a reconnect to take effect (the media type
     // is negotiated when the graph is built).
@@ -472,12 +474,18 @@ struct EnhancementSettings {
     pipeline::SrTarget srTarget=pipeline::SrTarget::Uhd4K;
     uint32_t videoSrQuality=kDefaultVideoSrQuality; // 0 DLSS SR; 5 FSR; RTX Video SR family/tier values (videoSrFamily)
     uint32_t dlssSrModel=0;    // DLSS SR only; see kDlssSrModelCount
+    uint32_t fsrSrSharpness=0;  // Percentage for the final FSR pass, 0 disables RCAS.
     // Base SR uses srTarget; the optional second SR has its own target/quality.
     // srPrescale now lowers the first AI result only when dualSrEnabled.
     // srOutput shrinks a single RTX Video SR result (supersampling); double SR
     // ignores it.
     pipeline::SrPrescale srPrescale=pipeline::SrPrescale::Off;
     pipeline::SrOutput srOutput=pipeline::SrOutput::Target;
+    // Smart SR (pipeline/SmartSr.h): a single standard RTX Video SR on live SDR or
+    // HDR10 video measures the render extent of a source that upscaled itself (console
+    // 4K output of a 1080p/1440p game), inverts that upscale and enlarges the
+    // render instead. Native frames keep the ordinary SR. Off by default.
+    bool smartSr=false;
     bool dualSrEnabled=false;
     pipeline::SrTarget dualSrTarget=pipeline::SrTarget::Uhd4K;
     uint32_t dualSrQuality=kDefaultVideoSrQuality; // any SR value (DLSS SR, RTX Video SR family/tier, FSR), independent of the base
@@ -557,10 +565,12 @@ struct EnhancementSettings {
     // game whose frames arrive unevenly (17/50 ms). Re-times frames on the engine thread only.
     bool pacingRepair=false;
     // UI "HUD 自动锁定" (pipeline/HudLock.h, from PushFPS): a per-pixel HUD mask found every
-    // frame and kept out of graph frame generation. Its passes exist only when on.
+    // frame. The selected scope restores either generated frames or every output.
     bool hudLock=false;
     HudProtectMode hudProtect=HudProtectMode::Off;
+    bool subtitleHold=false;
     bool dynamicHud=false;
+    bool hudAllEffects=false;
     ContentRate content=ContentRate::Transport;
     AudioSyncMode audioSync=AudioSyncMode::Automatic;
     int32_t audioOffsetMs=0;
@@ -591,16 +601,21 @@ struct EnhancementSettings {
         }
         if(!nr||!sr)active.lowLatency=defaults.lowLatency;
         if(!nr||!protection.enabled)active.protection=defaults.protection;
-        if(!exclusion.enabled)active.exclusion=defaults.exclusion;
+        if(!exclusion.enabled&&!((multiplier>1||hudAllEffects)&&hudProtect==HudProtectMode::Regions))
+            active.exclusion=defaults.exclusion;
         if(!sr){active.srTarget=defaults.srTarget;active.videoSrQuality=defaults.videoSrQuality;active.srMotion=defaults.srMotion;}
         // The DLSS SR model serves every DLSS SR pass, the second of a double SR too.
         if(!usesDlaa()&&(!sr||(videoSrQuality!=0&&!(dualSrEnabled&&dualSrQuality==0))))active.dlssSrModel=defaults.dlssSrModel;
+        if(!sr||(videoSrQuality!=kVideoSrFsr&&!(dualSrEnabled&&dualSrQuality==kVideoSrFsr)))
+            active.fsrSrSharpness=0;
         if(!sr||!dualSrEnabled){
             active.srPrescale=defaults.srPrescale;
             active.dualSrEnabled=false;active.dualSrTarget=defaults.dualSrTarget;active.dualSrQuality=defaults.dualSrQuality;
         }
         // The supersample shrink belongs to a single RTX Video SR pass.
         if(!sr||!rtxVideoSr(videoSrQuality)||dualSrEnabled)active.srOutput=defaults.srOutput;
+        // Smart SR runs with one standard RTX Video SR pass and no supersample shrink.
+        if(!sr||!ngxVideoSr(videoSrQuality)||dualSrEnabled||active.srOutput!=pipeline::SrOutput::Target)active.smartSr=defaults.smartSr;
         if(multiplier<=1){
             active.frameGenerationBackend=defaults.frameGenerationBackend;active.vfgQuality=defaults.vfgQuality;
             active.fgMotion=defaults.fgMotion;active.fgStrictAdmission=defaults.fgStrictAdmission;
@@ -640,12 +655,13 @@ struct EnhancementSettings {
         if(!(multiplier>1&&frameGenerationBackend==FrameGenerationBackend::Vfg))active.vfgAutoRegulate=defaults.vfgAutoRegulate;
         if(!(multiplier>2))active.fgAdaptive=defaults.fgAdaptive;
         if(!(multiplier>1))active.pacingRepair=defaults.pacingRepair;
-        // XeSS generates inside its own presenter; HUD Lock works on graph frame generation.
-        if(!(multiplier>1&&frameGenerationBackend!=FrameGenerationBackend::XeSS)){
+        // With the default scope, XeSS generates the frames inside its own presenter.
+        if(!hudAllEffects&&!(multiplier>1&&frameGenerationBackend!=FrameGenerationBackend::XeSS)){
             active.hudLock=defaults.hudLock;
             active.dynamicHud=defaults.dynamicHud;
         }
-        if(multiplier<=1)active.hudProtect=defaults.hudProtect;
+        if(multiplier<=1&&!hudAllEffects)active.subtitleHold=false;
+        if(multiplier<=1&&!hudAllEffects)active.hudProtect=defaults.hudProtect;
         return active;
     }
     bool sameActiveVideoParameters(const EnhancementSettings& other) const {
@@ -764,6 +780,7 @@ struct EnhancementSettings {
         if(frameGenerationBackend==FrameGenerationBackend::Rife&&multiplier>3)return "RIFE supports 2X and 3X";
         if(!validVideoSrQuality(videoSrQuality))return "invalid video SR quality";
         if(dlssSrModel>=kDlssSrModelCount)return "invalid DLSS SR model";
+        if(fsrSrSharpness>100)return "invalid FSR sharpness";
         if(!pipeline::validSrTarget(srTarget))return "invalid SR target";
         if(!pipeline::validSrPrescale(srPrescale))return "invalid SR prescale";
         if(!pipeline::validSrOutput(srOutput))return "invalid SR output";

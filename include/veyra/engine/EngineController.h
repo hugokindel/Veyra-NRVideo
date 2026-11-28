@@ -4,6 +4,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <condition_variable>
 #include <functional>
@@ -23,6 +24,7 @@
 #endif
 #ifdef VEYRA_ENABLE_XBOX
 #include "veyra/source/XboxSessionSource.h"
+#include "veyra/engine/XboxControllerSession.h"
 #endif
 #include "veyra/media/AudioTrack.h"
 #include "veyra/media/NetworkSettings.h"
@@ -32,18 +34,16 @@
 #include "veyra/engine/VirtualCamera.h"
 #include "veyra/engine/MirrorOutput.h"
 #include "veyra/engine/ScreenTextCapture.h"
+#include "veyra/engine/ConsoleAimReadback.h"
 #include "veyra/engine/DisplayStateService.h"
 namespace veyra::source { struct RemotePlayConnectDesc; class RemotePlaySessionSource; struct MoonlightConnectDesc; class MoonlightSessionSource; struct XboxConnectDesc; class XboxSessionSource; }
-namespace veyra::remoteplay { struct ControllerState;struct ControllerFeedback; }
+namespace veyra::remoteplay { struct ControllerState;struct ControllerFeedback;class MappedController; }
 namespace veyra::sink { struct RgbaImage; }
 namespace veyra::gfx { class D3D12DeviceContext; class CommandSlotRing; }
 namespace veyra::engine {
 class FrameFlowWindow;
 struct PreviewGpuSession;
 struct PlayerOptions { bool nr=false,sr=false,fg=false,realtime=true; uint32_t fgMultiplier=2; EnhancementSettings settings;
-    // 「自动」抑制态由 settings.fgAutoMultiplier + 源帧率/输出上限在 EngineController
-    // 的每帧循环里判定（previewFgMultiplier=1），不在这里另存状态：PlayerOptions 会在
-    // 每次 applySettings 之后由 from() 重建，放在这里的字段会丢。
     std::optional<ChainRuntimeOrder> nodeOrder; // in-process only; not export shared memory
     int audioStreamIndex=-1; // export selection; -1 selects the container default
     double exportStartSeconds=0.0; // export-only trim; first complete frame at/after this time
@@ -94,6 +94,11 @@ struct PlayerSnapshot {
     bool nrActive=false,srActive=false,fgActive=false;
     bool nrAutoActive=false;
     uint32_t nrAutoPercent=0,nrAutoWidth=0,nrAutoHeight=0;
+    // Smart SR: the preview graph detects the render extent; settled once a verdict
+    // held for three probes; the extent SR enlarges (zero: the ordinary SR path).
+    // Blocked: switched on, but a stage ahead of SR changes the picture.
+    bool smartSrActive=false,smartSrSettled=false,smartSrBlocked=false;
+    uint32_t smartSrWidth=0,smartSrHeight=0;
     std::wstring nrAutoStatus;
     // NR inference reuse: whether the preview graph runs it, whether Auto
     // chooses the level, the level (0 infers every frame, 1/2/3 reuse one
@@ -221,10 +226,12 @@ struct PlayerSnapshot {
     // 0 = no XeSS session has reported yet; the settings UI then falls back to
     // the audited-provider probe.
     int xessMaxInterpolatedFrames=0;
+    bool xessIntelNative=false; // Active render adapter uses Intel's unmodified runtime.
     // AMD FSR frame-generation ceiling (generated frames per presented frame;
     // 1 = 2X). 0 = no FSR session has reported yet.
     int fsrMaxGeneratedFrames=0;
     std::string fsrProviderVersion;
+    std::string fsrSrProviderVersion;
     bool running=false,failed=false,image=false,capture=false,remotePlay=false;
     // The session ended because the GPU stopped completing work (frame-ready timeout or a
     // removed device / driver reset), not because the source failed.
@@ -249,13 +256,20 @@ public:
     void setEnhancementPrewarmEnabled(bool);
     bool requestSettings(EnhancementSettings,std::optional<ChainRuntimeOrder> = std::nullopt,uint64_t* acceptedRevision=nullptr);
     void requestPresentation(PresentationSettings);
+    enum class ConsoleRenderMode { Normal, LowLatency, MeasureWithoutFg, MeasureWithFg };
+    bool setConsoleRenderMode(ConsoleRenderMode);
+    bool consoleRenderReady() const;
+    double mappedGameFps() const;
+    void setConsoleAimProbe(std::shared_ptr<remoteplay::AimTest> probe) { aimReadback_.setProbe(std::move(probe)); }
     void open(HWND video,const std::wstring& path,PlayerOptions options);
 #ifdef VEYRA_ENABLE_REMOTEPLAY
     void openRemotePlay(HWND, source::RemotePlayConnectDesc, PlayerOptions);
     remoteplay::ControllerFeedback remotePlayFeedback();
     void remotePlayController(const remoteplay::ControllerState&);
+    bool remotePlayMappedController(uint64_t destination, std::weak_ptr<remoteplay::MappedController>);
+    bool remotePlayInputActive() const;
     void setRemotePlayTouchpadPressOnly(bool enabled){remotePlayTouchpadPressOnly_=enabled;}
-    void remotePlayLoginPin(std::string);
+    bool remotePlayLoginPin(uint64_t requestId,std::string_view pin);
     // PS5 手柄控制 beside a capture card: a controller-only Remote Play session
     // (the console's keepalive video and audio are dropped on receipt). Start and
     // stop are queued to a dedicated thread, so callers never wait for the
@@ -270,6 +284,7 @@ public:
         bool starting=false,alive=false,connected=false,pinRequired=false,recovering=false,failed=false;
         bool keepaliveReady=false;double keepaliveFps=0; // console video samples dropped per second
         std::wstring message;
+        remoteplay::SessionInbox::LoginPinPrompt loginPin;
     };
     RemoteControlStatus remoteControlStatus()const;
     bool remoteControlRequested()const; // cheap: a start is queued or a session exists
@@ -287,9 +302,16 @@ public:
 #endif
 #ifdef VEYRA_ENABLE_XBOX
     void openXbox(HWND, source::XboxConnectDesc, PlayerOptions);
+    bool startXboxControl(source::XboxConnectDesc);
+    void stopXboxControl() { xboxControl_.stop(); }
+    XboxControllerSession::Status xboxControlStatus() const { return xboxControl_.status(); }
     // Pad and rumble for the running Xbox session; no-ops when none is streaming.
     void xboxController(const remoteplay::ControllerState&);
     remoteplay::ControllerFeedback xboxFeedback();
+    uint64_t xboxInputTarget() const;
+    bool xboxMappedController(uint64_t target, std::weak_ptr<remoteplay::MappedController>, bool native);
+    void xboxNativeKey(uint64_t target, xbox::KeyboardFrame);
+    void xboxNativeMouse(uint64_t target, xbox::MouseFrame);
 #endif
     void stop();
     sink::HdmiBitstreamOutput& hdmiBitstream() { return *hdmiBitstream_; }
@@ -299,7 +321,7 @@ public:
     void setFullscreenMemoryProtection(bool enabled);
     void setFullscreenFrameStats(int corner){fullscreenFrameStatsCorner_=corner;}
     void observeHdrCoverage(bool on){hdrCoverageObserved_=on;}
-    void previewView(PreviewView view){if(!std::isfinite(view.zoom)||!std::isfinite(view.centerX)||!std::isfinite(view.centerY)||!std::isfinite(view.displayAspect)||view.displayAspect<0||view.mode<0||view.mode>6)return;std::lock_guard lock(mutex_);view.zoom=std::clamp(view.zoom,.05f,64.0f);if(view.displayAspect==0)view.displayAspect=previewView_.displayAspect;view.rotationDegrees=previewView_.rotationDegrees;view.userQuarterTurns=previewView_.userQuarterTurns;previewView_=view;}
+    void previewView(PreviewView view){if(!std::isfinite(view.zoom)||!std::isfinite(view.centerX)||!std::isfinite(view.centerY)||!std::isfinite(view.displayAspect)||view.displayAspect<0||view.mode<0||view.mode>PreviewView::kAdaptiveWideMode)return;std::lock_guard lock(mutex_);view.zoom=std::clamp(view.zoom,.05f,64.0f);view.adaptivePreservation=std::clamp(view.adaptivePreservation,0,100);view.adaptiveZoom=std::clamp(view.adaptiveZoom,0,15);if(view.displayAspect==0)view.displayAspect=previewView_.displayAspect;view.rotationDegrees=previewView_.rotationDegrees;view.userQuarterTurns=previewView_.userQuarterTurns;previewView_=view;}
     bool rotatePreviewClockwise(uint64_t session){std::lock_guard lock(mutex_);if(session!=snapshot_.sessionId||(!snapshot_.running&&!snapshot_.image))return false;previewView_.rotateClockwise();return true;}
     PreviewView previewView()const{std::lock_guard lock(mutex_);return previewView_;}
     void setVolume(float gain,bool mute);
@@ -342,6 +364,10 @@ public:
     // True once no presenter holds a swap chain on a previously set window.
     bool mirrorReleased()const{return mirror_.width.load()==0&&MirrorState(mirror_.state.load())!=MirrorState::Active;}
 private:
+#ifdef VEYRA_ENABLE_XBOX
+    std::shared_ptr<source::XboxSessionSource> xboxInputSession(uint64_t target = 0) const;
+    XboxControllerSession xboxControl_;
+#endif
     void run(HWND,std::wstring,PlayerOptions,std::shared_ptr<source::RemotePlayConnectDesc> remoteRequest={},std::shared_ptr<source::MoonlightConnectDesc> moonlightRequest={},std::shared_ptr<source::XboxConnectDesc> xboxRequest={});
     void runLargeImage(HWND,const sink::RgbaImage&,PlayerOptions,gfx::D3D12DeviceContext&,gfx::CommandSlotRing&);
     void post(std::function<void()>);
@@ -383,7 +409,9 @@ private:
     std::unique_ptr<VirtualCamera> virtualCamera_=std::make_unique<VirtualCamera>();
     std::unique_ptr<ScreenTextCapture> screenText_=std::make_unique<ScreenTextCapture>();
     PresentCaptureFanout outputCaptures_{*virtualCamera_,*screenText_};
-    PresentCaptureFanout captures_{recordingCaptures_,outputCaptures_};
+    ConsoleAimReadback aimReadback_;
+    PresentCaptureFanout observedCaptures_{outputCaptures_,aimReadback_};
+    PresentCaptureFanout captures_{recordingCaptures_,observedCaptures_};
     // Declared before worker_: it outlives the engine thread's presenters.
     DisplayStateService displayStates_;
     MirrorOutputLink mirror_; // likewise outlives the presenters
@@ -393,10 +421,18 @@ private:
     std::condition_variable wake_;std::function<void()> pending_;bool shutdown_=false,busy_=false;
     // Owner-thread stall detection (field logs(15)); created before worker_ starts.
     std::unique_ptr<EngineWatchdog> watchdog_;
+    std::unique_ptr<class CaptureDriverWorker> captureDriver_;  // playback-owner only
     std::condition_variable dispatchDone_;bool dispatchExited_=false; // mutex_
     std::wstring hangPreviousStatus_; // mutex_
     EnhancementSettings desired_;uint64_t nextRevision_=1;
     std::optional<ChainRuntimeOrder> desiredNodeOrder_; // protected by mutex_, paired with desired_
+    uint64_t publishSettingsRequest(EnhancementSettings, std::optional<ChainRuntimeOrder>); // mutex held
+    struct ConsoleRenderScope {
+        ConsoleRenderMode mode = ConsoleRenderMode::Normal;
+        uint64_t session = 0;
+        uint32_t multiplier = 1;
+        PresentationSettings presentation;
+    } consoleScope_; // mutex held
     std::atomic<bool> stop_{false},paused_{false},muted_{false};
     std::atomic<bool> captureAudioMonitoring_{true};
     std::shared_ptr<sink::HdmiBitstreamOutput> hdmiBitstream_;

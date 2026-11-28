@@ -61,6 +61,7 @@ HttpsResponse StreamApi::call(const std::string& method, const std::string& path
     r.method = method;
     r.host = host_;
     r.path = path;
+    if (method == "DELETE") r.timeoutMs = 3500;
     r.headers["Content-Type"] = "application/json";
     r.headers["Authorization"] = "Bearer " + token_;
     for (const auto& [k, v] : extraHeaders) r.headers[k] = v;
@@ -95,7 +96,7 @@ std::vector<Console> StreamApi::consoles() {
     }
 }
 
-std::string StreamApi::play(const std::string& serverId, const std::string& locale) {
+std::string StreamApi::play(const std::string& serverId, const std::string& locale, bool controlOnly, StreamResolution resolution) {
     const json body = {
         {"titleId", ""}, {"systemUpdateGroup", ""}, {"clientSessionId", ""},
         {"settings", {{"nanoVersion", "V3;WebrtcTransport.dll"}, {"enableTextToSpeech", false}, {"highContrast", 0},
@@ -103,7 +104,19 @@ std::string StreamApi::play(const std::string& serverId, const std::string& loca
                       {"sdkType", "web"}, {"osName", "windows"}}},
         {"serverId", serverId}, {"fallbackRegionNames", json::array()},
     };
-    const json j = parse(call("POST", "/v5/sessions/home/play", body.dump(), {{"X-MS-Device-Info", kDeviceInfo}}), "play");
+    std::string deviceInfo = kDeviceInfo;
+    if (controlOnly) {
+        // Greenlight 58e832a1 requests the 720p profile with this OS name.
+        auto device = json::parse(deviceInfo);
+        device["dev"]["os"]["name"] = "android";
+        deviceInfo = device.dump();
+    } else if (resolution == StreamResolution::QuadHd) {
+        auto device = json::parse(deviceInfo);
+        const auto [width, height] = streamExtent(resolution);
+        device["dev"]["displayInfo"]["dimensions"] = {{"widthInPixels", width}, {"heightInPixels", height}};
+        deviceInfo = device.dump();
+    }
+    const json j = parse(call("POST", "/v5/sessions/home/play", body.dump(), {{"X-MS-Device-Info", deviceInfo}}), "play");
     const std::string path = j.value("sessionPath", "");
     // "v5/sessions/home/<id>"
     const auto slash = path.find_last_of('/');
@@ -243,8 +256,18 @@ std::vector<IceCandidate> StreamApi::exchangeIce(const std::string& sessionId, c
     }
 }
 
-void StreamApi::keepalive(const std::string& sessionId) {
-    call("POST", "/v5/sessions/home/" + sessionId + "/keepalive", "{}");
+void StreamApi::keepalive(const std::string& sessionId, const RenewToken& renew) {
+    const std::string path = "/v5/sessions/home/" + sessionId + "/keepalive";
+    try {
+        call("POST", path, "{}");
+    } catch (const ServiceError& error) {
+        if (error.status != 401 || !renew) throw;
+        std::string replacement;
+        try { replacement = renew(); } catch (const std::exception&) {}
+        if (replacement.empty() || replacement == token_) throw;
+        setToken(std::move(replacement));
+        call("POST", path, "{}");
+    }
 }
 
 void StreamApi::stop(const std::string& sessionId) {

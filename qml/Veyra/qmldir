@@ -8,6 +8,7 @@ UpdateBanner 1.0 UpdateBanner.qml
 PlaylistWindow 1.0 PlaylistWindow.qml
 PlaybackRateButton 1.0 PlaybackRateButton.qml
 PlaybackRateDialog 1.0 PlaybackRateDialog.qml
+PerfDiagnosticsDialog 1.0 PerfDiagnosticsDialog.qml
 singleton Theme 1.0 Theme.qml
 VAccordion 1.0 VAccordion.qml
 VSubGroup 1.0 VSubGroup.qml
@@ -76,6 +77,7 @@ ProDisplayPanel 1.0 ProDisplayPanel.qml
 
 # Dialog components
 DialogLayer 1.0 DialogLayer.qml
+UpdateDialog 1.0 UpdateDialog.qml
 DialogSection 1.0 DialogSection.qml
 DialogGroup 1.0 DialogGroup.qml
 DialogNote 1.0 DialogNote.qml
@@ -86,6 +88,22 @@ CaptureGuideDialog 1.0 CaptureGuideDialog.qml
 OnboardingGuide 1.0 OnboardingGuide.qml
 DynamicHudRow 1.0 DynamicHudRow.qml
 Ps5SourceDialog 1.0 Ps5SourceDialog.qml
+Ps5LoginPinDialog 1.0 Ps5LoginPinDialog.qml
+Ps5LoginPinField 1.0 Ps5LoginPinField.qml
+ControllerPanelWindow 1.0 ControllerPanelWindow.qml
+ControllerPanelButton 1.0 ControllerPanelButton.qml
+ControllerConnectionPage 1.0 ControllerConnectionPage.qml
+ControllerMethodPage 1.0 ControllerMethodPage.qml
+ControllerBindingsPage 1.0 ControllerBindingsPage.qml
+ControllerFeelPage 1.0 ControllerFeelPage.qml
+ControllerDiagram 1.0 ControllerDiagram.qml
+ConsoleGlyph 1.0 ConsoleGlyph.qml
+KeyCap 1.0 KeyCap.qml
+BindingRow 1.0 BindingRow.qml
+StatusCard 1.0 StatusCard.qml
+StepTabs 1.0 StepTabs.qml
+ConsolePadLabels 1.0 ConsolePadLabels.qml
+ConsoleKeymapOverlay 1.0 ConsoleKeymapOverlay.qml
 PcSourceDialog 1.0 PcSourceDialog.qml
 XboxSourceDialog 1.0 XboxSourceDialog.qml
 ScreenSourceDialog 1.0 ScreenSourceDialog.qml

@@ -65,23 +65,43 @@ struct StageRequest {
     bool uncompressedSource=false;
     const ChainRuntimeOrder* nodeOrder=nullptr; // paired with this settings transaction
     bool amdAdapter=false;
+    bool liveSource=false; // capture, screen and console streams
 };
 
 // Both passes must be supported by the graph adapter. FSR still requires a
 // video source. An inactive second pass keeps its saved settings.
-inline bool dualSrRuns(const EnhancementSettings& s,bool nvidiaAdapter,bool stillImage=false,bool amdAdapter=false){
+inline bool dualSrRuns(const EnhancementSettings& s,bool nvidiaAdapter,bool stillImage=false,bool amdAdapter=false,bool liveSource=false){
     return s.dualSrEnabled&&videoSrRunsOn(s.videoSrQuality,nvidiaAdapter,amdAdapter)&&
         videoSrRunsOn(s.dualSrQuality,nvidiaAdapter,amdAdapter)&&
-        !(stillImage&&(s.videoSrQuality==kVideoSrFsr||s.dualSrQuality==kVideoSrFsr));
+        videoSrAvailableForSource(s.videoSrQuality,stillImage,liveSource)&&
+        videoSrAvailableForSource(s.dualSrQuality,stillImage,liveSource)&&
+        !(stillImage&&(lowResolutionMotionSr(s.videoSrQuality)||lowResolutionMotionSr(s.dualSrQuality)));
 }
-inline pipeline::SrPrescale runningSrPrescale(const EnhancementSettings& s,bool nvidiaAdapter,bool stillImage=false,bool amdAdapter=false){
-    return dualSrRuns(s,nvidiaAdapter,stillImage,amdAdapter)?s.srPrescale:pipeline::SrPrescale::Off;
+inline pipeline::SrPrescale runningSrPrescale(const EnhancementSettings& s,bool nvidiaAdapter,bool stillImage=false,bool amdAdapter=false,bool liveSource=false){
+    return dualSrRuns(s,nvidiaAdapter,stillImage,amdAdapter,liveSource)?s.srPrescale:pipeline::SrPrescale::Off;
 }
 // Supersampling (user 2026-10-28): one RTX Video SR pass evaluates at its target
 // and the result is area-shrunk into srOutput before every later effect. Double
 // SR has its own second target, so the shrink is inactive there.
 inline pipeline::SrOutput runningSrOutput(const EnhancementSettings& s,bool nvidiaAdapter){
     return nvidiaAdapter&&rtxVideoSr(s.videoSrQuality)&&!s.dualSrEnabled?s.srOutput:pipeline::SrOutput::Target;
+}
+
+// Smart SR measures and inverts the source's own scaler, so nothing may change the
+// picture ahead of SR. The list order moves anti-aliasing behind SR for it
+// (ChainExecutionRequest::smartSr); a denoise or an NR-first order there, and any
+// same-size or NR step ahead of SR in a node chain, block it. A colour grade there
+// is fused into the input conversion and stays: it only weakens the detection.
+inline bool smartSrBlocked(const EffectChain& chain,bool nodeOrder,bool nrRuns,bool nrFirst){
+    for(uint32_t i=0;i<chain.nodeCount;++i){
+        const auto& node=chain.nodes[i];
+        if(nodeOrder&&node.type==EffectType::SuperResolution)return false;
+        if(!node.enabled)continue;
+        if(node.type==EffectType::VideoDenoise)return true;
+        if(nodeOrder&&(node.type==EffectType::AntiAliasing||node.type==EffectType::Beauty||
+                       (node.type==EffectType::NrEnhance&&nrRuns)))return true;
+    }
+    return !nodeOrder&&nrRuns&&nrFirst;
 }
 
 // Fills the stage, size and parameter fields of `desc` from `settings`.
@@ -118,7 +138,8 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     const bool boundedAmd=request.exportJob&&!request.stillImage&&request.amdNr&&
         currentNrRuntime(settings.nrRuntime)==NrRuntime::LmxxfAmd;
     const auto policy=request.exportJob?exportNrSizePolicy(settings.nrRuntime,settings.nrPolicy):settings.nrPolicy;
-    const auto srPrescale=runningSrPrescale(settings,request.nvidiaAdapter,request.stillImage,request.amdAdapter);
+    const bool srRequested=request.sr&&videoSrAvailableForSource(settings.videoSrQuality,request.stillImage,request.liveSource);
+    const auto srPrescale=runningSrPrescale(settings,request.nvidiaAdapter,request.stillImage,request.amdAdapter,request.liveSource);
     const auto srOutput=runningSrOutput(settings,request.nvidiaAdapter);
     if(!pipeline::Extent{request.width,request.height}.valid()||!pipeline::validSrTarget(settings.srTarget)||
        !pipeline::validNrSizePolicy(policy)||!pipeline::validSrPrescale(srPrescale)||!pipeline::validSrOutput(srOutput)){
@@ -129,11 +150,11 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     }
     // The NR budget controls NR. AMD optical flow keeps its source extent
     // and applies its own optional half-resolution setting in the graph.
-    auto plan=pipeline::ResolutionPlan::make({request.width,request.height},request.sr,
+    auto plan=pipeline::ResolutionPlan::make({request.width,request.height},srRequested,
         boundedAmd?pipeline::NrSizePolicy::Realtime:policy,
         (request.stillImage||request.exportJob)&&!boundedAmd,settings.revision,settings.srTarget,lowLatency,
         request.amdNr&&currentNrRuntime(settings.nrRuntime)==NrRuntime::LmxxfAmd?1080u:0u,srPrescale,srOutput,
-        dualSrRuns(settings,request.nvidiaAdapter,request.stillImage,request.amdAdapter),settings.dualSrTarget);
+        dualSrRuns(settings,request.nvidiaAdapter,request.stillImage,request.amdAdapter,request.liveSource),settings.dualSrTarget);
     if(request.exportJob&&!request.stillImage)
         plan.nr=exportNrProcessingExtent(plan.base,settings.nrRuntime,policy);
     desc.sourceWidth=request.width;desc.sourceHeight=request.height;
@@ -148,10 +169,20 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     // ResolutionPlan::srApplied describes enlargement, not SDK execution. Raw capture has
     // no compression artifacts: there a source already at the target skips SR as in 2.0.6
     // (5090 field log 57: 4K->4K VSR cost ~8.7 ms a frame and pushed 60 fps over budget).
-    const bool nativeVideoRestore=request.sr&&!request.stillImage&&!request.uncompressedSource&&request.nvidiaAdapter&&
+    // Smart SR (live video, one standard RTX Video SR pass, no supersample shrink)
+    // re-renders a raw frame from its detected render extent, so it keeps the stage
+    // there; until it finds one, such a frame at the work size is copied as before.
+    desc.enableNr=request.nr&&(request.nvidiaAdapter||request.amdNr)&&(!settings.nrLayerCount||settings.activeNrLayerCount()>0);
+    const bool smartSrAsked=settings.smartSr&&srRequested&&!request.stillImage&&!request.exportJob&&request.nvidiaAdapter&&
+        ngxVideoSr(settings.videoSrQuality)&&!plan.dualSrApplied&&
+        srOutput==pipeline::SrOutput::Target;
+    desc.smartSrBlocked=smartSrAsked&&smartSrBlocked(chain,request.nodeOrder!=nullptr,desc.enableNr,lowLatency);
+    const bool smartSr=smartSrAsked&&!desc.smartSrBlocked;
+    const bool nativeVideoRestore=srRequested&&!request.stillImage&&(!request.uncompressedSource||smartSr)&&request.nvidiaAdapter&&
         ngxVideoSr(settings.videoSrQuality);
     desc.enableSr=(plan.srApplied||nativeVideoRestore)&&videoSrRunsOn(settings.videoSrQuality,request.nvidiaAdapter,request.amdAdapter);
-    desc.enableNr=request.nr&&(request.nvidiaAdapter||request.amdNr)&&(!settings.nrLayerCount||settings.activeNrLayerCount()>0);
+    desc.smartSr=smartSr&&desc.enableSr;
+    desc.smartSrNativeCopy=desc.smartSr&&request.uncompressedSource&&!plan.srApplied;
     if(!desc.enableNr||!request.nvidiaAdapter||settings.opticalFlowBackend!=OpticalFlowBackend::Nvidia)
         plan.flow=plan.source;
     desc.flowWidth=plan.flow.width;desc.flowHeight=plan.flow.height;
@@ -165,6 +196,7 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     desc.fgMultiplier=request.fgMultiplier;
     desc.videoSrQuality=currentVideoSrQuality(settings.videoSrQuality);
     desc.dlssSrModel=settings.dlssSrModel;
+    desc.fsrSrSharpness=float(settings.fsrSrSharpness)*0.01f;
     describeNrLayers(settings,desc);
     desc.frameGenerationBackend=settings.frameGenerationBackend;
     desc.vfgQuality=settings.vfgQuality;
@@ -195,14 +227,14 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     desc.contentRate=settings.content;
     desc.opticalFlowBackend=settings.opticalFlowBackend;
     desc.amdFlowHalfResolution=settings.amdFlowHalfResolution;desc.fgMotionRefine=settings.fgMotionRefine;desc.dlssgLite=settings.dlssgLite;desc.vfgAutoRegulate=settings.vfgAutoRegulate;desc.hudLock=settings.hudLock;desc.hudProtect=settings.hudProtect;
-    desc.dynamicHud=settings.dynamicHud;
+    desc.subtitleHold=settings.subtitleHold;desc.dynamicHud=settings.dynamicHud;desc.hudAllEffects=settings.hudAllEffects;
     desc.nrLayersExtent.clear();
     for(uint32_t i=0;i<chain.nodeCount;++i){
         auto& node=chain.nodes[i];
         // Request flags are authoritative for the legacy flat API. Retain a
         // resolution step even when AI SR is unavailable: the existing graph
         // still performs its ordinary source-to-work resize in that slot.
-        if(node.type==EffectType::SuperResolution)node.enabled=request.sr;
+        if(node.type==EffectType::SuperResolution)node.enabled=srRequested;
         if(node.type==EffectType::NrEnhance)
             node.enabled=desc.enableNr&&(!settings.nrLayerCount||node.enabled);
         if(node.type==EffectType::Protection)node.enabled=node.enabled&&desc.enableNr;
@@ -211,7 +243,7 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     ChainExecutionPlan execution;
     const auto validation=compileChainExecutionPlan(chain,{{request.width,request.height},settings.srTarget,
         request.stillImage,request.exportJob,boundedAmd,desc.dualSr?srPrescale:pipeline::SrPrescale::Off,
-        desc.dualSr?pipeline::SrOutput::Target:srOutput,desc.dualSr,settings.dualSrTarget},execution);
+        desc.dualSr?pipeline::SrOutput::Target:srOutput,desc.dualSr,settings.dualSrTarget,desc.smartSr},execution);
     if(!validation.accepted){desc.fixedExecutionPlanError=validation.message;return plan;}
     if(request.nodeOrder){
         // Node order owns the first NR stage, even for an ordinary resize or
@@ -230,7 +262,7 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
     if(!desc.enableNr)for(const auto size:desc.nrLayersSizePolicy){
         desc.nrLayersExtent.push_back(request.exportJob&&!request.stillImage?
             exportNrProcessingExtent(plan.base,settings.nrRuntime,size):
-            pipeline::ResolutionPlan::make({request.width,request.height},request.sr,size,request.stillImage,
+            pipeline::ResolutionPlan::make({request.width,request.height},srRequested,size,request.stillImage,
             settings.revision,settings.srTarget,lowLatency,
                 request.amdNr&&currentNrRuntime(settings.nrRuntime)==NrRuntime::LmxxfAmd?1080u:0u,srPrescale,srOutput,
                 desc.dualSr,settings.dualSrTarget).nr);

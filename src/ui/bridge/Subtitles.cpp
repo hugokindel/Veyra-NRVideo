@@ -23,32 +23,44 @@ void QmlPlayerBridge::refreshSubtitles(const std::wstring& media) {
     auto& i = *impl_;
     i.subTracks.clear(); i.subExternal = i.subLoaded = 0;
     i.subPrimary = i.subSecondary = -1; i.subPrimaryChosen = i.subSecondaryChosen = false;
-    i.subStatus=QFileInfo(QString::fromStdWString(media)).isFile()?tr("正在读取字幕"):QString{}; i.subMedia = media;
+    i.subStatus = QFileInfo(QString::fromStdWString(media)).isFile() ? tr("正在读取字幕") : QString{};
     if(i.subFileLoader)i.subFileGeneration=i.subFileLoader->requestFile(L"");
     i.subFilePath.clear();
     if (i.subAlignWorker.joinable()) { i.subAlignWorker.request_stop(); i.subAlignWorker = {}; }
     i.subAligning = false; i.subAlignReady = false;
+    requestSubtitleScan(media);
+    emit subtitlesChanged();
+}
+void QmlPlayerBridge::requestSubtitleScan(const std::wstring& path) {
+    auto& i = *impl_;
+    i.subMedia = path;
     if (!i.subLoader) i.subLoader = std::make_unique<engine::SubtitleLoader>();
     // A file on a server is scanned only while playback has its buffer (#48): a second reader
     // that takes the same share's bandwidth would starve the picture it is meant to subtitle.
-    const bool server = !media.empty() && (engine::subtitleServerFile(media)||engine::subtitleHttpContainer(media));
+    const bool server = !path.empty() && (media::httpMediaInput(path) || engine::subtitleServerFile(path));
     i.subScanGate = server ? std::make_shared<std::atomic<bool>>(false) : nullptr;
     i.subScanOpen = false;
     i.subLoader->setReadGate(i.subScanGate);
     if (server) i.subStatus = tr("字幕将在视频缓冲好后读取");
-    i.subGeneration = i.subLoader->request(media);
-    emit subtitlesChanged();
+    i.subGeneration = i.subLoader->request(path);
 }
 void QmlPlayerBridge::tickSubtitles() {
     auto& i = *impl_;
     bool changed = false;
+    const auto& n = i.snapshot.network;
+    // The URL may have no extension. Wait for the playback demuxer to identify the stream.
+    if (i.subMedia.empty() && i.liveKind == QLatin1String("url") &&
+        i.openingSessionId != 0 && i.snapshot.sessionId == i.openingSessionId &&
+        !i.snapshot.failed && n.httpMatroskaSubtitles && n.state != media::NetworkStats::State::Failed) {
+        requestSubtitleScan(i.sourceLabel);
+        changed = true;
+    }
     if (i.subScanGate) {
         // Opens once playback holds a few seconds ahead (or has read the whole file), closes when
         // it runs short, and never opens for a server too slow for the stream itself.
-        const auto& n = i.snapshot.network;
         const bool ended = n.active && n.state == media::NetworkStats::State::Ended;
         const bool healthy = n.active && !n.bandwidthLow && n.state == media::NetworkStats::State::Playing;
-        const bool http = engine::subtitleHttpContainer(i.subMedia);
+        const bool http = media::httpMediaInput(i.subMedia);
         const double needed = http ? (i.subScanOpen?0.5:1.0) : (i.subScanOpen?1.0:3.0);
         const bool open = ended || (healthy && n.bufferedSeconds >= needed);
         if (open != i.subScanOpen) {
@@ -235,6 +247,10 @@ void QmlPlayerBridge::tickSubtitles() {
         updateSubtitleOverlay(i.subOverlay, draw, view);
         return;
     }
+    if (i.prefInt("liveSubtitlePosition", 0) == 1) {
+        view.liveX = std::clamp(i.prefInt("liveSubtitleX", 50), 0, 100) / 100.0;
+        view.liveY = std::clamp(i.prefInt("liveSubtitleY", 20), 0, 100) / 100.0;
+    }
     const int alignment = draw.empty() ? 2 : 8;
     const auto beginLive = draw.size();
     const int liveSize = i.prefInt("liveSubtitleSize", 0);
@@ -246,6 +262,7 @@ void QmlPlayerBridge::tickSubtitles() {
     const auto appendLive = [&](const QString& text, double scale, uint32_t alpha, int lines, bool italic = false) {
         SubtitleLine line;
         line.text = text.toStdWString();
+        line.liveCaption = true;
         line.style.alignment = alignment;
         line.style.italic = italic;
         line.style.primary = (alpha << 24) | liveRgb;
@@ -258,7 +275,7 @@ void QmlPlayerBridge::tickSubtitles() {
         appendLive(original, 0.8, 0xb3, 1);
     if (!translated.isEmpty())
         appendLive(translated, 1.0, 0xff, std::clamp(liveLines > 0 ? liveLines : view.targetLines, 1, 3));
-    if (alignment == 8 && draw.size() - beginLive == 2)
+    if (view.liveX < 0 && alignment == 8 && draw.size() - beginLive == 2)
         std::swap(draw[beginLive], draw[beginLive + 1]);
     if (!draft.isEmpty()) appendLive(draft, 0.75, 0x99, 1, true);
     updateSubtitleOverlay(i.subOverlay, draw, view);

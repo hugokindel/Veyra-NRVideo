@@ -103,7 +103,7 @@ struct ChiakiBackend::Impl {
         if(!event||!self.active.load())return;
         switch(event->type){
         case CHIAKI_EVENT_CONNECTED:self.connected=true;self.token.connected();break;
-        case CHIAKI_EVENT_LOGIN_PIN_REQUEST:self.token.loginPinRequired();break;
+        case CHIAKI_EVENT_LOGIN_PIN_REQUEST:self.token.loginPinRequired(event->login_pin_request.pin_incorrect);break;
         case CHIAKI_EVENT_QUIT:
             self.connected=false;self.quitReason=static_cast<int>(event->quit.reason);
             // A remote termination is not a successful decoded EOF.
@@ -230,6 +230,7 @@ BackendResult ChiakiBackend::start(const NativeConnectRequest& request,SessionIn
     s.started=true;return s.record(startCode,"chiaki_session_start");
 }
 BackendResult ChiakiBackend::stop(){
+    std::lock_guard guard(controllerMutex_);
     if(!p_)return {true,0,"already_stopped"};
     auto& s=*p_;
     if(!s.onOwner())return {false,-1102,"wrong_owner_thread"};
@@ -257,11 +258,12 @@ BackendResult ChiakiBackend::requestIdr(){
 }
 BackendResult ChiakiBackend::submitLoginPin(std::string_view pin){
     if(!p_||!p_->onOwner()||!p_->started)return {false,-1104,"pin_without_session"};
-    if(pin.empty()||pin.size()>8||!std::all_of(pin.begin(),pin.end(),[](char c){return c>='0'&&c<='9';}))return {false,-1105,"invalid_login_pin"};
+    if(!validLoginPin(pin))return {false,-1105,"invalid_login_pin"};
     return p_->record(chiaki_session_set_login_pin(&p_->session,reinterpret_cast<const std::uint8_t*>(pin.data()),pin.size()),"chiaki_session_set_login_pin");
 }
 BackendResult ChiakiBackend::submitController(const ControllerState& state){
-    if(!p_||!p_->onOwner()||!p_->started)return {false,-1106,"controller_without_session"};
+    std::lock_guard guard(controllerMutex_);
+    if(!p_||!p_->started)return {false,-1106,"controller_without_session"};
     ChiakiControllerState c;chiaki_controller_state_set_idle(&c);
     struct Mapping{std::uint32_t semantic;ChiakiControllerButton target;};
     static constexpr Mapping buttons[]={

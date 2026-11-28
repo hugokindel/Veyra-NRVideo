@@ -17,12 +17,16 @@
 #include "veyra/remoteplay/Types.h"
 #include "veyra/sink/CaptureAudioSession.h"
 #include "veyra/source/IFrameSource.h"
+#include "veyra/xbox/VideoRtpReceive.h"
+#include "veyra/xbox/Protocol.h"
+#include "veyra/xbox/StreamResolution.h"
 
 struct AVFrame;
 struct ID3D12Device;
 struct ID3D12CommandQueue;
 
 namespace veyra::xbox { class Account; }
+namespace veyra::remoteplay { class MappedController; }
 
 namespace veyra::source {
 
@@ -32,10 +36,13 @@ struct XboxConnectDesc {
     std::string consoleName;         // for messages
     bool gamepad = true;             // forward the PC's controller
     bool softwareDecode = false;    // opt-in workaround for silent hardware decode corruption
+    bool controlOnly = false;       // receive keepalive media without decoding or playback
+    bool d3d11Decode = false;       // opt-in native alternative for problematic D3D12 decode drivers
     std::string locale = "zh-CN";
     std::shared_ptr<ID3D12Device> decodeDevice;
     std::shared_ptr<ID3D12CommandQueue> decodeQueue;
     const std::atomic<bool>* stopRequested = nullptr; // engine owner outlives the source
+    xbox::StreamResolution resolution = xbox::StreamResolution::Auto;
 };
 
 struct XboxStats {
@@ -44,11 +51,16 @@ struct XboxStats {
     std::wstring message;           // progress while starting; the reason when Ended or Failed
     std::string disconnectReason;
     bool reconnectable = false;
+    bool controlOnly = false;
     uint32_t width = 0, height = 0;
     bool hardwareDecode = false;
     uint64_t units = 0, decoded = 0, dropped = 0, decodeErrors = 0, keyframeRequests = 0;
+    uint64_t ingressEvicted = 0, waitingKeyframeDropped = 0, mailboxOverwritten = 0, interopSkipped = 0;
+    unsigned decodeQueueDepth = 0, decodeQueueHighWater = 0;
+    xbox::VideoRtpStats videoRtp;
+    uint64_t audioPacketsDiscarded = 0;
     double receivedFps = 0, decodedFps = 0, videoMbps = 0;
-    double decodeMs = 0, rttMs = 0;
+    double decodeMs = 0, decodeQueueMs = 0, rttMs = 0;
 };
 
 class XboxSessionSource final : public IFrameSource {
@@ -72,6 +84,7 @@ public:
     XboxStats stats() const;
     uint64_t skipped() const;
     uint64_t unitsReceived() const;
+    bool inputReady() const;
     sink::CaptureAudioState audioState() const { return audio_.snapshot(); }
     void setAudioGain(float value) { audio_.setGain(value); }
     void setAudioSync(unsigned mode, int offset) { audio_.setSync(mode, offset); }
@@ -80,16 +93,20 @@ public:
 
     // Controller 0; sent when it changes and at least every 33 ms (the console expects a heartbeat).
     void controller(const remoteplay::ControllerState& state);
+    void setMappedController(std::weak_ptr<remoteplay::MappedController>, bool native);
+    void nativeKey(xbox::KeyboardFrame);
+    void nativeMouse(xbox::MouseFrame);
     remoteplay::ControllerFeedback takeFeedback();
 
 private:
     struct Impl;
     void run(XboxConnectDesc desc);
     void decodeLoop();
+    void sendInput();
     void publish(std::shared_ptr<AVFrame> frame, const pipeline::FramePacket& packet, const SourceInfo& info);
     void setState(XboxStats::State state, std::wstring message);
 
-    std::unique_ptr<Impl> p_;
+    std::atomic<std::shared_ptr<Impl>> p_;
     mutable std::mutex mutex_;
     std::condition_variable ready_;
     std::atomic<bool> cancel_{false};

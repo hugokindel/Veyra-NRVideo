@@ -23,21 +23,61 @@ uint byteAt(uint y, uint index) {
     const float4 t = packedBytes[uint2(index >> 2, y)];
     return uint(round(saturate(t[index & 3]) * 255.0));
 }
-uint wordAt(uint y,uint index){
-    const uint base=index*4;
-    return byteAt(y,base)|(byteAt(y,base+1)<<8)|(byteAt(y,base+2)<<16)|(byteAt(y,base+3)<<24);
+uint wordAt(uint y, uint index) {
+    const uint4 bytes = uint4(round(saturate(packedBytes[uint2(index, y)]) * 255.0));
+    return bytes.x | (bytes.y << 8) | (bytes.z << 16) | (bytes.w << 24);
 }
 [numthreads(16,16,1)]
 void main(uint3 p : SV_DispatchThreadID) {
     if (p.x >= width || p.y >= height) return;
     float3 rgb;
+#ifdef VEYRA_Y210
+    // Y0 U Y1 V, in four little-endian words. Ignore the low six padding bits.
+    const uint pair = p.x / 2;
+    const uint lo = wordAt(p.y, pair * 2);
+    const uint hi = wordAt(p.y, pair * 2 + 1);
+    const bool odd = (p.x & 1) != 0;
+    const float luma = float(((odd ? hi : lo) >> 6) & 1023);
+    float2 cbcr = float2(lo >> 22, hi >> 22);
+    const uint chromaLocation = asuint(reserved);
+    const bool centered = chromaLocation != 0 && (chromaLocation & 1) == 0;
+    if (centered || odd) {
+        const int neighbor = clamp(int(pair) + (centered && !odd ? -1 : 1), 0, int(width / 2) - 1);
+        const float2 adjacent = float2(wordAt(p.y, neighbor * 2) >> 22, wordAt(p.y, neighbor * 2 + 1) >> 22);
+        cbcr = lerp(cbcr, adjacent, centered ? 0.25 : 0.5);
+    }
+    const float y = saturate(limited > 0.5 ? (luma - 64.0) / 876.0 : luma / 1023.0);
+    const float2 uv = (cbcr - 512.0) / (limited > 0.5 && limited < 1.5 ? 896.0 : 1023.0);
+    rgb = matrix709 > 1.5 ? float3(y + 1.4746*uv.y, y - .164553*uv.x - .571353*uv.y, y + 1.8814*uv.x)
+        : matrix709 > .5 ? float3(y + 1.5748*uv.y, y - .1873*uv.x - .4681*uv.y, y + 1.8556*uv.x)
+        : float3(y + 1.402*uv.y, y - .3441*uv.x - .7141*uv.y, y + 1.772*uv.x);
+    rgb = saturate(rgb);
+#else
     if (packing == 6) {
-        const uint base=(p.x/6)*4,i=p.x%6;
-        const uint a=wordAt(p.y,base),b=wordAt(p.y,base+1),c=wordAt(p.y,base+2),d=wordAt(p.y,base+3);
-        const uint ys[6]={(a>>10)&1023,b&1023,(b>>20)&1023,(c>>10)&1023,d&1023,(d>>20)&1023};
-        const uint us[3]={a&1023,(b>>10)&1023,(c>>20)&1023},vs[3]={(a>>20)&1023,c&1023,(d>>10)&1023};
-        float y=float(ys[i])/1023.0;float2 uv=(float2(us[i/2],vs[i/2])-512.0)/1023.0;
-        if(limited>0.5){y=(float(ys[i])-64.0)/876.0;uv=(float2(us[i/2],vs[i/2])-512.0)/896.0;}
+        // Each of the three 4:2:2 pairs shares two adjacent 32-bit words.
+        // Avoid reading the whole group for every pixel.
+        const uint pair = (p.x % 6) / 2;
+        const uint word = (p.x / 6) * 4 + pair;
+        const uint lo = wordAt(p.y, word);
+        const uint hi = wordAt(p.y, word + 1);
+        const bool odd = (p.x & 1) != 0;
+        const uint lumaWord = odd || pair == 2 ? hi : lo;
+        const uint lumaShift = odd ? pair * 10 : ((pair + 1) % 3) * 10;
+        const float luma = float((lumaWord >> lumaShift) & 1023);
+        const uint crWord = pair == 0 ? lo : hi;
+        const uint crShift = pair == 0 ? 20 : (pair - 1) * 10;
+        float2 cbcr = float2((lo >> (pair * 10)) & 1023, (crWord >> crShift) & 1023);
+        // The odd pixel is between two co-sited samples. Across the packing
+        // boundary the first word of the next group carries both components.
+        if (odd && p.x + 1 < width) {
+            const uint next = wordAt(p.y, word + 2);
+            const uint nextCb = pair == 2 ? next : (hi >> ((pair + 1) * 10));
+            cbcr = 0.5 * (cbcr + float2(nextCb & 1023, (next >> (pair * 10)) & 1023));
+        }
+        const float2 chromaDelta = cbcr - 512.0;
+        float y = luma / 1023.0;
+        float2 uv = chromaDelta / 1023.0;
+        if (limited > 0.5) { y = (luma - 64.0) / 876.0; uv = chromaDelta / 896.0; }
         rgb=matrix709>1.5?float3(y+1.4746*uv.y,y-.164553*uv.x-.571353*uv.y,y+1.8814*uv.x)
             :matrix709>.5?float3(y+1.5748*uv.y,y-.187324*uv.x-.468124*uv.y,y+1.8556*uv.x)
             :float3(y+1.402*uv.y,y-.344136*uv.x-.714136*uv.y,y+1.772*uv.x);
@@ -76,6 +116,7 @@ void main(uint3 p : SV_DispatchThreadID) {
         else rgb = float3(((v >> 11) & 31) / 31.0, ((v >> 5) & 63) / 63.0, (v & 31) / 31.0);
     }
     if (limitedU != 0 && packing <= 3) rgb = saturate((rgb - 16.0 / 255.0) * (255.0 / 219.0));
+#endif
     float3 decoded;
     if(transfer>=4){
         float3 nits;

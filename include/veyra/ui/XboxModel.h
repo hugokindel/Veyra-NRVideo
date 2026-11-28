@@ -25,6 +25,7 @@ public:
     struct Launch {
         source::XboxConnectDesc desc;
         QString label;
+        bool startupFullscreen = false;
     };
     using LaunchFn = std::function<bool(Launch)>;
 
@@ -33,6 +34,7 @@ public:
 
     void setLaunchHandler(LaunchFn handler) { launch_ = std::move(handler); }
     void updateStream(bool active, const source::XboxStats& stats);
+    std::optional<source::XboxConnectDesc> controlRequest(const QString& host) const;
 
     QVariantMap state() const;
     QVariantList consoles() const { return consoles_; }
@@ -46,6 +48,7 @@ public:
     Q_INVOKABLE void cancel();
     Q_INVOKABLE bool connectStream();
     Q_INVOKABLE bool resumeLast();
+    bool resumeLast(bool startupFullscreen);
     Q_INVOKABLE bool set(const QString& key, const QVariant& value);
 
     QString lastLabel() const { return lastName_; }
@@ -59,13 +62,15 @@ private:
     void startJob(const QString& status, std::function<std::function<void()>(const std::atomic<bool>&)> work);
     void loadSettings();
     void saveSettings() const;
-    bool launchConsole(const QString& id, const QString& name);
+    bool launchConsole(const QString& id, const QString& name, bool startupFullscreen = false);
 
     LaunchFn launch_;
     std::shared_ptr<xbox::Account> account_;
     QVariantList consoles_;
     QString selected_, status_, code_, verificationUri_, lastId_, lastName_;
     bool busy_ = false, gamepad_ = true, softwareDecode_ = false, loaded_ = false, streamActive_ = false, signingIn_ = false;
+    bool d3d11Decode_ = false;
+    xbox::StreamResolution resolution_ = xbox::StreamResolution::Auto;
     QVariantMap stream_;
     std::atomic<bool> cancel_{false};
     std::jthread worker_;

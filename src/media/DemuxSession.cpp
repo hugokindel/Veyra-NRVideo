@@ -534,6 +534,11 @@ std::shared_ptr<DemuxSession> DemuxSession::open(const OpenParams& params, std::
     s.durationUs_ = context->duration == AV_NOPTS_VALUE ? 0 : context->duration;
     s.containerBitRate_ = context->bit_rate;
     s.formatName_ = context->iformat && context->iformat->name ? context->iformat->name : "";
+    s.httpMatroskaSubtitles_ = s.durationUs_ > 0 && httpMediaInput(s.path_) &&
+        context->iformat == av_find_input_format("matroska") &&
+        std::any_of(s.streams_.begin(), s.streams_.end(), [](const auto& stream) {
+            return stream.type == AVMEDIA_TYPE_SUBTITLE;
+        });
     const bool byteSeekable = context->pb && (context->pb->seekable & AVIO_SEEKABLE_NORMAL);
     const bool hls = s.formatName_.find("hls") != std::string::npos || s.formatName_.find("applehttp") != std::string::npos;
     // A source with a known length that can be repositioned is on demand; anything
@@ -879,6 +884,7 @@ NetworkStats DemuxSession::stats() const {
     NetworkStats out;
     out.active = true;
     out.live = live_;
+    out.httpMatroskaSubtitles = httpMatroskaSubtitles_;
     out.bufferedSeconds = leadSecondsLocked();
     out.targetSeconds = targetSeconds_;
     out.bufferedBytes = video_.bytes + audio_.bytes;
@@ -1437,14 +1443,8 @@ void DemuxSession::doSeek() {
                 break;
             }
         }
-        // -1 below means "all streams", so the timestamp must be in AV_TIME_BASE
-        // (microseconds), not the video stream's time base.
-        const int64_t ts = target + startTimeUs_;
         irq_->arm(kConnectTimeoutMs + kReadTimeoutVodMs);
-        // All streams: the enhancement layer (a second video stream) has to move
-        // with the base stream or the PTS pairing breaks after every seek.
-        (void)videoIndex_;
-        const int result = av_seek_frame(context_, -1, ts, AVSEEK_FLAG_BACKWARD);
+        const int result = seekMediaInput(*context_, target, startTimeUs_);
         irq_->disarm();
         ok = result >= 0;
         if (!ok) {

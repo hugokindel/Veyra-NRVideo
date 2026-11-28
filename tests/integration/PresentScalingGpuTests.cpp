@@ -8,6 +8,7 @@
 //
 // .raw: "VRAW", int32 width, int32 height, then width*height RGBA float32
 // (linear light). Image mode renders the old and the new blit at each size.
+#include "LanczosReference.h"
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -110,6 +111,7 @@ struct View {
     int dstW = 0, dstH = 0;
     double renderW = 0, renderH = 0;
     double cx = 0.5, cy = 0.5;
+    float widthRatio = 1.0f;
 };
 View fitView(int srcW, int srcH, int dstW, int dstH)
 {
@@ -118,13 +120,6 @@ View fitView(int srcW, int srcH, int dstW, int dstH)
 }
 double viewUv(int i, int dst, double render, double center) { return ((i + 0.5) / dst - 0.5) * dst / render + center; }
 
-double catmullRom(double x)
-{
-    x = std::abs(x);
-    if (x < 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
-    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
-    return 0.0;
-}
 double lanczos3(double x)
 {
     x = std::abs(x);
@@ -243,14 +238,14 @@ Image magnifyModel(const Image& src, const View& v)
     return out;
 }
 
-// The shader's minification for SDR-range pictures: Catmull-Rom widened by
+// The shader's minification for SDR-range pictures: Lanczos-2 widened by
 // the shrink factor up to 4:1, and held at its 2:1 width past 4:1. Its
 // anti-ringing hold only acts where a sample exceeds 1.0; the HDR block check
 // covers that.
 Image minifyModel(const Image& src, const View& v)
 {
     const double widest = std::max(src.w / v.renderW, src.h / v.renderH);
-    return separable(src, v, 2.0, catmullRom, widest > 4.001 ? 2.0 : 4.0);
+    return separable(src, v, 2.0, lanczos2, widest > 4.001 ? 2.0 : 4.0);
 }
 
 // What the fine path should produce.
@@ -307,7 +302,7 @@ struct Gpu {
     HANDLE event = nullptr;
     uint64_t fenceValue = 0;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12PipelineState> pso, adaptivePso;
     ComPtr<ID3D12DescriptorHeap> srvHeap, rtvHeap;
     ComPtr<ID3D12QueryHeap> queries;
     ComPtr<ID3D12Resource> queryReadback;
@@ -321,7 +316,8 @@ struct Gpu {
     bool init(const fs::path& shaderDir, UINT adapterIndex)
     {
         const auto vs = readFile(shaderDir / L"PresentBlit_vs.dxil"), ps = readFile(shaderDir / L"PresentBlit_ps.dxil");
-        if (vs.empty() || ps.empty()) {
+        const auto adaptivePs = readFile(shaderDir / L"PresentAdaptive_ps.dxil");
+        if (vs.empty() || ps.empty() || adaptivePs.empty()) {
             std::printf("shaders not found in %s\n", narrow(shaderDir.wstring()).c_str());
             return false;
         }
@@ -386,6 +382,8 @@ struct Gpu {
         pd.RTVFormats[0] = kFormat;
         pd.SampleDesc.Count = 1;
         if (FAILED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)))) return false;
+        pd.PS = {adaptivePs.data(), adaptivePs.size()};
+        if (FAILED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&adaptivePso)))) return false;
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.NumDescriptors = 1;
@@ -515,11 +513,11 @@ struct Gpu {
         ID3D12DescriptorHeap* heaps[] = {srvHeap.Get()};
         list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(root.Get());
-        list->SetPipelineState(pso.Get());
+        list->SetPipelineState(v.widthRatio != 1.0f ? adaptivePso.Get() : pso.Get());
         const double fit = std::min(v.dstW / v.renderW, v.dstH / v.renderH);
         const float constants[16] = {float(v.renderW), float(v.renderH), flags, float(1.0 / fit),
                                      float(v.dstW), float(v.dstH), float(v.cx), float(v.cy),
-                                     0, 0, 203, 0, 0, 0, 0, 0};
+                                     0, 0, 203, 0, 0, 0, v.widthRatio, 0};
         list->SetGraphicsRoot32BitConstants(0, 16, constants, 0);
         list->SetGraphicsRootDescriptorTable(1, srvHeap->GetGPUDescriptorHandleForHeapStart());
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -603,6 +601,59 @@ void exactness(Gpu& gpu, const Image& src, const View& v, const std::string& lab
     }
 }
 
+void runAdaptiveChecks(Gpu& gpu)
+{
+    Image source(512, 288);
+    for (int y = 0; y < source.h; ++y) {
+        for (int x = 0; x < source.w; ++x) {
+            source.at(x, y, 0) = float((x + 0.5) / source.w);
+            source.at(x, y, 1) = float((y + 0.5) / source.h);
+            source.at(x, y, 3) = 1.0f;
+        }
+    }
+    const auto texture = gpu.upload(source);
+    if (!texture) { check(false, "adaptive ramp upload"); return; }
+    for (unsigned turns : {0u, 1u, 2u, 3u}) {
+        const View view{717, 349, 710, 337, .48, .49, 1.55f};
+        const auto result = gpu.render(texture.Get(), view, float(turns << 6));
+        double maxError = 0;
+        for (int y = 0; y < view.dstH; ++y) {
+            for (int x = 0; x < view.dstW; ++x) {
+                const double u = viewUv(x, view.dstW, view.renderW, view.cx);
+                const double v = viewUv(y, view.dstH, view.renderH, view.cy);
+                double red = 0, green = 0;
+                if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
+                    const double dx = 2*u-1;
+                    const double r = view.widthRatio;
+                    const double warped = .5 + .5*dx*r/std::sqrt(1+(r*r-1)*dx*dx);
+                    switch (turns) {
+                    case 1: red=v; green=1-warped; break;
+                    case 2: red=1-warped; green=1-v; break;
+                    case 3: red=1-v; green=warped; break;
+                    default: red=warped; green=v; break;
+                    }
+                    red = std::clamp(red, .5/source.w, 1-.5/source.w);
+                    green = std::clamp(green, .5/source.h, 1-.5/source.h);
+                }
+                maxError = std::max({maxError, std::abs(result.at(x,y,0)-red), std::abs(result.at(x,y,1)-green)});
+            }
+        }
+        std::printf("  adaptive quarter-turn %u max ramp error %.6f\n", turns, maxError);
+        check(maxError < .0015, "adaptive GPU mapping agrees with rotated CPU sample positions and black bars");
+    }
+    const auto data = gpu.upload(noise(1920, 1080, 7));
+    if (!data) { check(false, "adaptive timing upload"); return; }
+    View flat{3440, 1440, 3440, 1440}, adaptive=flat;
+    adaptive.widthRatio = 1.30f;
+    for (const float flags : {kOldFlags, kFineFlags}) {
+        for (int round=0; round<4; ++round) {
+            const bool baseline = round==0||round==3;
+            const double ms = gpu.time(data.Get(), baseline?flat:adaptive, flags, 120);
+            std::printf("  adaptive timing %s fine=%d round=%d 3440x1440 %.4f ms\n",
+                baseline?"linear":"adaptive",flags==kFineFlags,round,ms);
+        }
+    }
+}
 void runChecks(Gpu& gpu)
 {
     // 1:1 must stay a texel-exact copy (HDR and colour checks depend on it).
@@ -787,6 +838,7 @@ int wmain(int argc, wchar_t** argv)
     if (!image.empty()) return imageMode(gpu, image, outDir.empty() ? fs::path(L".") : outDir, sizes);
     runChecks(gpu);
     runTiming(gpu);
+    runAdaptiveChecks(gpu);
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

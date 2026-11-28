@@ -9,7 +9,10 @@
 #include "veyra/remoteplay/StreamRecovery.h"
 #include "veyra/engine/PresentationScheduler.h"
 #include "veyra/engine/FgRecoveryBudget.h"
+#include "veyra/sink/CaptureSyncTarget.h"
+#include "veyra/sink/RemotePlayAudioStartup.h"
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <functional>
 #include <iostream>
@@ -86,6 +89,135 @@ TEST(clock_long_session_drift_and_fg){
         CHECK(admitted>measured*98/100);
     }
 }
+TEST(clock_tracks_sustained_slow_ps5_video) {
+    constexpr HostTime origin = 237512080000LL;
+    constexpr double ingressMs = double(origin) / 10000.0;
+    constexpr double pipelineMs = 50.0;
+    for (const double actualFps : {29.84, 29.5}) {
+        RemotePlayClock clock;
+        clock.reset(origin, 30);
+        veyra::sink::CaptureSyncTarget sync;
+        HostTime previous = -1;
+        double maxLagMs = 0, maxAudioErrorMs = 0;
+        for (uint64_t frame = 0; frame < uint64_t(actualFps * 300); ++frame) {
+            const auto jitter = frame % 97 == 11 ? 30000 : HostTime(frame % 7) * 2200;
+            const HostTime arrival = origin + std::llround(double(frame) * 10000000.0 / actualFps) + jitter;
+            const auto stamp = clock.video(frame, arrival);
+            CHECK(stamp && !stamp->discontinuity && stamp->pts100ns > previous);
+            previous = stamp->pts100ns;
+            const double arrivalMs = double(arrival) / 10000.0;
+            const double hostMs = arrivalMs + pipelineMs;
+            const double lag = arrivalMs - ingressMs - double(stamp->pts100ns) / 10000.0;
+            const auto estimate = sync.observe(pipelineMs + lag, hostMs, arrivalMs);
+            maxLagMs = std::max(maxLagMs, std::abs(lag));
+            maxAudioErrorMs = std::max(maxAudioErrorMs, std::abs(estimate.targetMs - pipelineMs));
+        }
+        std::cout << "slow fps=" << actualFps << " maxLagMs=" << maxLagMs << " maxAudioErrorMs=" << maxAudioErrorMs << '\n';
+        CHECK(maxLagMs < 20.0 && maxAudioErrorMs < 18.0);
+    }
+}
+TEST(clock_tracks_ps5_vfr_transitions) {
+    RemotePlayClock clock;
+    clock.reset(0, 30);
+    HostTime source = 0, previous = -1;
+    uint64_t frame = 0;
+    double maxLagMs = 0;
+    for (const double rate : {30.0, 24.0, 27.0, 30.0, 25.0, 30.0}) {
+        for (unsigned sample = 0; sample < 300; ++sample, ++frame) {
+            if (frame) source += std::llround(10000000.0 / rate);
+            const auto jitter = frame % 97 == 11 ? 30000 : HostTime(frame % 7) * 2200;
+            const auto stamp = clock.video(frame, source + jitter);
+            CHECK(stamp && !stamp->discontinuity && stamp->pts100ns > previous);
+            previous = stamp->pts100ns;
+            maxLagMs = std::max(maxLagMs, double(std::abs(source + jitter - stamp->pts100ns)) / 10000.0);
+        }
+    }
+    std::cout << "24-30 fps maxLagMs=" << maxLagMs << '\n';
+    CHECK(maxLagMs < 55.0);
+}
+TEST(clock_rejects_short_network_burst_as_slow_cadence) {
+    for (const unsigned fps : {30u, 60u}) {
+        RemotePlayClock clock;
+        clock.reset(0, fps);
+        HostTime lastArrival = 0;
+        HostTime maxPtsError = 0;
+        const unsigned burstFrames = (12 * fps + 99) / 100;
+        for (uint64_t frame = 0; frame < fps * 10u; ++frame) {
+            const HostTime source = HostTime(frame * 10000000 / fps);
+            const HostTime delay = frame >= 2 * fps && frame < 2 * fps + burstFrames ? 1200000 : 0;
+            // Delayed packets catch up in index order with a tiny gap.
+            const HostTime arrival = frame ? std::max(lastArrival + 1000, source + delay) : source;
+            lastArrival = arrival;
+            const auto stamp = clock.video(frame, arrival);
+            CHECK(stamp && !stamp->discontinuity);
+            maxPtsError = std::max(maxPtsError, std::abs(stamp->pts100ns - source));
+        }
+        std::cout << "short burst fps=" << fps << " maxPtsErrorMs=" << double(maxPtsError) / 10000.0 << '\n';
+        CHECK(maxPtsError < 10000);
+    }
+}
+TEST(audio_sync_uses_original_video_arrival) {
+    veyra::sink::CaptureSyncTarget sync;
+    constexpr double residence = 52.0;
+    constexpr double arrival = 10000.0;
+    const auto unanchored = sync.observe(952.0, arrival + residence, std::nullopt);
+    CHECK(!unanchored.fallback && unanchored.targetMs == 952.0);
+    const auto anchored = sync.observe(952.0, arrival + residence, arrival);
+    CHECK(anchored.fallback && anchored.targetMs == residence && anchored.localMs == residence);
+}
+TEST(ps5_audio_start_ignores_stale_first_present) {
+    using veyra::sink::RemotePlayAudioStartup;
+    RemotePlayAudioStartup normal;
+    CHECK(normal.observe(10100, 41.0, true));
+
+    // PS5 field reports started on a stale display frame before jumping
+    // forward toward the latest picture. Polling repeats are not new samples.
+    RemotePlayAudioStartup backlog;
+    CHECK(!backlog.observe(10100, 1481.0, true));
+    CHECK(!backlog.observe(10140, 1481.0, false));
+    CHECK(!backlog.observe(10200, 739.0, true));
+    CHECK(!backlog.observe(10230, 300.0, true));
+    CHECK(backlog.observe(10260, 39.0, true));
+
+    RemotePlayAudioStartup steadySlow;
+    CHECK(!steadySlow.observe(10100, 195.0, true));
+    CHECK(!steadySlow.observe(10134, 188.0, true));
+    CHECK(steadySlow.observe(10168, 196.0, true));
+
+    RemotePlayAudioStartup deadline;
+    CHECK(!deadline.observe(10100, 1000.0, true));
+    CHECK(!deadline.observe(10449, 410.0, true));
+    CHECK(deadline.observe(10450, 405.0, true));
+
+    RemotePlayAudioStartup missing;
+    CHECK(missing.observe(10100, std::nullopt, true));
+    CHECK(!missing.observe(10134, 700.0, true));
+}
+TEST(ps5_audio_start_measured_target_and_pcm_tail) {
+    using namespace veyra::sink;
+    constexpr double presentHost = 10039.0;
+    const auto measured = originalVideoResidence(presentHost, 100000000LL);
+    CHECK(measured && *measured == 39.0);
+    CHECK(!originalVideoResidence(presentHost, 100400000LL));
+    CHECK(!originalVideoResidence(presentHost, std::nullopt));
+
+    CaptureSyncTarget clock;
+    constexpr double biasedPtsTarget = 78.0;
+    const auto chosen = clock.observe(measured.value_or(biasedPtsTarget), presentHost, 10000.0);
+    CHECK(chosen.targetMs == 39.0 && chosen.localMs == 39.0 && !chosen.fallback);
+    // At most the buffered section older than the chosen video residence
+    // and the newest callback is removed. This count is in complete stereo
+    // sample frames, so the left/right marker stays paired.
+    constexpr size_t queue = 3600, prefill = 1536;
+    const auto discard = keepRemotePlayStartupPcm(queue - prefill, queue, prefill, chosen.targetMs, 10.0, 48000);
+    CHECK(discard == 1248 && queue - discard == 2352);
+    CHECK(keepRemotePlayStartupPcm(queue - prefill, queue, prefill, 100.0, 10.0, 48000) == 0);
+    const std::array<int16_t, 6> newest{100, -100, 101, -101, 102, -102};
+    std::vector<int16_t> stereo(queue * 2, 0);
+    std::copy(newest.begin(), newest.end(), stereo.data() + stereo.size() - newest.size());
+    const std::span<const int16_t> kept(stereo.data() + discard * 2, (queue - discard) * 2);
+    CHECK(std::equal(newest.begin(), newest.end(), kept.last(newest.size()).begin()));
+}
 TEST(clock_reject_invalid){RemotePlayClock c;CHECK(!c.video(0,0));THROWS(c.reset(0,120));THROWS(c.reset(-1,60));c.reset(10,60);CHECK(!c.video(0,9));CHECK(c.video(1,20));CHECK(!c.video(1,20));CHECK(!c.video(2,19));CHECK(!c.audioPts(0,0,10));CHECK(!c.audioPts(std::numeric_limits<std::uint64_t>::max(),8000,10));}
 TEST(queue_limits_validation){QueueLimits l;l.maxFrames=0;THROWS(VideoIngress{l});l={};l.maxConfigBytes=l.maxBytes+1;THROWS(VideoIngress{l});l={};l.maxAge100ns=0;THROWS(VideoIngress{l});}
 TEST(config_not_counted_as_picture){VideoIngress q;q.begin(1);CHECK(q.push(config(),0)==PushStatus::ConfigStored);CHECK(q.stats().accessUnits==0);CHECK(q.stats().depth==0);CHECK(!q.tryPop(0));}
@@ -137,6 +269,58 @@ TEST(inbox_failure_closes_media){SessionInbox q;auto t=q.begin(monotonic100ns())
 TEST(inbox_begin_and_stop_guards){SessionInbox q;THROWS(q.begin(-1));auto t=q.begin(monotonic100ns());THROWS(q.begin(monotonic100ns()));THROWS(q.finishStop());q.invalidate();THROWS(q.begin(monotonic100ns()));q.finishStop();CHECK(q.begin(monotonic100ns()).generation()>t.generation());}
 TEST(inbox_callbacks_race_invalidate){SessionInbox q;auto t=q.begin(monotonic100ns());std::atomic<bool> finish=false;std::thread worker([&]{while(!finish){t.connected();(void)t.audio(audio(0,480,t.generation()));}});q.invalidate();finish=true;worker.join();CHECK(!q.isCurrent(t.generation()));CHECK(!q.tryAudio());q.finishStop();CHECK(q.snapshot().state==SessionState::Idle);}
 TEST(inbox_failed_requires_backend_join){SessionInbox q;auto t=q.begin(monotonic100ns());t.failed(42);THROWS(q.begin(monotonic100ns()));q.invalidate();q.finishStop();CHECK(q.begin(monotonic100ns()).generation()>t.generation());}
+TEST(inbox_login_pin_only_once_per_request){
+    SessionInbox inbox;
+    auto native=inbox.begin(monotonic100ns());
+    CHECK(!inbox.queueLoginPin(1,"0123"));
+    native.loginPinRequired(false);
+    const auto first=inbox.snapshot().loginPin.requestId;
+    CHECK(first&&!inbox.snapshot().loginPin.incorrect);
+    for(const auto* invalid:{"", "123", "12345", "12345678", " 123", "01a3", "０１２３"})
+        CHECK(!inbox.queueLoginPin(first,invalid));
+    CHECK(inbox.queueLoginPin(first,"0123"));
+    CHECK(inbox.snapshot().loginPin.pending&&!inbox.queueLoginPin(first,"9876"));
+    std::array<char,4> transport{};
+    CHECK(inbox.takeLoginPin(transport)==first);
+    CHECK(std::string_view(transport.data(),transport.size())=="0123");
+    CHECK(!inbox.takeLoginPin(transport));
+    inbox.loginPinSubmitFailed(first);
+    CHECK(inbox.snapshot().loginPin.submitFailed&&inbox.queueLoginPin(first,"9876"));
+    native.loginPinRequired(true);
+    const auto retry=inbox.snapshot().loginPin;
+    CHECK(retry.requestId!=first&&retry.incorrect&&!retry.pending);
+    CHECK(!inbox.takeLoginPin(transport)&&!inbox.queueLoginPin(first,"1234"));
+    CHECK(inbox.queueLoginPin(retry.requestId,"2345"));
+    CHECK(inbox.takeLoginPin(transport)==retry.requestId);
+    native.connected();
+    native.loginPinRequired(false);
+    CHECK(!inbox.snapshot().loginPin.requestId&&!inbox.queueLoginPin(retry.requestId,"1234"));
+    CHECK(inbox.snapshot().state==SessionState::WaitingFirstFrame);
+}
+TEST(inbox_login_pin_isolated_across_reconnect_and_input_modes){
+    SessionInbox video,control;
+    auto old=video.begin(monotonic100ns());
+    auto other=control.begin(monotonic100ns());
+    CHECK(old.generation()==other.generation());
+    old.loginPinRequired(false);other.loginPinRequired(false);
+    const auto oldId=video.snapshot().loginPin.requestId;
+    const auto otherId=control.snapshot().loginPin.requestId;
+    CHECK(oldId!=otherId&&!control.queueLoginPin(oldId,"1234"));
+    CHECK(video.queueLoginPin(oldId,"1234"));
+    video.invalidate();video.finishStop();
+    auto current=video.begin(monotonic100ns());
+    old.loginPinRequired(true);
+    CHECK(!video.snapshot().loginPin.requestId);
+    current.loginPinRequired(false);
+    const auto currentId=video.snapshot().loginPin.requestId;
+    std::array<char,4> transport{};
+    CHECK(currentId!=oldId&&currentId!=otherId&&!video.takeLoginPin(transport));
+    CHECK(!video.queueLoginPin(oldId,"4567")&&!video.queueLoginPin(otherId,"4567"));
+    CHECK(video.queueLoginPin(currentId,"4567"));
+    current.failed(42);
+    CHECK(!video.snapshot().loginPin.requestId&&!video.takeLoginPin(transport));
+    CHECK(control.queueLoginPin(otherId,"7890")&&control.takeLoginPin(transport)==otherId);
+}
 TEST(input_and_mailbox_zero_generation){InputGate g;THROWS(g.begin(0));LatestMailbox<int> m;THROWS(m.begin(0));VideoIngress v;THROWS(v.begin(0));AudioIngress a;THROWS(a.begin(0));}
 TEST(inbox_frame_stamped_after_reader_clock){
     // The same through the session boundary, in the product's order: the reader's clock

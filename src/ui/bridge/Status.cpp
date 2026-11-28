@@ -34,6 +34,11 @@ QString QmlPlayerBridge::srStageNote() const {
     const auto& plan = s.metrics.resolution;
     if (!s.running || !plan.output.valid() || plan.settingsRevision != s.applied.revision) return {};
     QStringList notes;
+    if (plan.srApplied && !s.fsrSrProviderVersion.empty() && s.fsrSrProviderVersion != "unknown")
+        notes << tr("运行中的超分：%1").arg(QString::fromStdString(s.fsrSrProviderVersion));
+    if(s.applied.sr&&(!engine::videoSrAvailableForSource(s.applied.videoSrQuality,s.image,s.capture)||
+        (s.applied.dualSrEnabled&&!engine::videoSrAvailableForSource(s.applied.dualSrQuality,s.image,s.capture))))
+        notes << tr("Intel XeSS 超分当前仅用于视频播放");
     if (plan.srPrescaleIneffective) notes << tr("第二次超分未执行：再次降低后的尺寸须小于基础超分结果及第二次目标。");
     if (plan.srOutputIneffective) notes << tr("超分后缩回未生效：超分须先放大画面，且缩回尺寸要小于超分结果。");
     // Only the standard family restores a source already at the target size.
@@ -44,6 +49,19 @@ QString QmlPlayerBridge::srStageNote() const {
     return notes.join(QStringLiteral("；"));
 }
 
+// Smart SR as the running graph has it: blocked by a stage ahead of SR, still
+// measuring, the render extent SR enlarges, or a source its sender did not upscale.
+bool QmlPlayerBridge::smartSrRunning() const { return impl_->snapshot.running && impl_->snapshot.smartSrActive; }
+QString QmlPlayerBridge::smartSrStatus() const {
+    const auto& s = impl_->snapshot;
+    if (s.running && s.smartSrBlocked)
+        return tr("超分之前有会改动画面的处理（NR、降噪、抗锯齿或美颜），智能超分未运行；请关闭，或移到超分之后。");
+    if (!s.running || !s.smartSrActive) return {};
+    if (s.smartSrWidth && s.smartSrHeight)
+        return tr("检测到渲染分辨率 %1x%2，按此还原后超分").arg(s.smartSrWidth).arg(s.smartSrHeight);
+    if (!s.smartSrSettled) return tr("正在检测渲染分辨率…");
+    return tr("画面不是放大输出，按原画面处理");
+}
 double QmlPlayerBridge::queuedFrames() const {
     // Valid output opportunities held by presenter jobs, not cumulative skips
     // and not the OS/display queue. Zero is meaningful only with a live window.
@@ -457,12 +475,12 @@ void QmlPlayerBridge::updateRunStatus() {
         if(s.pacingFrames>0)options<<tr("帧节奏修复 · 已重排 %1%").arg(qRound(100.0*double(s.pacingRepaired)/double(s.pacingFrames)));
         else options<<tr("帧节奏修复 · 等待去重测出帧率");
     }
-    if(s.running&&!s.image&&s.applied.multiplier>1&&s.applied.hudLock){
+    if(s.running&&!s.image&&(s.applied.multiplier>1||s.applied.hudAllEffects)&&s.applied.hudLock){
         if(s.hudLockState==1)options<<tr("HUD 自动锁定");
         else if(s.hudLockState==2)options<<tr("HUD 自动锁定 · 无法启用");
         else if(s.hudLockState==3)options<<tr("HUD 自动锁定 · 当前补帧方式不支持");
     }
-    if (s.running && !s.image && s.applied.multiplier > 1 && s.applied.dynamicHud) {
+    if (s.running && !s.image && (s.applied.multiplier > 1 || s.applied.hudAllEffects) && s.applied.dynamicHud) {
         if (s.dynamicHudState == 1) options << tr("动态 HUD 保护");
         else if (s.dynamicHudState == 2) options << tr("动态 HUD 保护 · 无法启用");
         else if (s.dynamicHudState == 3) options << tr("动态 HUD 保护 · 当前补帧方式不支持");

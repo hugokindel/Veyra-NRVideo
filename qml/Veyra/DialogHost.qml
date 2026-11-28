@@ -11,10 +11,13 @@ Item {
     z: 100
 
     property string dialog: ""
+    property var controllerPanel: null
+    property bool xboxHostPicker: false
     property bool onboardingActive: false
     readonly property alias captureSettings: captureDialog
     readonly property bool captureGuideOpen: captureGuide.visible
     onDialogChanged: {
+        if (dialog !== "" && veyra.ps5Input) veyra.ps5Input.releasePs5()
         if (dialog !== "capture") {
             legacyCapturePicker.close()
             captureGuide.close()
@@ -22,6 +25,7 @@ Item {
     }
 
     function open(key) {
+        if (key !== "xbox") xboxHostPicker = false
         if (key === "save") saveDialog.resetForOpen()
         if (key === "manage") {
             manageDialog.mode = veyra.nodeMode === 1 ? "node" : "list"
@@ -30,7 +34,16 @@ Item {
         veyra.logUi("ui-dialog", "open " + key + " (was " + (host.dialog || "none") + ")")
         host.dialog = key
     }
-    function close() { host.dialog = "" }
+    function close() { host.dialog = ""; xboxHostPicker = false }
+    function openPs5Mapping(xbox = false, page = "", driving = undefined) {
+        const captureOnly = dialog === "capture" || (dialog === "xbox" && xboxHostPicker)
+            || (dialog === "" && veyra.sourceKind === "capture")
+        controllerPanel?.open({platform: xbox ? "xbox" : "ps5", page, driving, captureOnly})
+    }
+    function pickXboxHost() {
+        xboxHostPicker = true
+        open("xbox")
+    }
 
     signal startPs5()
     signal startMoonlight()
@@ -60,12 +73,26 @@ Item {
         opacity: host.dialog !== "" && !host.onboardingActive ? 1 : 0
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: Theme.d(200) } }
-        TapHandler { onTapped: host.close() }
+        MouseArea {
+            anchors.fill: parent
+            enabled: host.dialog !== "" && !host.onboardingActive
+            onClicked: host.close()
+        }
     }
     // For the motion probe: the open dialog's scale.
     property real motionScale: 1
 
     // --- shared chrome ----------------------------------------------------
+
+    UpdateDialog {
+        dialogHost: host
+        update: veyra.updates.portable
+        exportRunning: veyra.exportRunning
+    }
+    Connections {
+        target: veyra.updates.portable
+        function onInstallationReady() { host.open("update") }
+    }
 
     NetworkSourceDialog {
         id: networkDialog
@@ -92,6 +119,13 @@ Item {
         id: ps5Dialog
         dialogHost: host    }
 
+    Ps5LoginPinDialog {
+        dialogHost: host
+        backend: veyra
+        inlinePrompt: host.controllerPanel?.inlinePin === true
+            && host.controllerPanel.captureOnly === (veyra.ps5LoginPrompt?.controlOnly === true)
+    }
+
     // --- PC 串流（Sunshine / GameStream） ----------------------------------
     // Hosts, pairing, the host's apps and the stream-core settings. The effect chain is not here: once
     // connected, the picture goes through the software's own pages like any other source.
@@ -105,7 +139,9 @@ Item {
     // start. The software never sees the password; only a refresh token is kept, encrypted for this user.
     XboxSourceDialog {
         id: xbDialog
-        dialogHost: host    }
+        dialogHost: host
+        chooseForCapture: host.xboxHostPicker
+    }
 
     // --- 屏幕捕获 ---------------------------------------------------------
     DialogLayer {

@@ -1,15 +1,22 @@
 # 当前项目状态
 
-更新于 2026-11-23。[Veyra 2.2.1 发布页](https://github.com/Likely7/Veyra-NRVideo/releases/tag/v2.2.1)提供 NVIDIA 和 AMD 安装器及便携版。[完整更新](RELEASE_NOTES_2.2.1.md) · [构建与对应源码](BUILD_2.2.1.md)。
+更新于 2026-11-27。公开发行仍为 2.2.1。[Veyra 2.2.1 发布页](https://github.com/Likely7/Veyra-NRVideo/releases/tag/v2.2.1)提供 NVIDIA 和 AMD 安装器及便携版。[完整更新](RELEASE_NOTES_2.2.1.md) · [构建与对应源码](BUILD_2.2.1.md)。
 
 [2.2.0 历史发行](https://github.com/Likely7/Veyra-NRVideo/releases/tag/v2.2.0) · [2.2.0 对应源码与构建](BUILD_2.2.0.md)。
 
 ## Fork：hugokindel/Veyra-NRVideo `feature/mirror-output`
 
-- 基于官方 2.2.1，加入[镜像窗口](MIRROR_WINDOW_2026-11-20.md)（扩展模式第二窗口，同一最终画面，两屏保留 HDR）与 [Elgato 4K Pro 色度修复](ELGATO_4K_PRO_CHROMA_2026-11-24.md)。全功能构建，exe 依赖与官方 2.2.1 一致。
-- 最新补丁标签 `v2.2.1-mirror4`（`33a47f46`）：替换官方 2.2.1 NVIDIA 包中的 `veyra_qml_ui.exe`、`qml/Veyra/Main.qml`、`ProPage.qml`、`shaders/YuvToLinearRgb.dxil`。用户安装 `C:/Shared/Veyra` 为此版本。
+- 基于官方 2.2.2（2026-11-28 合并 `v2.2.2`），加入[镜像窗口](MIRROR_WINDOW_2026-11-20.md)（扩展模式第二窗口，同一最终画面，两屏保留 HDR）与 [Elgato 4K Pro 色度修复](ELGATO_4K_PRO_CHROMA_2026-11-24.md)。全功能构建，exe 依赖（93 个 DLL）与官方 2.2.2 一致。
+- 2.2.2 补丁集合（与官方 2.2.2 NVIDIA 便携包逐文件 SHA-256 比对）：`veyra_qml_ui.exe`、`qml/Veyra/Main.qml`、`ProPage.qml`、`shaders/YuvToLinearRgb.dxil`、`shaders/P210ToLinearRgb.dxil`。尚未打标签/打包。
+- 上一补丁标签 `v2.2.1-mirror4`（`33a47f46`），用户安装 `C:/Shared/Veyra` 仍为此版本。
 - 合并上游、构建、测试与打包流程见 [FORK.md](FORK.md)；构建脚本在 `scripts/fork/`。
 - 待定：更新公钥（当前未写入）；GitHub Release 未创建；采集卡交接时的镜像切换与流媒体/DeckLink/Magewell/AMD 实机未验证。记录见 [WORKLOG](WORKLOG.md) 2026-11-24。
+
+## 2.2.2 本地主线
+
+合入 PS5 双键位与「默认」档案、准星和字幕防拖影、全效果 HUD 保护、实时译文位置与色板、采集驱动阻塞隔离、软件内更新进度与稍后重启。Antigravity 的启动诊断和便携打包修复已在本地 main，整合时保留便携更新与回退。Claude 已收录的光流、回放、录音、低延迟和显示修复沿用现有主线历史。
+
+2.2.2 整合了 Lanczos-2 AA 缩小、#258 智能超分、Claude 性能诊断、近期采集和串流修复、SDK 更新及 Antigravity 启动和打包修复。 [2.2.1 以来的整合记录与 1440p60 NV12 实卡对照](INTEGRATION_2.2.2.md) · [工作日志](WORKLOG.md)
 
 ## 2.2.0
 

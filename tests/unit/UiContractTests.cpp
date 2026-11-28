@@ -13,10 +13,119 @@
 #include "veyra/source/CaptureAudioClock.h"
 #include "veyra/source/DeckLinkInputConnection.h"
 #include "veyra/ui/InterfaceRenderer.h"
+#include "../../src/ui/StartupFullscreenRequest.h"
+#include "../../src/ui/LoginStartup.h"
 #include <iostream>
 #include <vector>
 #include <stdexcept>
 void require(bool value,const char* why){if(!value)throw std::runtime_error(why);}
+
+void loginStartupContracts(const std::filesystem::path& output) {
+    namespace fs = std::filesystem;
+    namespace startup = veyra::ui::login_startup;
+    using namespace veyra::portable;
+
+    const auto dir = fs::absolute(output).lexically_normal().make_preferred() /
+        (L"login-startup-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+    const auto package = dir / L"Veyra 便携版";
+    const auto version = package / versionsFolder / L"2.2.1" / playerName;
+    const auto nextVersion = package / versionsFolder / L"2.2.2-012345abcdef" / playerName;
+    const auto launcher = package / launcherName;
+    const auto standalone = dir / L"Standalone" / playerName;
+    fs::create_directories(version.parent_path());
+    fs::create_directories(nextVersion.parent_path());
+    fs::create_directories(standalone.parent_path());
+    std::ofstream(package / packageMarker, std::ios::binary) << "VEYRA_PORTABLE_V1\nNVIDIA\n";
+    std::ofstream(launcher, std::ios::binary).put('v');
+    std::ofstream(standalone, std::ios::binary).put('v');
+
+    require(startup::executableForPlayer(version) == launcher && startup::executableForPlayer(nextVersion) == launcher,
+            "update or rollback keeps the same root launcher");
+    require(startup::executableForPlayer(standalone) == standalone, "standalone resolves its actual player");
+    const auto command = startup::commandFor(launcher);
+    const auto standaloneCommand = startup::commandFor(standalone);
+    require(command == L"\"" + launcher.wstring() + L"\"", "the command quotes the Unicode path and contains no arguments");
+    require(startup::commandFor(playerName).empty(), "do not register a path that depends on the login working directory");
+
+    struct PrivateHive {
+        HKEY handle = nullptr;
+        ~PrivateHive() { if (handle) RegCloseKey(handle); }
+    } hive;
+    require(RegLoadAppKeyW((dir / L"private.hiv").c_str(), &hive.handle, KEY_ALL_ACCESS, REG_PROCESS_APPKEY, 0) == ERROR_SUCCESS,
+            "open a process-private test hive on disk");
+    const auto key = hive.handle;
+    const auto entry = [&] { return startup::entryStatus(key, command); };
+    const auto toggle = [&](bool enabled) { return startup::setEnabled(key, launcher, enabled); };
+    require(entry() == ERROR_FILE_NOT_FOUND && toggle(false) == ERROR_SUCCESS && entry() == ERROR_FILE_NOT_FOUND,
+            "a fresh login setting is off and turning it off is a no-op");
+    require(toggle(true) == ERROR_SUCCESS && toggle(true) == ERROR_SUCCESS && entry() == ERROR_SUCCESS,
+            "enable registers the exact command and is idempotent");
+    require(startup::entryStatus(key, standaloneCommand) == ERROR_ALREADY_EXISTS &&
+            startup::setEnabled(key, standalone, true) == ERROR_ALREADY_EXISTS &&
+            startup::setEnabled(key, standalone, false) == ERROR_SUCCESS && entry() == ERROR_SUCCESS,
+            "another copy cannot replace or remove the owner");
+
+    constexpr DWORD extra = 42;
+    require(RegSetKeyValueW(key, startup::runKey, L"Other app", REG_DWORD, &extra, sizeof(extra)) == ERROR_SUCCESS,
+            "seed an unrelated startup entry in the private hive");
+    require(toggle(false) == ERROR_SUCCESS && toggle(false) == ERROR_SUCCESS && entry() == ERROR_FILE_NOT_FOUND,
+            "disable removes the owner's command and is idempotent");
+    DWORD unchanged = 0, bytes = sizeof(unchanged);
+    require(RegGetValueW(key, startup::runKey, L"Other app", RRF_RT_REG_DWORD, nullptr, &unchanged, &bytes) == ERROR_SUCCESS &&
+            unchanged == extra, "other startup entries are left alone");
+
+    require(RegSetKeyValueW(key, startup::runKey, startup::valueName, REG_EXPAND_SZ, command.c_str(),
+                            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS,
+            "seed a value not created by Veyra");
+    require(entry() == ERROR_ALREADY_EXISTS && toggle(true) == ERROR_ALREADY_EXISTS &&
+            toggle(false) == ERROR_SUCCESS && entry() == ERROR_ALREADY_EXISTS,
+            "a value of a different type stays intact");
+    require(RegDeleteKeyValueW(key, startup::runKey, startup::valueName) == ERROR_SUCCESS, "reset the private fixture");
+    require(startup::setEnabled(key, package / L"missing.exe", true) == ERROR_FILE_NOT_FOUND && entry() == ERROR_FILE_NOT_FOUND,
+            "missing launcher cannot create an unusable entry");
+    const auto longPath = package / (std::wstring(245, L'a') + L".exe");
+    require(startup::setEnabled(key, longPath, true) == ERROR_FILENAME_EXCED_RANGE && entry() == ERROR_FILE_NOT_FOUND,
+            "commands beyond the Windows Run limit are reported and never saved");
+    std::cout << "PASS login startup: process-private hive, Unicode launcher, ownership, on/off, missing file and path limit\n";
+}
+
+void startupFullscreenContracts() {
+    using veyra::ui::StartupFullscreenRequest;
+    StartupFullscreenRequest resume;
+    require(!resume.take(1, false, true, 1), "startup fullscreen defaults off");
+    require(resume.arm() && resume.awaitingSession(), "an automatic request can wait for async open");
+    require(!resume.take(1, false, true, 1), "a frame before the resume opens cannot satisfy it");
+    resume.bind(2);
+    resume.bind(3);
+    require(resume.hasSession() && !resume.awaitingSession(), "the request binds exactly one session");
+    require(!resume.take(1, true, true, 1), "late shutdown of the previous session is ignored");
+    require(!resume.take(2, false, true, 0), "playing without an actual present waits");
+    require(!resume.take(2, false, true, 1), "a cached present from another session cannot trigger fullscreen");
+    require(!resume.take(2, false, false, 2), "a paused source remains in its current view");
+    require(resume.take(2, false, true, 2), "first real present of the resumed session enters fullscreen");
+    require(!resume.take(2, false, true, 2) && !resume.arm(), "startup fullscreen is a one-shot request");
+
+    StartupFullscreenRequest stopped;
+    require(stopped.arm(), "arm a delayed source");
+    stopped.cancel();
+    stopped.bind(4);
+    require(!stopped.awaitingSession() && !stopped.take(4, false, true, 4), "stop before async completion bars a stale open");
+
+    StartupFullscreenRequest manual;
+    manual.cancel();
+    require(!manual.arm(), "a manual source selected before the startup timer wins");
+
+    StartupFullscreenRequest replaced;
+    require(replaced.arm(), "arm a source before it is replaced");
+    replaced.bind(5);
+    require(!replaced.take(6, false, true, 6) && !replaced.take(5, false, true, 5), "a newer session invalidates the request");
+
+    StartupFullscreenRequest failed;
+    require(failed.arm(), "arm a source before it fails");
+    failed.bind(7);
+    require(!failed.take(7, true, true, 7) && !failed.take(7, false, true, 7), "terminal state wins even if a frame was submitted");
+}
+
 // Judge intentional rate changes against policy, never against measured output.
 void outputRateContracts(){
     using namespace veyra;
@@ -138,6 +247,8 @@ static void interfaceRendererContracts(){
 int wmain(int argc,wchar_t** argv){try{
     using namespace veyra;
     outputRateContracts();
+    startupFullscreenContracts();
+    if (argc > 1) loginStartupContracts(argv[1]);
     interfaceRendererContracts();
     {
         engine::EnhancementSettings fresh;
@@ -201,6 +312,26 @@ int wmain(int argc,wchar_t** argv){try{
         v.mode=0;v.rotationDegrees=-90;const auto opposite=v.sourceUv(.25f,.25f);require(opposite.first==.75f&&opposite.second==.25f,"opposite display matrix rotates the other way");
         v.rotationDegrees=180;const auto upsideDown=v.sourceUv(.25f,.25f);require(upsideDown.first==.75f&&upsideDown.second==.75f,"upside-down display matrix maps both axes");
         v.rotationDegrees=90;v.displayAspect=.75;require(std::abs(v.aspect(64,32)-.75)<.00001,"already-oriented SAR is not inverted twice");}
+    {
+        engine::PreviewView v;
+        v.mode=engine::PreviewView::kAdaptiveWideMode;
+        require(v.renderedSize(3440,1440,1920,1080)==std::pair{3440.0f,1440.0f},"adaptive view fills a wider display");
+        require(v.renderedSize(1920,1440,1920,1080)==std::pair{1920.0f,1080.0f},"adaptive view contains on a narrower display");
+        const float ratio=v.adaptiveWidthRatio(3440,1440,1920,1080);
+        require(ratio>1.0f&&v.remapWidth(.5f,ratio)==.5f&&std::abs(v.remapWidth(1.0f,ratio)-1.0f)<.00001f,
+                "adaptive width preserves center and endpoints");
+        require(v.remapWidth(.2f,ratio)<.2f&&v.remapWidth(-.1f,ratio)<0.0f,"adaptive width stretches edges without hiding outside coordinates");
+        v.adaptiveZoom=8;
+        for(int angle:{0,90,180,270}){
+            v.rotationDegrees=angle;
+            v.zoom=1;v.centerX=v.centerY=.5f;
+            const auto source=v.sourcePoint(800,640,3440,1440,1920,1080);
+            v.wheel(1,800,640,3440,1440,1920,1080);
+            const auto point=v.displayPoint(source.first,source.second,3440,1440,1920,1080);
+            require(std::abs(point.first-800)<.005f&&std::abs(point.second-640)<.005f,
+                    "adaptive display, mouse and mask transform share the same anchor after zoom and rotation");
+        }
+    }
     ui::UiSessionState state;require(!state.enhanced&&!state.configured.nr&&!state.configured.sr&&state.configured.multiplier==1,"fresh startup effects disabled");state.configured.forceSdrPreview=true;state.enhanced=true;state.configured.nr=true;state.configured.multiplier=4;state.configured.sr=true;state.configured.model.intensity=.37f;state.configured.residual.color=1.4f;
     auto before=state.effective();require(state.mode==ui::Mode::Daily,"startup Daily");state.mode=ui::Mode::Professional;require(state.effective()==before,"mode cannot alter settings");state.enhanced=false;auto bypass=state.effective();require(!bypass.nr&&!bypass.sr&&bypass.multiplier==1,"true full bypass");require(bypass.forceSdrPreview,"master bypass retains SDR display choice");state.enhanced=true;require(state.effective()==before,"restore all settings");
     for(bool input:{false,true})for(bool display:{false,true})for(bool force:{false,true}){engine::EnhancementSettings s;s.forceSdrPreview=force;require(s.useHdrPreview(input,display)==(input&&display&&!force),"HDR output policy");}
@@ -226,6 +357,15 @@ int wmain(int argc,wchar_t** argv){try{
         ui::CapturePreferenceStore store(argv[1]);ui::CapturePreferences p{L"\\\\?\\usb#video-\u91c7\u96c6",L"1920:1080:166833:{SUBTYPE}:RGB32",L"{audio-endpoint}",-3,2};
         require(store.load().videoPath.empty(),"fresh capture preference empty");require(store.save(p),"capture preference atomic save");
         const auto restored=store.load();require(restored.videoPath==p.videoPath&&restored.formatKey==p.formatKey&&restored.audioPath==p.audioPath&&restored.audioMode==p.audioMode&&restored.colorOverride==p.colorOverride,"capture stable identifiers and Unicode round trip");
+        auto elgato=p;
+        elgato.audioMode=0;
+        elgato.audioPath=LR"(@device:cm:{category}\wave:{elgato})";
+        require(store.save(elgato)&&store.load().audioMode==0&&store.load().audioPath==elgato.audioPath,
+                "matched capture audio is saved as the existing stable DirectShow endpoint");
+        elgato.audioMode=source::kCaptureAudioDisabled;
+        elgato.audioPath.clear();
+        require(store.save(elgato)&&store.load().audioMode==source::kCaptureAudioDisabled&&store.load().audioPath.empty(),
+                "an explicitly silent capture choice survives restarting");
         auto virtualSpeaker=p;
         virtualSpeaker.audioMode=source::kCaptureAudioVirtualSpeaker;
         require(store.save(virtualSpeaker),"save explicit virtual speaker audio");

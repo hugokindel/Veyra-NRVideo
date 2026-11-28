@@ -7,6 +7,7 @@
 #include "veyra/gfx/AmfFrcBackend.h"
 #include "veyra/gfx/RifeDmlBackend.h"
 #include "veyra/gfx/AmfVideoSrBackend.h"
+#include "veyra/gfx/XessSrBackend.h"
 
 namespace veyra::ui {
 
@@ -110,6 +111,8 @@ static QVariantMap scanEffectCapabilities() {
     add("sr5", H::CrossVendor, fsrLoader && exists(fsr / "amd_fidelityfx_upscaler_dx12.dll"), QObject::tr("需要支持 DirectX 12 的硬件显卡"));
     const auto srId = [](uint32_t id) { return "sr" + QString::number(id); };
     const auto shaders = runtime::shaderDirectory();
+    add(srId(engine::kVideoSrXess), H::CrossVendor, gfx::XessSrBackend::runtimeAvailable(),
+        QObject::tr("需要支持 DirectX 12 的硬件显卡"));
     add(srId(engine::kVideoSrNis), H::CrossVendor, exists(shaders / "NisSdr.dxil") && exists(shaders / "NisHdr.dxil"),
         QObject::tr("需要支持 DirectX 12 的硬件显卡"));
     add(srId(engine::kVideoSrAmf10), H::AmdFrc, gfx::AmfVideoSrBackend::available(),
@@ -117,7 +120,9 @@ static QVariantMap scanEffectCapabilities() {
     const bool anrInstalled = ngx::AnrProvider::available(nr.wstring());
     add("anr", H::CrossVendor, anrInstalled, QObject::tr("需要支持 DirectX 12 的硬件显卡"));
     auto anr = out.value("anr").toMap();
-    anr["downloadable"] = !anrInstalled && ui::hardwareSupports(H::CrossVendor, gpu);
+    const bool anrSupported = ui::hardwareSupports(H::CrossVendor, gpu);
+    anr["downloadable"] = !anrInstalled && anrSupported;
+    anr["updateAvailable"] = anrSupported && ngx::AnrProvider::downloadUpdateAvailable();
     out["anr"] = anr;
     add("dlss", H::Nvidia, exists(nr / "nvngx_dlssg.dll"), QObject::tr("需要 NVIDIA RTX 显卡"));
     add("vfg", H::Vfg, pipeline::VfgBackend::runtimeAvailable(nr.wstring()), QObject::tr("需要 NVIDIA RTX 30 / 40 / 50（30 系为实验兼容）"));
@@ -226,10 +231,15 @@ QString disableUnavailableEffects(engine::ChainConfiguration& configuration) {
                 saved, globals.dualSrQuality, globals.dualSrEnabled));
         }
     };
+    engine::moveLegacyExclusionToFrameGeneration(configuration.chain, nullptr,
+        configuration.editor ? nullptr : &configuration.selectedNr,
+        configuration.editor ? nullptr : &configuration.selectedColour);
     sanitize(configuration.chain, configuration);
     if (configuration.editor) {
         auto editor = std::make_shared<engine::NodeEditorDocument>(*configuration.editor);
         auto globals = editor->globals.value_or(static_cast<const engine::ChainGlobalSettings&>(configuration));
+        engine::moveLegacyExclusionToFrameGeneration(editor->nodes, &editor->layout,
+            &configuration.selectedNr, &configuration.selectedColour);
         sanitize(editor->nodes, globals);
         editor->globals = globals;
         configuration.editor = std::move(editor);
@@ -237,7 +247,14 @@ QString disableUnavailableEffects(engine::ChainConfiguration& configuration) {
     reasons.removeDuplicates();
     return reasons.join("; ");
 }
-QVariantMap QmlPlayerBridge::effectCapabilities() const { return currentEffectCapabilities(); }
+QVariantMap QmlPlayerBridge::effectCapabilities() const {
+    auto caps=currentEffectCapabilities();
+    const auto& s=impl_->snapshot;
+    if(s.running&&!engine::videoSrAvailableForSource(engine::kVideoSrXess,s.image,s.capture))
+        caps["sr"+QString::number(engine::kVideoSrXess)]=QVariantMap{
+            {"available",false},{"reason",tr("Intel XeSS 超分当前仅用于视频播放")}};
+    return caps;
+}
 QVariantMap QmlPlayerBridge::effectAvailability(const QString& id) const {
     const auto& s = settings();
     const QString key = id == "nr" ? "nr" + QString::number(int(engine::currentNrRuntime(s.nrRuntime))) :
@@ -266,6 +283,7 @@ QVariantList QmlPlayerBridge::srBackendChoices() const {
     for (const auto& entry : std::initializer_list<Entry>{{"0", 0, "DLSS SR"}, {"rtx", 4, tr("RTX 视频超分 · 标准")},
             {"rtx-hb", 16, tr("RTX 视频超分 · 高码率")}, {"rtx-st", 21, tr("RTX 视频超分 · 流媒体")},
             {"5", 5, effectGpu().vendor == 0x1002 ? tr("FSR 3.1 / 4 · 自动兼容") : QString("FSR 3.1")},
+            {QString::number(engine::kVideoSrXess), engine::kVideoSrXess, tr("Intel XeSS 超分 · 实验")},
             {QString::number(engine::kVideoSrNis), engine::kVideoSrNis, "NVIDIA NIS"},
             {QString::number(engine::kVideoSrAmf10), engine::kVideoSrAmf10, "AMD VideoSR 1.0"}}) {
         const auto cap = caps.value("sr" + QString::number(entry.capability)).toMap();

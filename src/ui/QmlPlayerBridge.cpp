@@ -60,8 +60,15 @@ namespace {bool prepareStartupPreset(const engine::PresetEntry& entry, engine::C
 QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesystem::path dataDirectory,
                                 QObject* parent)
     : QObject(parent), impl_(std::make_unique<Impl>(engine, std::move(dataDirectory))) {
+    if (auto* app = qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
+        connect(app, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
+            if (state == Qt::ApplicationActive) emit launchAtLoginChanged();
+        });
+    }
     liveTranslation_ = new LiveTranslation(QString::fromStdWString(impl_->dataDir.wstring()), this);
     connect(this,&QmlPlayerBridge::mediaOpenRequested,this,[this]{
+        flushHdrMemory();
+        impl_->hdrTitleApplied.clear();
         liveTranslation_->setPlayback(impl_->snapshot.sessionId, false, true);
         endExclusionMove(false);impl_->exclusionSelected=-1;beginProtectionDraw(QString{});
         emit protectionChanged();
@@ -73,6 +80,7 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     auto* checker = new UpdateChecker(version(), this);
     updates_ = checker;
     connect(checker, &UpdateChecker::notice, this, &QmlPlayerBridge::notice);
+    createPerfDiagnostics();
     impl_->playlist = new PlaylistModel(utf8Of((impl_->dataDir / L"playlist.v1.json").wstring()), this);
     connect(impl_->playlist, &PlaylistModel::playRequested, this, [this](const QString& path) {
         openPath(path);
@@ -86,6 +94,12 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     // The compute GPU decides which effects exist, so it is settled before
     // anything below samples the capabilities or restores the saved chain.
     impl_->loadPrefs();
+#if defined(VEYRA_ENABLE_REMOTEPLAY) || defined(VEYRA_ENABLE_MOONLIGHT) || defined(VEYRA_ENABLE_XBOX)
+    impl_->streamInput = std::make_unique<ui::StreamInputCapture>(engine,
+        QString::fromStdWString((impl_->dataDir / L"ps5-keyboard-map.v1.json").wstring()),
+        [this] { return ps5InputTarget(); }, [this] { return xboxInputTarget(); });
+    connect(this, &QmlPlayerBridge::mediaOpenRequested, this, [this] { impl_->streamInput->releasePs5(); });
+#endif
     impl_->engine.setCaptureAudioMonitoring(impl_->prefBool("captureAudioMonitor",true));
     // Keep main's established key; also read the PR's key for users of its build.
     // Missing/invalid settings stay at unity, never an automatic boost.
@@ -97,9 +111,17 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     veyra::log::info("ui-prefs",std::format("volume restored={:.3f} muted={}",gain,mute));
     logShortcuts();
     syncReplay();
-    impl_->enumerateGpuAdapters();
-    impl_->resolveGpuMonitor();
-    impl_->applyComputeGpu();
+    {
+        const auto gpuStart = std::chrono::steady_clock::now();
+        veyra::log::info("startup", "stage=gpu-enum-start");
+        veyra::Logger::instance().flush();
+        impl_->enumerateGpuAdapters();
+        impl_->resolveGpuMonitor();
+        impl_->applyComputeGpu();
+        const double gpuMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gpuStart).count();
+        veyra::log::info("startup", std::format("stage=gpu-enum-ready adapters={} elapsedMs={:.1f}", impl_->gpuAdapters.size(), gpuMs));
+        veyra::Logger::instance().flush();
+    }
     connect(this,&QmlPlayerBridge::snapshotChanged,this,
         [this,ceiling=fgMaxMultiplier(),text=fgProviderText()]() mutable {
             const auto nextCeiling=fgMaxMultiplier();const auto nextText=fgProviderText();
@@ -285,6 +307,10 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             const bool on = p.value(QStringLiteral("pacingRepair")).toBool();
             if (s.pacingRepair != on) { s.pacingRepair = on; changed = true; }
         }
+        if (p.contains(QStringLiteral("hudAllEffects"))) {
+            const bool on = p.value(QStringLiteral("hudAllEffects")).toBool();
+            if (s.hudAllEffects != on) { s.hudAllEffects = on; changed = true; }
+        }
         if (p.contains(QStringLiteral("hudLock"))) {
             const bool on = p.value(QStringLiteral("hudLock")).toBool();
             if (s.hudLock != on) { s.hudLock = on; changed = true; }
@@ -295,6 +321,10 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
                 s.hudProtect=engine::HudProtectMode(mode);
                 changed=true;
             }
+        }
+        if (p.contains(QStringLiteral("subtitleHold"))) {
+            const bool on=p.value(QStringLiteral("subtitleHold")).toBool();
+            if(s.subtitleHold!=on){s.subtitleHold=on;changed=true;}
         }
         if (p.contains(QStringLiteral("dynamicHud"))) {
             const bool on = p.value(QStringLiteral("dynamicHud")).toBool();
@@ -354,7 +384,9 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             pr.variableRefresh = saved.value(QStringLiteral("vrr")).toBool();
         }
         if (pr.valid()) impl_->engine.requestPresentation(pr);
-        impl_->aspectMode = std::clamp(impl_->prefs.value(QStringLiteral("aspect")).toInt(), 0, 6);
+        impl_->aspectMode = std::clamp(impl_->prefs.value(QStringLiteral("aspect")).toInt(), 0, engine::PreviewView::kAdaptiveWideMode);
+        impl_->adaptivePreservation = std::clamp(impl_->prefInt("adaptivePreservation", 87), 0, 100);
+        impl_->adaptiveZoom = std::clamp(impl_->prefInt("adaptiveZoom", 0), 0, 15);
     }
     impl_->sessionSaveTimer = new QTimer(this);
     impl_->sessionSaveTimer->setSingleShot(true);
@@ -372,11 +404,10 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     impl_->hdrMemorySaveTimer=new QTimer(this);
     impl_->hdrMemorySaveTimer->setSingleShot(true);impl_->hdrMemorySaveTimer->setInterval(400);
     connect(impl_->hdrMemorySaveTimer,&QTimer::timeout,this,[this]{flushHdrMemory();});
-    impl_->volumeSaveTimer=new QTimer(this);
-    impl_->volumeSaveTimer->setSingleShot(true);impl_->volumeSaveTimer->setInterval(500);
-    connect(impl_->volumeSaveTimer,&QTimer::timeout,this,[this]{
-        if(impl_->savePrefs())veyra::log::info("ui-prefs",std::format("volume={:.3f} saved",impl_->prefs.value(QStringLiteral("volume")).toDouble()));
-        else veyra::log::warn("ui-prefs","volume not saved");
+    impl_->prefsSaveTimer=new QTimer(this);
+    impl_->prefsSaveTimer->setSingleShot(true);impl_->prefsSaveTimer->setInterval(500);
+    connect(impl_->prefsSaveTimer,&QTimer::timeout,this,[this]{
+        if(!impl_->savePrefs())veyra::log::warn("ui-prefs","pending preferences not saved");
     });
     impl_->timer = new QTimer(this);
     connect(impl_->timer, &QTimer::timeout, this, [this] {
@@ -384,6 +415,7 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         const uint64_t before = impl_->publishedRevision;
         const bool wasRunning = impl_->snapshot.running;
         const bool wasImage = impl_->snapshot.image;
+        const bool wasXeSSSrRestricted=wasRunning&&(wasImage||impl_->snapshot.capture);
         const bool wasFailed = impl_->snapshot.failed;
         const bool wasEngineHung = impl_->snapshot.status == engine::kEngineHangStatus;
         const bool wasCaptureDriverWaiting = impl_->snapshot.captureDriverWaitMs != 0;
@@ -391,7 +423,15 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         const auto wasTransport = impl_->snapshot.transport;
         const uint64_t wasSession = impl_->snapshot.sessionId;
         const auto oldSourceAspect=sourceAspect();
-        if(impl_->poll()){emit settingsChanged();emitChainChanged();}
+        bool enterStartupFullscreen = false;
+        const bool settingsRolledBack = impl_->poll(enterStartupFullscreen);
+        if (enterStartupFullscreen && impl_->prefBool("autoResume", false) && impl_->prefBool("startFullscreen", false)) {
+            veyra::log::info("ui-startup", std::format("fullscreen requested after first presentation session={}", impl_->snapshot.sessionId));
+            emit startupFullscreenRequested();
+        }
+        if (settingsRolledBack) { emit settingsChanged(); emitChainChanged(); }
+        if(wasXeSSSrRestricted!=(impl_->snapshot.running&&(impl_->snapshot.image||impl_->snapshot.capture)))
+            emit effectCapabilitiesChanged();
         if(wasSession!=impl_->snapshot.sessionId||oldSourceAspect!=sourceAspect())emit compareChanged();
         // Live recording state: the recorder owns the files, this side shows them.
         {
@@ -584,8 +624,6 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
                     impl_->netLossNoticeAt = now;
                 }
             }
-            // 「自动」倍率：每个会话进入播放后决定一次（见 applyFgAutoMultiplier）。
-            maybeApplyFgAutoMultiplier();
             emit snapshotChanged();
         }
         // The reconnect waits for the failed session's teardown (the GPU reset can hold it for
@@ -731,6 +769,10 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
 QObject* QmlPlayerBridge::liveTranslation() const { return liveTranslation_; }
 
 QmlPlayerBridge::~QmlPlayerBridge() {
+#if defined(VEYRA_ENABLE_REMOTEPLAY) || defined(VEYRA_ENABLE_MOONLIGHT)
+    impl_->streamInput->releasePs5();
+    impl_->streamInput->capture(false);
+#endif
     // Before anything is torn down: this reads the playback position.
     // The overlay is a child window: it has to go before the video window does.
     flushHdrMemory();
@@ -738,8 +780,8 @@ QmlPlayerBridge::~QmlPlayerBridge() {
     releaseMirrorWindow();
     if (qApp) qApp->removeEventFilter(this);
     if (qApp) qApp->removeNativeEventFilter(&impl_->displayEventFilter);
-    // rememberPosition(true) writes every preference, a pending volume included.
-    if (impl_->volumeSaveTimer) impl_->volumeSaveTimer->stop();
+    // rememberPosition(true) writes every preference, including any pending interactive changes.
+    if (impl_->prefsSaveTimer) impl_->prefsSaveTimer->stop();
     rememberPosition(true);
     if (impl_->sessionSaveTimer) impl_->sessionSaveTimer->stop();
     if (!impl_->persistSession())

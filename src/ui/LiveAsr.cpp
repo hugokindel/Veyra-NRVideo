@@ -8,6 +8,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QStringList>
 #include <algorithm>
 #include <format>
 #include <utility>
@@ -26,6 +27,7 @@ qint64 percentile(const std::vector<qint64>& sorted, unsigned percent) {
 
 LiveAsr::LiveAsr(const QString& directory)
     : root_(asr::root(directory)), assets_(root_, asr::assets(asr::Parakeet)) {
+    refreshLegacyRuntime();
     clock_.start();
     timer_.setInterval(20);
     process_.setStandardErrorFile(QProcess::nullDevice());
@@ -33,8 +35,10 @@ LiveAsr::LiveAsr(const QString& directory)
         args->flags |= CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS;
     });
     connect(&assets_, &ModelAssets::changed, this, [this] {
-        if (!assets_.downloading() && assets_.installed() && process_.state() == QProcess::NotRunning)
-            failed_ = false;
+        if (!assets_.downloading()) {
+            refreshLegacyRuntime();
+            if (installed() && process_.state() == QProcess::NotRunning) failed_ = false;
+        }
         emit changed();
     });
     connect(&process_, &QProcess::started, this, [this] {
@@ -75,6 +79,7 @@ void LiveAsr::configure(int model, const QString& language, int threads, int req
     if (asr::assets(model).empty() || (model_ == model && language_ == language && threads_ == threads)) return;
     if (model_ != model && !assets_.setAssets(asr::assets(model))) return;
     model_ = model;
+    refreshLegacyRuntime();
     realTimeFactor_ = 0.0;
     language_ = language;
     threads_ = threads;
@@ -89,6 +94,7 @@ void LiveAsr::setEnabled(bool enabled) {
     failed_ = false;
     if (enabled_) {
         assets_.refreshInstalled();
+        refreshLegacyRuntime();
         nextAssetCheckAt_ = 0;
         lastSummaryAt_ = clock_.elapsed();
         timer_.start();
@@ -108,9 +114,24 @@ void LiveAsr::setPlayback(bool active, bool discontinuity) {
     if (active_ && enabled_ && ready_) attachTap();
 }
 
+void LiveAsr::refreshLegacyRuntime() {
+    legacyRuntimeReady_ = !assets_.installed() && asr::verify(root_, model_, false);
+}
+
 QString LiveAsr::status() const {
     if (assets_.downloading() || (!assets_.installed() && !assets_.status().isEmpty())) return assets_.status();
     return status_;
+}
+
+QString LiveAsr::installLayout() const {
+    QStringList paths;
+    for (const auto& asset : asr::assets(model_)) {
+        const auto destination = QString::fromLatin1(asset.destination);
+        if (asset.members.empty()) paths.append(destination);
+        for (const auto& member : asset.members)
+            paths.append(destination + QLatin1Char('/') + QString::fromLatin1(member.name));
+    }
+    return paths.join(QLatin1Char('\n'));
 }
 
 void LiveAsr::download() {
@@ -128,8 +149,7 @@ void LiveAsr::setStatus(QString value) {
 }
 
 void LiveAsr::start() {
-    const auto selected = asr::assets(model_);
-    if (!ModelAssets::verify(root_, selected[0], true)) {
+    if (!asr::installedRuntime(root_, true)) {
         fail(QStringLiteral("runtime-verification"));
         return;
     }
@@ -209,7 +229,7 @@ void LiveAsr::tick() {
     if (process_.state() == QProcess::NotRunning) {
         if (now < nextAssetCheckAt_) return;
         nextAssetCheckAt_ = now + 500;
-        if (!assets_.installed()) { setStatus(tr("请先下载语音识别模型")); return; }
+        if (!installed()) { setStatus(tr("请先下载语音识别模型")); return; }
         // Warm the recognizer as soon as the user enables it. This can take
         // seconds on a cold disk. PCM is attached only once playback starts.
         start();

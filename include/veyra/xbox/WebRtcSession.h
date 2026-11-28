@@ -16,6 +16,7 @@
 
 #include "veyra/xbox/Protocol.h"
 #include "veyra/xbox/StreamApi.h"
+#include "veyra/xbox/VideoRtpReceive.h"
 
 namespace rtc {
 class PeerConnection;
@@ -24,6 +25,8 @@ class Track;
 }
 
 namespace veyra::xbox {
+
+class VideoReceivingSession;
 
 class Signaling {
 public:
@@ -35,6 +38,9 @@ public:
 struct WebRtcCallbacks {
     // One access unit, Annex-B, with the RTP timestamp (90 kHz) and the local arrival time (100 ns ticks).
     std::function<void(std::vector<uint8_t>&& unit, uint32_t rtpTimestamp, int64_t arrival100ns)> video;
+    // Controller-only sessions acknowledge complete frames without taking their payload.
+    // When set, this receives the timing in place of the video data callback.
+    std::function<void(uint32_t rtpTimestamp, int64_t arrival100ns)> videoKeepalive;
     // One Opus packet, 48 kHz timestamp.
     std::function<void(const uint8_t* data, size_t size, uint32_t rtpTimestamp)> audio;
     std::function<void(const Vibration&)> vibration;
@@ -45,8 +51,9 @@ struct WebRtcCallbacks {
 
 struct WebRtcStats {
     uint64_t bytesReceived = 0;      // data channels (libdatachannel's count)
-    uint64_t videoBytes = 0;         // access units handed to the decoder
+    uint64_t videoBytes = 0;         // received access units, including controller-session keepalive
     uint64_t videoUnits = 0, audioPackets = 0, keyframeRequests = 0;
+    VideoRtpStats videoRtp;
     double rttMs = 0;
     bool handshakeDone = false;
 };
@@ -59,6 +66,12 @@ public:
     WebRtcSession& operator=(const WebRtcSession&) = delete;
 
     void setCallbacks(WebRtcCallbacks callbacks) { callbacks_ = std::move(callbacks); }
+    // Session setup only. A size hint can also request a specific profile from the console.
+    void preferVideoSize(unsigned width, unsigned height, bool requestResolution = false) {
+        videoWidth_ = width;
+        videoHeight_ = height;
+        requestResolution_ = requestResolution;
+    }
     // Tests: gather candidates on this address only (e.g. "127.0.0.1"). Empty: every interface.
     void setBindAddress(std::string address) { bindAddress_ = std::move(address); }
 
@@ -69,6 +82,8 @@ public:
     bool waitReady(std::chrono::milliseconds timeout);
 
     void sendGamepad(const GamepadFrame& frame);   // sent when it changes, and at least every 33 ms by the caller
+    void sendMouse(const MouseFrame&);
+    void sendKeyboard(const KeyboardFrame&);
     void requestKeyframe();
     void videoPresented(uint32_t rtpTimestamp,int64_t arrival,int64_t submitted,int64_t decoded,int64_t presented);
     void close();
@@ -96,6 +111,7 @@ private:
     uint32_t lastFeedbackRtp_=0;
     std::shared_ptr<rtc::PeerConnection> pc_;
     std::shared_ptr<rtc::Track> audio_, video_;
+    std::shared_ptr<VideoReceivingSession> videoReceiver_;
     std::shared_ptr<rtc::DataChannel> chat_, control_, input_, message_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -105,6 +121,8 @@ private:
     std::chrono::steady_clock::time_point origin_ = std::chrono::steady_clock::now();
     std::string failure_;
     std::string bindAddress_;
+    unsigned videoWidth_ = 1920, videoHeight_ = 1080;
+    bool requestResolution_ = false;
 };
 
 } // namespace veyra::xbox

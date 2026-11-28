@@ -14,6 +14,46 @@
 #include "veyra/Log.h"
 
 namespace veyra::xbox {
+
+class VideoReceivingSession final : public rtc::RtcpReceivingSession {
+public:
+    void incoming(rtc::message_vector& messages, const rtc::message_callback& send) override {
+        rtc::RtcpReceivingSession::incoming(messages, send);
+        // The base handler processed RTCP and validated these RTP headers.
+        // This runs on the same ingress lane, before H.264 depacketization.
+        const VideoRtpStats* current = nullptr;
+        for (const auto& message : messages) {
+            const auto* header = reinterpret_cast<const rtc::RtpHeader*>(message->data());
+            current = &window_.observe(header->ssrc(), header->seqNumber());
+        }
+        if (!current) return;
+        reordered_.store(current->recoveredReorder, std::memory_order_relaxed);
+        duplicates_.store(current->duplicate, std::memory_order_relaxed);
+        expired_.store(current->expiredMissing, std::memory_order_relaxed);
+        outside_.store(current->outsideWindow, std::memory_order_relaxed);
+        resets_.store(current->sequenceResets, std::memory_order_relaxed);
+        pending_.store(current->pendingMissing, std::memory_order_relaxed);
+        received_.store(current->received, std::memory_order_release);
+    }
+
+    VideoRtpStats stats() const {
+        return {
+            .received = received_.load(std::memory_order_acquire),
+            .recoveredReorder = reordered_.load(std::memory_order_relaxed),
+            .duplicate = duplicates_.load(std::memory_order_relaxed),
+            .expiredMissing = expired_.load(std::memory_order_relaxed),
+            .outsideWindow = outside_.load(std::memory_order_relaxed),
+            .sequenceResets = resets_.load(std::memory_order_relaxed),
+            .pendingMissing = pending_.load(std::memory_order_relaxed),
+        };
+    }
+
+private:
+    VideoRtpReceiveWindow window_;
+    std::atomic<uint64_t> received_{}, reordered_{}, duplicates_{}, expired_{}, outside_{}, resets_{};
+    std::atomic<unsigned> pending_{};
+};
+
 namespace {
 
 using json = nlohmann::json;
@@ -103,7 +143,8 @@ bool WebRtcSession::start(Signaling& signaling, std::string* error, std::chrono:
     config.disableAutoNegotiation = true;
     config.maxMessageSize = 256 * 1024;
     if (!bindAddress_.empty()) config.bindAddress = bindAddress_;
-    pc_ = std::make_shared<rtc::PeerConnection>(config);
+    auto connection = std::make_shared<rtc::PeerConnection>(config);
+    { std::lock_guard lock(gate_->mutex); pc_ = std::move(connection); }
 
     pc_->onStateChange([this, gate=gate_](rtc::PeerConnection::State state) {
         std::lock_guard callbackLock(gate->mutex);if(!gate->open)return;
@@ -133,15 +174,20 @@ bool WebRtcSession::start(Signaling& signaling, std::string* error, std::chrono:
 
     auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>(rtc::NalUnit::Separator::LongStartSequence);
     video_->setMediaHandler(depacketizer);
-    video_->chainMediaHandler(std::make_shared<rtc::RtcpReceivingSession>());
+    auto videoReceiver = std::make_shared<VideoReceivingSession>();
+    video_->chainMediaHandler(videoReceiver);
+    { std::lock_guard lock(gate_->mutex); videoReceiver_ = std::move(videoReceiver); }
     video_->onFrame([this, gate=gate_](rtc::binary data, rtc::FrameInfo info) {
         std::lock_guard callbackLock(gate->mutex);if(!gate->open)return;
         ++videoUnits_;
         videoBytes_ += data.size();
-        if (!callbacks_.video) return;
-        std::vector<uint8_t> unit(data.size());
-        std::memcpy(unit.data(), data.data(), data.size());
-        callbacks_.video(std::move(unit), info.timestamp, host100ns());
+        if (callbacks_.videoKeepalive) {
+            callbacks_.videoKeepalive(info.timestamp, host100ns());
+        } else if (callbacks_.video) {
+            std::vector<uint8_t> unit(data.size());
+            std::memcpy(unit.data(), data.data(), data.size());
+            callbacks_.video(std::move(unit), info.timestamp, host100ns());
+        }
     });
     audio_->setMediaHandler(std::make_shared<rtc::OpusRtpDepacketizer>());
     audio_->chainMediaHandler(std::make_shared<rtc::RtcpReceivingSession>());
@@ -275,8 +321,8 @@ bool WebRtcSession::sendClientConfig() {
     sent &= sendMessageJson(message("/streaming/characteristics/touchinputenabledchanged", {{"touchInputEnabled", false}}));
     sent &= sendMessageJson(message("/streaming/characteristics/clientdevicecapabilities", json::object()));
     sent &= sendMessageJson(message("/streaming/characteristics/dimensionschanged", {
-        {"horizontal", 1920}, {"vertical", 1080}, {"preferredWidth", 1920}, {"preferredHeight", 1080},
-        {"safeAreaLeft", 0}, {"safeAreaTop", 0}, {"safeAreaRight", 1920}, {"safeAreaBottom", 1080}, {"supportsCustomResolution", true}}));
+        {"horizontal", videoWidth_}, {"vertical", videoHeight_}, {"preferredWidth", videoWidth_}, {"preferredHeight", videoHeight_},
+        {"safeAreaLeft", 0}, {"safeAreaTop", 0}, {"safeAreaRight", videoWidth_}, {"safeAreaBottom", videoHeight_}, {"supportsCustomResolution", true}}));
     return sent;
 }
 
@@ -295,8 +341,17 @@ void WebRtcSession::onMessageChannel(const std::string& text) {
         initialized &= sendControl(json{{"message", "gamepadChanged"}, {"gamepadIndex", 0}, {"wasAdded", true}}.dump());
         initialized &= sendControl(json{{"message", "gamepadChanged"}, {"gamepadIndex", 0}, {"wasAdded", false}}.dump());
         initialized &= sendControl(json{{"message", "gamepadChanged"}, {"gamepadIndex", 0}, {"wasAdded", true}}.dump());
+        if (requestResolution_) {
+            // Greenlight PR #1752 and Veyra PR #274 send both messages to request a home-stream profile.
+            const json extent = {{"width", videoWidth_}, {"height", videoHeight_}};
+            const bool sentPreference = sendControl(json{{"message", "VideoPreference"}, {"type", "VideoPreference"},
+                {"resolution", extent}, {"dimensions", extent}, {"maxFPS", 60}}.dump());
+            const bool sentAlias = sendControl(json{{"message", "userRequestedResolutionUpdate"},
+                {"resolutionAlias", std::to_string(videoHeight_)}}.dump());
+            if (!sentPreference || !sentAlias) log::warn("xbox", "could not send the requested stream resolution");
+        }
         if (input_ && input_->isOpen()) {
-            const auto report = clientMetadataReport(0, nowMs(), 1);
+            const auto report = clientMetadataReport(0, nowMs(), 0);
             initialized &= sendBinary(input_,report.data(),report.size());
         }
         initialized &= sendClientConfig();
@@ -308,7 +363,11 @@ void WebRtcSession::onMessageChannel(const std::string& text) {
         const std::string target = j.value("target", "");
         const std::string id = j.value("id", "");
         log::info("xbox-message", target + " " + j.value("content", std::string()).substr(0, 300));
-        if (target == "/streaming/sessionLifetimeManagement/serverInitiatedDisconnect") {
+        if (target.rfind("/streaming/touchcontrols", 0) == 0) {
+            // No touch input here: decline touch layouts so the title keeps reading the gamepad.
+            if (type == "TransactionStart")
+                sendMessageJson(json{{"type", "ReceiverCancel"}, {"id", id}, {"cv", ""}}.dump());
+        } else if (target == "/streaming/sessionLifetimeManagement/serverInitiatedDisconnect") {
             sendMessageJson(json{{"type", "TransactionComplete"}, {"content", "\"\""}, {"id", id}, {"cv", ""}}.dump());
             const auto content = json::parse(j.value("content", std::string()), nullptr, false);
             const std::string reason = content.is_object() && content.contains("reason") && content["reason"].is_string()
@@ -344,6 +403,18 @@ void WebRtcSession::sendGamepad(const GamepadFrame& frame) {
     if(!gate_->open||!handshakeDone_)return;
     const auto report=gamepadReport(++inputSequence_,nowMs(),{frame});
     sendBinary(input_,report.data(),report.size());
+}
+void WebRtcSession::sendMouse(const MouseFrame& frame) {
+    std::lock_guard lock(gate_->mutex);
+    if (!gate_->open || !handshakeDone_) return;
+    const auto report = mouseReport(++inputSequence_, nowMs(), frame);
+    sendBinary(input_, report.data(), report.size());
+}
+void WebRtcSession::sendKeyboard(const KeyboardFrame& frame) {
+    std::lock_guard lock(gate_->mutex);
+    if (!gate_->open || !handshakeDone_) return;
+    const auto report = keyboardReport(++inputSequence_, nowMs(), frame);
+    sendBinary(input_, report.data(), report.size());
 }
 
 void WebRtcSession::videoPresented(uint32_t rtp,int64_t arrival,int64_t submitted,int64_t decoded,int64_t presented) {
@@ -393,6 +464,7 @@ WebRtcStats WebRtcSession::stats() const {
     s.audioPackets = audioPackets_.load();
     s.keyframeRequests = keyframeRequests_.load();
     s.videoBytes = videoBytes_.load();
+    if (videoReceiver_) s.videoRtp = videoReceiver_->stats();
     s.handshakeDone = handshakeDone_.load();
     if (const auto pc = gate_->open?pc_:nullptr) {
         s.bytesReceived = pc->bytesReceived();

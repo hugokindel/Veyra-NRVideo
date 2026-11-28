@@ -37,11 +37,16 @@
 #include "veyra/ui/PlayerUiFacade.h"
 
 class QQmlEngine;
+class QJsonObject;
 namespace veyra::ui {
 
 class MoonlightModel;
 class XboxModel;
 class LiveTranslation;
+class PlaybackServer;
+class PerfDiagnostics;
+enum class CaptureControlAction;
+enum class CaptureControlResult;
 
 class QmlPlayerBridge : public QObject {
     Q_OBJECT
@@ -52,14 +57,16 @@ class QmlPlayerBridge : public QObject {
     // is the submit rate below (with its 1% low).
     // Automatic FG and Dolby Vision: automatic frame-generation multiplier and
     // the Dolby Vision follow / P7 composite switches.
-    Q_PROPERTY(bool fgAutoMultiplierEnabled READ fgAutoMultiplier WRITE setFgAutoMultiplier NOTIFY settingsChanged)
-    Q_PROPERTY(bool fgAutoMultiplierAvailable READ fgAutoMultiplierAvailable NOTIFY settingsChanged)
     Q_PROPERTY(bool doviFollow READ doviFollow WRITE setDoviFollow NOTIFY settingsChanged)
     Q_PROPERTY(bool doviP7Compose READ doviP7Compose WRITE setDoviP7Compose NOTIFY settingsChanged)
     Q_PROPERTY(bool doviFollowAverage READ doviFollowAverage WRITE setDoviFollowAverage NOTIFY settingsChanged)
     Q_PROPERTY(QString outputSummary READ outputSummary NOTIFY snapshotChanged)
     Q_PROPERTY(QString srStageSummary READ srStageSummary NOTIFY snapshotChanged)
     Q_PROPERTY(QString srStageNote READ srStageNote NOTIFY snapshotChanged)
+    // Smart SR: what the running graph detected (empty when it does not run).
+    Q_PROPERTY(QString smartSrStatus READ smartSrStatus NOTIFY snapshotChanged)
+    // The running graph detects render extents: list-mode anti-aliasing is behind SR.
+    Q_PROPERTY(bool smartSrRunning READ smartSrRunning NOTIFY snapshotChanged)
     Q_PROPERTY(bool fullscreenMemorySafe READ fullscreenMemorySafe NOTIFY snapshotChanged)
     Q_PROPERTY(double queuedFrames READ queuedFrames NOTIFY snapshotChanged)
     Q_PROPERTY(bool queuedFramesKnown READ queuedFramesKnown NOTIFY snapshotChanged)
@@ -120,6 +127,8 @@ class QmlPlayerBridge : public QObject {
     // list here could drift from what the package actually contains.
     Q_PROPERTY(QVariantList componentList READ componentList NOTIFY componentListChanged)
     Q_PROPERTY(QObject* updates READ updates CONSTANT)
+    // 设置 → 关于 → 性能诊断 (PerfDiagnostics.h).
+    Q_PROPERTY(QObject* perfDiagnostics READ perfDiagnostics CONSTANT)
 
     // --- capture dialog ----------------------------------------------------
     // Device and format lists come from the source's own enumeration, so the UI
@@ -166,6 +175,7 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(int captureAudioIngress READ captureAudioIngress WRITE setCaptureAudioIngress NOTIFY settingsChanged)
     Q_PROPERTY(int captureBufferMode READ captureBufferMode WRITE setCaptureBufferMode NOTIFY settingsChanged)
     Q_PROPERTY(bool captureQueryBusy READ captureQueryBusy NOTIFY captureChanged)
+    Q_PROPERTY(bool captureQueryTimedOut READ captureQueryTimedOut NOTIFY captureChanged)
     Q_PROPERTY(QString captureStatus READ captureStatus NOTIFY captureChanged)
     // Magewell Pro Capture low-latency mode (MagewellCapture.h): whether the selected device is
     // one, and a one-line state (active with its latency, missing runtime, or why it fell back).
@@ -204,6 +214,8 @@ class QmlPlayerBridge : public QObject {
     // wake, stream profile, decode/sampling, view-only, login PIN, controller
     // forwarding and gyro calibration. `ps5` carries the form state.
     Q_PROPERTY(QVariantMap ps5 READ ps5 NOTIFY ps5Changed)
+    Q_PROPERTY(QVariantMap ps5LoginPrompt READ ps5LoginPrompt NOTIFY ps5LoginPromptChanged)
+    Q_PROPERTY(bool ps5VideoActive READ ps5VideoActive NOTIFY snapshotChanged)
     Q_PROPERTY(QVariantList ps5Profiles READ ps5Profiles NOTIFY ps5Changed)
     // PS5 手柄控制 (采集卡对话框): a controller-only Remote Play session beside the
     // capture card, using the pairing selected in the PS5 dialog. {available,
@@ -215,13 +227,16 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(QObject* moonlight READ moonlightModel CONSTANT)
     // Xbox home streaming (unofficial): sign-in, consoles and stream state; null without Xbox support.
     Q_PROPERTY(QObject* xbox READ xboxModel CONSTANT)
+    Q_PROPERTY(QVariantMap xboxControl READ xboxControl NOTIFY xboxControlChanged)
     Q_PROPERTY(bool moonlightCaptured READ moonlightCaptured NOTIFY moonlightUiChanged)
+    Q_PROPERTY(QObject* ps5Input READ ps5Input CONSTANT)
     Q_PROPERTY(bool moonlightStatsVisible READ moonlightStatsVisible WRITE setMoonlightStatsVisible NOTIFY moonlightUiChanged)
 
     // Shell preferences that are not enhancement settings: screenshot folder,
     // subtitle look, audio output. Stored in <data>/qml-preferences.v1.json and
     // validated key by key in setPreference(); anything unknown is refused.
     Q_PROPERTY(QVariantMap preferences READ preferences NOTIFY preferencesChanged)
+    Q_PROPERTY(bool launchAtLogin READ launchAtLogin NOTIFY launchAtLoginChanged)
     Q_PROPERTY(QString gpuPriorityStatus READ gpuPriorityStatus NOTIFY preferencesChanged)
     Q_PROPERTY(bool enhancementPrewarmAvailable READ enhancementPrewarmAvailable CONSTANT)
     // The interface language in use after "auto" is resolved;
@@ -232,6 +247,8 @@ class QmlPlayerBridge : public QObject {
     // Live recording of the processed picture: the engine owns the encoder and
     // the file, the interface shows the state and starts or stops it.
     Q_PROPERTY(bool recording READ recording NOTIFY recordingChanged)
+    Q_PROPERTY(bool localCaptureControlAvailable READ localCaptureControlAvailable NOTIFY localCaptureControlChanged)
+    Q_PROPERTY(bool localCaptureControlEnabled READ localCaptureControlEnabled NOTIFY localCaptureControlChanged)
     Q_PROPERTY(bool virtualCameraEnabled READ virtualCameraEnabled NOTIFY virtualCameraChanged)
     Q_PROPERTY(QVariantMap virtualCameraState READ virtualCameraState NOTIFY virtualCameraChanged)
     Q_PROPERTY(int virtualCameraFps READ virtualCameraFps NOTIFY preferencesChanged)
@@ -428,6 +445,7 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(bool nrUiCorrection READ nrUiCorrection WRITE setNrUiCorrection NOTIFY settingsChanged)
     Q_PROPERTY(int videoSrQuality READ videoSrQuality WRITE setVideoSrQuality NOTIFY settingsChanged)
     Q_PROPERTY(int dlssSrModel READ dlssSrModel WRITE setDlssSrModel NOTIFY settingsChanged)
+    Q_PROPERTY(int fsrSrSharpness READ fsrSrSharpness WRITE setFsrSrSharpness NOTIFY settingsChanged)
     Q_PROPERTY(QVariantList dlssSrModelChoices READ dlssSrModelChoices CONSTANT)
     // Three-step SR (RTX Video SR). srPrescale: 0 off, 1..4 720p/900p/1080p/1440p,
     // 150..190 a manual 50..90 %. srOutput: 0 keep the SR result, 1 source size, 2..6 2K/4K/5K/6K/7K.
@@ -436,6 +454,8 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(int dualSrTargetIndex READ dualSrTargetIndex WRITE setDualSrTargetIndex NOTIFY settingsChanged)
     Q_PROPERTY(int dualSrQuality READ dualSrQuality WRITE setDualSrQuality NOTIFY settingsChanged)
     Q_PROPERTY(int srOutput READ srOutput WRITE setSrOutput NOTIFY settingsChanged)
+    // Smart SR (EnhancementSettings::smartSr): render detection for one standard RTX Video SR pass.
+    Q_PROPERTY(bool smartSr READ smartSr WRITE setSmartSr NOTIFY settingsChanged)
     Q_PROPERTY(bool protectionEnabled READ protectionEnabled WRITE setProtectionEnabled NOTIFY settingsChanged)
     Q_PROPERTY(QVariantMap protectionState READ protectionState NOTIFY protectionChanged)
     Q_PROPERTY(bool exclusionOverlayVisible READ exclusionOverlayVisible WRITE setExclusionOverlayVisible NOTIFY protectionChanged)
@@ -479,8 +499,10 @@ class QmlPlayerBridge : public QObject {
     // fgAdaptive, pacingRepair and hudLock, global controls kept in shell preferences.
     Q_PROPERTY(bool fgAdaptive READ fgAdaptive WRITE setFgAdaptive NOTIFY settingsChanged)
     Q_PROPERTY(bool pacingRepair READ pacingRepair WRITE setPacingRepair NOTIFY settingsChanged)
+    Q_PROPERTY(bool hudAllEffects READ hudAllEffects WRITE setHudAllEffects NOTIFY settingsChanged)
     Q_PROPERTY(bool hudLock READ hudLock WRITE setHudLock NOTIFY settingsChanged)
     Q_PROPERTY(int hudProtect READ hudProtect WRITE setHudProtect NOTIFY settingsChanged)
+    Q_PROPERTY(bool subtitleHold READ subtitleHold WRITE setSubtitleHold NOTIFY settingsChanged)
     Q_PROPERTY(bool dynamicHud READ dynamicHud WRITE setDynamicHud NOTIFY settingsChanged)
     Q_PROPERTY(bool dlssgLiteAvailable READ dlssgLiteAvailable CONSTANT)
     Q_PROPERTY(QString dlssgLiteHint READ dlssgLiteHint NOTIFY snapshotChanged)
@@ -521,6 +543,8 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(bool compareBase READ compareBase WRITE setCompareBase NOTIFY compareChanged)
     Q_PROPERTY(double compareSplit READ compareSplit NOTIFY compareChanged)
     Q_PROPERTY(int aspectMode READ aspectMode WRITE setAspectMode NOTIFY compareChanged)
+    Q_PROPERTY(int adaptivePreservation READ adaptivePreservation WRITE setAdaptivePreservation NOTIFY compareChanged)
+    Q_PROPERTY(int adaptiveZoom READ adaptiveZoom WRITE setAdaptiveZoom NOTIFY compareChanged)
     // Measured audio/video skew of a live source (ms); unknown otherwise.
     Q_PROPERTY(double audioSkewMs READ audioSkewMs NOTIFY snapshotChanged)
     Q_PROPERTY(bool audioSkewKnown READ audioSkewKnown NOTIFY snapshotChanged)
@@ -693,6 +717,8 @@ public:
     QString outputSummary() const;
     QString srStageSummary() const;
     QString srStageNote() const;
+    QString smartSrStatus() const;
+    bool smartSrRunning() const;
     double queuedFrames() const;
     bool queuedFramesKnown() const;
     int skippedFrames() const;
@@ -798,6 +824,7 @@ public:
     int captureBufferMode() const;
     void setCaptureBufferMode(int value);
     bool captureQueryBusy() const;
+    bool captureQueryTimedOut() const;
     QString captureStatus() const;
     QVariantMap screenOptions() const;
     // Declared here, in the public section: a Q_INVOKABLE above `public:` is
@@ -841,10 +868,15 @@ public:
     Q_INVOKABLE void autoAlignSubtitle();
 
     QVariantMap ps5() const;
+    bool ps5VideoActive() const;
+    Q_INVOKABLE QVariantMap ps5StreamStatistics() const;
     QVariantList ps5Profiles() const;
     QVariantMap ps5Control() const;
     QObject* moonlightModel() const;
     bool moonlightCaptured() const;
+    QObject* ps5Input() const;
+    Q_INVOKABLE bool ps5CaptureKeyboard();
+    uint64_t ps5InputTarget() const;
     bool moonlightStatsVisible() const;
     void setMoonlightStatsVisible(bool visible);
     Q_INVOKABLE void openMoonlightDialog();
@@ -853,6 +885,10 @@ public:
     QObject* xboxModel() const;
     Q_INVOKABLE void openXboxDialog();
     Q_INVOKABLE void xboxDisconnect();
+    Q_INVOKABLE bool xboxCaptureKeyboard();
+    Q_INVOKABLE void xboxControlSet(const QString& key, const QVariant& value);
+    QVariantMap xboxControl() const;
+    uint64_t xboxInputTarget() const;
     Q_INVOKABLE void ps5Load();
     Q_INVOKABLE bool ps5Set(const QString& key, const QVariant& value);
     Q_INVOKABLE void ps5SelectProfile(const QString& id);
@@ -862,7 +898,8 @@ public:
     Q_INVOKABLE void ps5Wake();
     Q_INVOKABLE void ps5Forget();
     Q_INVOKABLE void ps5OpenAccountChecker();
-    Q_INVOKABLE void ps5SendLoginPin(const QString& pin);
+    QVariantMap ps5LoginPrompt() const;
+    Q_INVOKABLE bool ps5SendLoginPin(const QString& requestId,const QString& pin);
     Q_INVOKABLE void ps5Cancel();
     Q_INVOKABLE void ps5Calibrate();
     // key: enabled | background (saved preferences ps5CaptureControl / ps5ControlBackground).
@@ -874,6 +911,8 @@ public:
     void setRemotePlayPin(const QString& value);
 
     QVariantMap preferences() const;
+    bool launchAtLogin() const;
+    Q_INVOKABLE void setLaunchAtLogin(bool enabled);
     QString gpuPriorityStatus() const;
     bool enhancementPrewarmAvailable() const;
     QString uiLanguage() const;
@@ -885,6 +924,9 @@ public:
     // pointer is on at start. QML's Screen.desktopAvailable* span the whole virtual desktop,
     // which centred the window across two of three monitors (field report 2026-10-01).
     Q_INVOKABLE QRect screenAvailableAt(int x, int y) const;
+    Q_INVOKABLE QVariantList fullscreenDisplays() const;
+    Q_INVOKABLE QString fullscreenDisplayId(QObject* window) const;
+    Q_INVOKABLE bool placeFullscreenWindow(QObject* window, const QString& display, const QRect& restoreGeometry) const;
     Q_INVOKABLE QRect launchScreenAvailable() const;
     QString screenshotDirectory() const;
     QString lastScreenshot() const;
@@ -909,6 +951,9 @@ public:
     // youtube, kofi) in the browser. The addresses live here; any other id does nothing.
     Q_INVOKABLE bool openSponsorLink(const QString& id);
     QObject* updates() const;
+    QObject* perfDiagnostics() const;
+    // The same object for main(): command-line automation and exit handling.
+    PerfDiagnostics* diagnosticsSession() const { return perfDiagnostics_; }
     QVariantList audioDevices() const;
     QVariantList gpuMonitorChoices() const;
     QString computeGpuHint() const;
@@ -1117,6 +1162,8 @@ public:
     void setVideoSrQuality(int value);
     int dlssSrModel() const;
     void setDlssSrModel(int value);
+    int fsrSrSharpness() const;
+    void setFsrSrSharpness(int value);
     QVariantList dlssSrModelChoices() const;
     int srPrescale() const;
     bool dualSrEnabled() const;
@@ -1128,6 +1175,8 @@ public:
     void setSrPrescale(int value);
     int srOutput() const;
     void setSrOutput(int value);
+    bool smartSr() const;
+    void setSmartSr(bool enabled);
     bool protectionEnabled() const;
     void setProtectionEnabled(bool value);
     QVariantMap protectionState() const;
@@ -1139,12 +1188,10 @@ public:
     Q_INVOKABLE bool beginExclusionMove(double x,double y);
     Q_INVOKABLE void updateExclusionMove(double x,double y);
     Q_INVOKABLE bool endExclusionMove(bool commit);
-    Q_INVOKABLE bool beginMaskDraw(bool allEffects,const QString& shape);
-    Q_INVOKABLE bool setMaskEnabled(bool allEffects,bool enabled);
-    Q_INVOKABLE bool setMaskFeather(bool allEffects,double pixels);
-    Q_INVOKABLE bool removeMaskRegion(bool allEffects,int index);
-    Q_INVOKABLE bool clearMaskRegions(bool allEffects);
-    Q_INVOKABLE bool setExclusionRegionMode(int index,int mode);
+    Q_INVOKABLE bool beginMaskDraw(bool hud,const QString& shape);
+    Q_INVOKABLE bool setMaskFeather(bool hud,double pixels);
+    Q_INVOKABLE bool removeMaskRegion(bool hud,int index);
+    Q_INVOKABLE bool clearMaskRegions(bool hud);
     Q_INVOKABLE bool setStabilizerParameter(int index,const QString& key,double value);
     Q_INVOKABLE bool setProtectionRegion(double left, double top, double right, double bottom, double feather);
     bool colorEnabled() const;
@@ -1188,10 +1235,14 @@ public:
     void setFgAdaptive(bool value);
     bool pacingRepair() const;
     void setPacingRepair(bool value);
+    bool hudAllEffects() const;
+    void setHudAllEffects(bool value);
     bool hudLock() const;
     void setHudLock(bool value);
     int hudProtect() const;
     void setHudProtect(int value);
+    bool subtitleHold() const;
+    void setSubtitleHold(bool value);
     bool dynamicHud() const;
     void setDynamicHud(bool value);
     bool dlssgLiteAvailable() const;
@@ -1227,6 +1278,10 @@ public:
     double compareSplit() const;
     int aspectMode() const;
     void setAspectMode(int value);
+    int adaptivePreservation() const;
+    void setAdaptivePreservation(int value);
+    int adaptiveZoom() const;
+    void setAdaptiveZoom(int value);
     double audioSkewMs() const;
     bool audioSkewKnown() const;
     QString exportSizeEstimate() const;
@@ -1419,11 +1474,11 @@ public:
     // fullscreen bar window uses it so only its pill takes the pointer.
     Q_INVOKABLE void setWindowMask(QObject* window, const QRectF& rect);
     Q_INVOKABLE void stepFrame(int direction);
-    Q_INVOKABLE void takeScreenshot();
+    Q_INVOKABLE bool takeScreenshot();
     // Recording: the 3 second countdown lives in the interface, the engine
     // only opens the file when the request reaches it.
     // source names the trigger in the log ("shortcut", "pro-button", "game-hotkey").
-    Q_INVOKABLE void startRecording(const QString& source = QString());
+    Q_INVOKABLE bool startRecording(const QString& source = QString());
     Q_INVOKABLE void setVirtualCameraEnabled(bool enabled);
     Q_INVOKABLE void uninstallVirtualCamera();
     Q_INVOKABLE void installVirtualCamera();
@@ -1437,12 +1492,17 @@ public:
     QVariantMap mirrorWindowState()const;
     void pollMirrorWindow();
     void releaseMirrorWindow();
-    Q_INVOKABLE void stopRecording(const QString& source = QString());
+    Q_INVOKABLE bool stopRecording(const QString& source = QString());
     Q_INVOKABLE void toggleRecording(const QString& source = QString());
     Q_INVOKABLE void chooseRecordingDirectory();
     Q_INVOKABLE void openRecordingDirectory();
     // Writes what the replay buffer holds now (source as for recording).
-    Q_INVOKABLE void saveReplay(const QString& source = QString());
+    Q_INVOKABLE bool saveReplay(const QString& source = QString());
+    void attachLocalCaptureControl(PlaybackServer& server);
+    bool localCaptureControlAvailable() const;
+    bool localCaptureControlEnabled() const;
+    Q_INVOKABLE void setLocalCaptureControlEnabled(bool enabled);
+    Q_INVOKABLE void copyLocalCaptureConnection();
     // Lists the recording endpoints for the microphone choice.
     Q_INVOKABLE void refreshMicrophones();
     bool recording() const;
@@ -1519,13 +1579,6 @@ public:
 
     void showFormatBadge(const engine::PlayerSnapshot& snapshot);
 
-    void maybeApplyFgAutoMultiplier();
-
-    void setFgAutoMultiplier(bool value);
-    bool fgAutoMultiplierAvailable() const;
-    bool fgAutoMultiplier() const;
-
-    void applyFgMultiplier(int multiplier);
 
     bool doviFollow() const;
     void setDoviFollow(bool on);
@@ -1536,18 +1589,24 @@ public:
 
 signals:
     void mediaOpenRequested(); // Synchronous intent, before opening or waiting for success.
+    void startupFullscreenRequested();
 
     void playlistRequested();
     void nodeAnchorsChanged();
     void ps5Changed();
+    void ps5PairSaved();
+    void ps5LoginPromptChanged();
     void ps5ControlChanged();
+    void xboxControlChanged();
     void moonlightUiChanged();
     void imageBatchChanged();
     void audioDevicesChanged();
     void subtitlesChanged();
     void subtitleTextChanged();
     void preferencesChanged();
+    void launchAtLoginChanged();
     void recordingChanged();
+    void localCaptureControlChanged();
     void virtualCameraChanged();
     void mirrorWindowChanged();
     void replayChanged();
@@ -1604,6 +1663,9 @@ private:
     // The recording settings both recorders follow, and the replay buffer
     // armed (or not) with them; its state for the interface.
     engine::RecordingSettings recordingOptions() const;
+    bool screenshotBusy() const;
+    CaptureControlResult dispatchLocalCaptureControl(CaptureControlAction action);
+    QJsonObject localCaptureControlState() const;
     void syncReplay();
     void pollReplay();
     // DLAA anti-aliasing needs the DLSS SR runtime and adapter; false (with a notice) otherwise.
@@ -1623,15 +1685,22 @@ private:
     QString vrrSummaryText(int level) const;
     void applyPresentation();
     void applyAspect(bool force);
+    void resumeSource(const QVariantMap& last, bool startupFullscreen);
+    void openPath(const QString& path, bool startupFullscreen);
+    void resumeCaptureSession(bool startupFullscreen);
+    bool startCaptureSession(bool startupFullscreen);
+    bool ps5Connect(bool startupFullscreen);
+    bool acceptSourceRequest(bool startupFullscreen);
+    void bindOpeningSession(bool startupFullscreen);
     // From Home, show the destination and connection note before opening the
     // live source so the video viewport has time to settle.
     void openAfterLivePage(const QString& pending, std::function<void()> open,
-                           const QString& homeTarget = QStringLiteral("min"));
+                           const QString& homeTarget = QStringLiteral("min"), bool startupFullscreen = false);
     void rememberSource(const QString& kind, const QString& label);
     // Edits either mask node in the active chain; rolls back when refused.
     void updateMaskOverlay();
-    QVariantMap maskState(bool allEffects) const;
-    bool editProtection(const std::function<bool(engine::ChainNode&)>& edit,bool allEffects=false);
+    QVariantMap maskState(bool hud) const;
+    bool editProtection(const std::function<bool(engine::ChainNode&)>& edit,bool hud=false);
     engine::ColorSettings selectedColourSettings() const;
     bool commitColour(const engine::ColorSettings& colour);
     // Reads the export job's snapshot and emits exportChanged.
@@ -1644,6 +1713,7 @@ private:
     bool eventFilter(QObject* watched, QEvent* event) override;
     void rememberPosition(bool flush);
     void refreshSubtitles(const std::wstring& media);
+    void requestSubtitleScan(const std::wstring& path);
     void tickSubtitles();
     void tickImageBatch();
     void tickCapture();
@@ -1662,15 +1732,19 @@ private:
 #ifdef VEYRA_ENABLE_MOONLIGHT
     void setupMoonlight();
 #endif
-    void queryCapture(int kind, std::wstring device);
+    void queryCapture(int kind, std::wstring device, bool startupFullscreen = false);
     // Opens a device/stream URI (capture, screen) the way openPath opens a file.
-    void openSourceUri(const std::wstring& uri, const std::wstring& label, bool screenFill = false);
+    void openSourceUri(const std::wstring& uri, const std::wstring& label, bool screenFill = false,
+                       bool startupFullscreen = false);
 
+    friend struct CaptureQueryBridgeTest;
     struct Impl;
     std::unique_ptr<Impl> impl_;
     QObject* nvidiaVrrProfile_ = nullptr;
     LiveTranslation* liveTranslation_ = nullptr;
     QObject* updates_ = nullptr;
+    PerfDiagnostics* perfDiagnostics_ = nullptr;
+    void createPerfDiagnostics();
 };
 
 } // namespace veyra::ui

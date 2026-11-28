@@ -36,6 +36,9 @@ Window {
     // app screenshot can be compared under the same name.
     property string page: "home"
     readonly property bool onboardingActive: onboarding.visible
+    readonly property int controllerInset: controllerPanel.rightInset
+    readonly property int videoAreaWidth: Math.max(0, width - controllerInset)
+    onControllerInsetChanged: Qt.callLater(videoHost.syncRect)
     // The node page splitter: height of its video card (picture + 40px bar).
     property real nodeVideoHeight: 330
     // Every navigation goes through here: "专业" means the node page while the
@@ -59,6 +62,7 @@ Window {
     // sized window during that transition.
     readonly property bool screenSized: fullTarget || fullRestorePending || visibility === Window.FullScreen || visibility === Window.Maximized
     function toggleMaximized() {
+        if (fullRestorePending) return
         // The dock's restore button must also leave fullscreen, using the same
         // saved window state and cleanup as F11 / the transport button.
         if (fullscreen) { toggleFullscreen(); return }
@@ -248,11 +252,11 @@ Window {
         // Fullscreen is a video-only viewport (AppShell): the picture is the screen
         // and the controls float above it in their own window (FullscreenBar).
         if ((fullscreen || (maximized && page === "min")) && page !== "home" && page !== "set")
-            return { x: 0, y: 0, width: width, height: height }
+            return { x: 0, y: 0, width: videoAreaWidth, height: height }
         switch (page) {
         case "min":
             // .min .stage: full width, height = the picture height.
-            return { x: 0, y: 0, width: width, height: Math.round(pictureHeight) }
+            return { x: 0, y: 0, width: videoAreaWidth, height: Math.round(pictureHeight) }
         case "pro":
             // Share the page's responsive header, transport and status dimensions.
             // A second fixed-height formula let the HWND cover the playback bar.
@@ -260,7 +264,7 @@ Window {
         case "node":
             return nodePage.videoViewport
         case "exp":
-            return ExportLayout.calculate(width, height, exportPage.compactTab).video
+            return ExportLayout.calculate(videoAreaWidth, height, exportPage.compactTab).video
         default:
             return { x: 0, y: 0, width: 0, height: 0 }
         }
@@ -271,6 +275,7 @@ Window {
     Item {
         id: pages
         anchors.fill: parent
+        anchors.rightMargin: root.controllerInset
         // In fullscreen the picture covers the page, and the native video window
         // passes the pointer through: a hidden page control must not take a click
         // meant for the picture.
@@ -301,6 +306,7 @@ Window {
             onVideoViewportChanged: if (root.page === "pro" && !root.fullscreen) videoHost.syncRect()
             home: pages
             onboardingActive: root.onboardingActive
+            playlistActionEnabled: root.playlistActionEnabled
             overlay: root.quickPanelShown && root.page === "pro"
             onRequestFullscreen: root.toggleFullscreen()
             onRequestPage: p => root.goPage(p)
@@ -332,8 +338,10 @@ Window {
             pageId: "set"
             home: pages
             fullscreenBackground: ultrawideBackground
+            fullscreenDisplays: root.fullscreenDisplays
             onRequestPage: p => {
-                if (p === "translation") dialogs.open(p)
+                if (p === "perf-diagnostics") perfDialog.open()
+                else if (p === "translation" || p === "update" || p === "xbox") dialogs.open(p)
                 else root.goPage(p)
             }
         }
@@ -343,11 +351,16 @@ Window {
     DialogHost {
         id: dialogs
         anchors.fill: parent
+        anchors.rightMargin: root.controllerInset
+        controllerPanel: controllerPanel
         onboardingActive: root.onboardingActive
         // The dialogs open the source through the bridge; show the picture.
         onStartPs5: if (root.page === "home") root.goPage("min")
         onStartMoonlight: if (root.page === "home") root.goPage("min")
-        onStartXbox: if (root.page === "home") root.goPage("min")
+        onStartXbox: {
+            if (root.page === "set") root.goPage("pro")
+            else if (root.page === "home") root.goPage("min")
+        }
         onStartScreen: if (root.page === "home") root.goPage("min")
         onStartScreenCrop: {
             root.goPage("min")
@@ -397,7 +410,10 @@ Window {
     // The dock floats above every page and retracts on its own.
     TopDock {
         id: dock
-        anchors.horizontalCenter: parent.horizontalCenter
+        width: root.videoAreaWidth
+        controllerPanelAvailable: root.controllerEntryAvailable
+        controllerPanelOpen: controllerPanel.opened
+        onRequestControllerPanel: root.toggleControllerPanel()
         // The node page is the professional mode's node view.
         currentPage: root.page === "node" ? "pro" : root.page
         maximized: root.maximized || root.fullscreen
@@ -468,9 +484,19 @@ Window {
     // cinema rule would otherwise snap that fullscreen size back to the film.
     property bool fullTarget: false
     property int fullRestoreVisibility: Window.Windowed
-    // Windows may briefly report Windowed while restoring a maximized window.
-    // Keep cinema sizing out of that native transition, without a polling timer.
+    // Keep cinema sizing suspended while Windows restores or moves a window.
     property bool fullRestorePending: false
+    property var fullscreenPlacement: null
+    readonly property var fullscreenDisplays: Qt.application.screens.length > 0 ? veyra.fullscreenDisplays() : []
+
+    onFullscreenDisplaysChanged: Qt.callLater(checkFullscreenDisplay)
+    function checkFullscreenDisplay() {
+        const placement = fullscreenPlacement
+        if (placement && !fullscreenDisplays.some(display => display.id === placement.target)) {
+            restoreFullscreenWindow(true)
+            toast.show(qsTr("全屏显示器已断开，已恢复窗口。"), true)
+        }
+    }
     property bool fullLocked: false
     // Fullscreen quick-adjust panel (Home): the professional mode's own controls
     // over the picture - the list inspector (with the performance orbs) in list
@@ -520,24 +546,63 @@ Window {
         fullHide.restart()
         videoHost.syncRect()
     }
+    function restoreFullscreenWindow(disconnected) {
+        const previous = fullscreenPlacement
+        const reposition = previous !== null && (previous.moved || disconnected)
+        fullscreenPlacement = null
+        fullRestorePending = reposition || fullRestoreVisibility === Window.Maximized
+        fullTarget = false
+        visibility = reposition ? Window.Windowed : fullRestoreVisibility
+        Qt.callLater(function() {
+            if (reposition) {
+                veyra.placeFullscreenWindow(root, previous.origin, previous.rect)
+                root.visibility = root.fullRestoreVisibility
+                videoHost.syncRect()
+            }
+            root.fullRestorePending = false
+        })
+        veyra.logUi("ui-fullscreen", "enabled=" + fullscreen)
+    }
+    function enterFullscreenOnDisplay(origin, target) {
+        fullscreenPlacement = null
+        let moved = false
+        if (target) {
+            const rect = Qt.rect(x, y, width, height)
+            moved = origin !== target && veyra.placeFullscreenWindow(root, target, Qt.rect(0, 0, 0, 0))
+            if (origin === target || moved)
+                fullscreenPlacement = {origin: origin, target: target, rect: rect, moved: moved}
+        }
+        visibility = Window.FullScreen
+        fullRestorePending = false
+        if (moved) Qt.callLater(videoHost.syncRect)
+        veyra.logUi("ui-fullscreen", "enabled=" + fullscreen)
+    }
     function toggleFullscreen() {
+        if (fullRestorePending) return
         if (!fullscreen && veyra.fullscreenMemorySafe === false) {
             toast.show(qsTr("本次播放检测到全屏显存持续增长，请使用窗口播放；重新打开片源后可再次测试全屏。"), true)
             veyra.logUi("ui-fullscreen", "blocked after sustained video-memory growth")
             return
         }
         fullLocked = false
-        if (!fullscreen) {
-            fullRestoreVisibility = maximized ? Window.Maximized : Window.Windowed
-            fullTarget = true
-            visibility = Window.FullScreen
-        } else {
-            fullRestorePending = fullRestoreVisibility === Window.Maximized
-            fullTarget = false
-            visibility = fullRestoreVisibility
-            Qt.callLater(function() { root.fullRestorePending = false })
+        if (fullscreen) {
+            restoreFullscreenWindow(false)
+            return
         }
-        veyra.logUi("ui-fullscreen", "enabled=" + fullscreen)
+        fullRestoreVisibility = maximized ? Window.Maximized : Window.Windowed
+        fullTarget = true
+        const preference = veyra.preferences.fullscreenDisplay || ""
+        const target = fullscreenDisplays.some(display => display.id === preference) ? preference : ""
+        const origin = target ? veyra.fullscreenDisplayId(root) : ""
+        if (target && origin !== target && maximized) {
+            // Let Windows restore the normal rectangle before saving it and
+            // moving across potentially different display scaling factors.
+            fullRestorePending = true
+            visibility = Window.Windowed
+            Qt.callLater(function() { root.enterFullscreenOnDisplay(origin, target) })
+        } else {
+            enterFullscreenOnDisplay(origin, target)
+        }
     }
 
     // G2.5 fullscreen controls. AppShell: any pointer movement shows the transport,
@@ -741,13 +806,139 @@ Window {
             veyra.moonlightCapture(true)
         }
     }
+    readonly property bool ps5InputLocked: !!veyra.ps5Input &&
+        (veyra.ps5Input.ps5Captured || veyra.ps5Input.xboxCaptured || veyra.ps5Input.previewing)
+    readonly property bool ps5KeyboardReady: !!veyra.ps5Input && veyra.ps5Input.ps5KeyboardEnabled &&
+        ((veyra.ps5.active === true && veyra.ps5.viewOnly !== true) ||
+         (veyra.ps5Control.state === "connected" && veyra.isCapture))
+    readonly property bool xboxMappingSource: veyra.sourceKind === "xbox" ||
+        (veyra.sourceKind === "capture" && veyra.xboxControl?.state === "connected")
+    readonly property bool xboxKeyboardReady: xboxMappingSource && veyra.ps5Input?.xboxKeyboardEnabled === true &&
+        (veyra.sourceKind === "xbox" ? veyra.xbox?.state?.stream?.state === "streaming" && veyra.xbox.state.gamepad !== false
+            : veyra.xboxControl?.state === "connected")
+    readonly property bool controllerEntryAvailable: !!veyra.ps5Input
+        && (veyra.ps5Control?.available === true || veyra.xboxControl?.available === true)
+        && ["ps5", "xbox", "capture"].indexOf(veyra.sourceKind) >= 0
+        && !root.ps5InputLocked && !veyra.moonlightCaptured && !root.onboardingActive
+    function controllerOptions() {
+        if (dialogs.dialog === "ps5") return {platform: "ps5", captureOnly: false}
+        if (dialogs.dialog === "xbox") return {platform: "xbox", captureOnly: dialogs.xboxHostPicker}
+        const xbox = veyra.sourceKind === "xbox" || veyra.xboxControl?.state === "connected"
+            || (veyra.xboxControl?.enabled === true && veyra.ps5Control?.enabled !== true)
+        return {platform: xbox ? "xbox" : "ps5",
+            captureOnly: veyra.sourceKind !== "ps5" && veyra.sourceKind !== "xbox"}
+    }
+    function toggleControllerPanel() { controllerPanel.toggle(root.controllerOptions()) }
+    onXboxMappingSourceChanged: if (dialogs.dialog === "" && !controllerPanel.opened)
+        veyra.ps5Input?.selectPlatform(xboxMappingSource)
+    readonly property bool consoleKeymapOnVideo: veyra.hasSource &&
+        (root.page === "min" || root.page === "pro" || root.page === "node") &&
+        (root.ps5KeyboardReady || root.xboxKeyboardReady || root.ps5InputLocked)
+    Binding {
+        target: veyra.ps5Input
+        property: "quickReferenceEnabled"
+        value: root.consoleKeymapOnVideo && !veyra.moonlightCaptured && dialogs.dialog === ""
+        when: !!veyra.ps5Input
+    }
+    Binding {
+        target: veyra.ps5Input
+        property: "quickReferenceOpen"
+        value: consoleKeymap.referenceOpen && !consoleKeymap.suppressed
+        when: !!veyra.ps5Input
+    }
+    TapHandler {
+        enabled: (root.ps5KeyboardReady || root.xboxKeyboardReady) && !root.ps5InputLocked && dialogs.dialog === ""
+        onTapped: eventPoint => {
+            if (root.page !== "min" && root.page !== "pro" && root.page !== "node") return
+            if (root.overVideoCover(eventPoint.scenePosition) || !root.pictureContains(eventPoint.scenePosition)) return
+            if (veyra.protectionDrawShape.length > 0 || veyra.exclusionOverlayVisible || screenCrop.editing) return
+            if (root.xboxKeyboardReady) veyra.xboxCaptureKeyboard()
+            else veyra.ps5CaptureKeyboard()
+        }
+    }
+    ConsoleKeymapOverlay {
+        id: consoleKeymap
+        anchors.fill: parent
+        anchors.rightMargin: root.controllerInset
+        z: 92
+        input: veyra.ps5Input
+        xbox: root.xboxMappingSource
+        active: root.consoleKeymapOnVideo
+        locked: root.ps5InputLocked
+        suppressed: dialogs.dialog !== "" || veyra.moonlightCaptured
+        onEditRequested: dialogs.openPs5Mapping(root.xboxMappingSource, "bindings", consoleKeymap.showDriving)
+    }
+    Connections {
+        target: veyra.ps5Input
+        function onApplicationHotkeyRequested(chord) {
+            if (chord === "Ctrl+Alt+M" && veyra.perfDiagnostics && veyra.perfDiagnostics.state === "recording") veyra.perfDiagnostics.mark()
+            if (chord === veyra.shortcuts.screenshot) veyra.takeScreenshot()
+            if (chord === veyra.shortcuts.record) veyra.toggleRecording("shortcut")
+            if (chord === veyra.shortcuts.replay) veyra.saveReplay("shortcut")
+            if (chord === veyra.shortcuts.fullscreenStats && root.fullscreen && dialogs.dialog === "" && !screenCrop.editing)
+                veyra.setPreference("fullscreenFrameStats", !veyra.preferences.fullscreenFrameStats)
+        }
+    }
+
     // Stream statistics on and off. While a PC stream has the keyboard, the capture filter sees the keys
     // first and toggles the same switch.
     Shortcut {
         sequence: "Ctrl+Alt+Shift+S"
-        enabled: (veyra.moonlight && veyra.moonlight.state.streaming === true) || (veyra.xbox && veyra.xbox.state.streaming === true)
+        enabled: veyra.ps5VideoActive || (veyra.moonlight && veyra.moonlight.state.streaming === true)
+                 || (veyra.xbox && veyra.xbox.state.streaming === true)
         onActivated: veyra.moonlightStatsVisible = !veyra.moonlightStatsVisible
     }
+    Shortcut {
+        sequence: "Ctrl+Alt+F1"
+        enabled: !!veyra.ps5Input && !root.ps5InputLocked && !veyra.moonlightCaptured
+        onActivated: root.toggleControllerPanel()
+    }
+
+    ControllerPanelWindow {
+        id: controllerPanel
+        owner: root
+        bridge: veyra
+        onCaptureSettingsRequested: dialogs.open("capture")
+        onCaptureFocusRequested: {
+            if (dialogs.dialog !== "") dialogs.close()
+            root.requestActivate()
+        }
+        onStreamStarted: {
+            if (dialogs.dialog === "ps5" || dialogs.dialog === "xbox") dialogs.close()
+            if (root.page === "home") root.goPage("min")
+            else if (root.page === "set") root.goPage("pro")
+        }
+        onStartKeyboardRequested: xbox => {
+            consoleCaptureStart.xbox = xbox
+            consoleCaptureStart.attempts = 0
+            consoleCaptureStart.restart()
+        }
+        onOpenedChanged: if (!opened && !root.ps5InputLocked)
+            veyra.ps5Input?.selectPlatform(root.xboxMappingSource)
+    }
+
+    // Windows hands focus back to the player after clicking a native tool
+    // window. The bridge still verifies foreground ownership before capture.
+    Timer {
+        id: consoleCaptureStart
+        interval: 20
+        repeat: true
+        property bool xbox: false
+        property int attempts: 0
+        onTriggered: {
+            if (!controllerPanel.opened || !controllerPanel.connected || controllerPanel.xbox !== xbox) {
+                stop()
+                return
+            }
+            const grabbed = xbox ? veyra.xboxCaptureKeyboard() : veyra.ps5CaptureKeyboard()
+            if (grabbed) stop()
+            else if (++attempts >= 10) {
+                stop()
+                toast.show(qsTr("点击画面开始键鼠控制"), false)
+            }
+        }
+    }
+
     StreamHud {
         id: streamHud
         x: 16
@@ -766,11 +957,15 @@ Window {
     FullscreenBar {
         id: fullBar
         owner: root
+        rightInset: root.controllerInset
+        controllerPanelAvailable: root.controllerEntryAvailable
+        controllerPanelOpen: controllerPanel.opened
+        onRequestControllerPanel: Qt.callLater(root.toggleControllerPanel)
         // Windowed cinema: the pill straddles the picture edge (D1). It hides under
         // an open dialog, which lives in the main window below it.
         cinema: root.cinema && !root.fullscreen
         pillTop: (root.maximized ? root.height : root.pictureHeight) - 46
-        shown: !root.onboardingActive && veyra.hasSource && !screenCrop.editing && !root.pillHidden && (root.fullscreen ? root.fullControls && !root.fullLocked
+        shown: !root.ps5InputLocked && !veyra.moonlightCaptured && !root.onboardingActive && veyra.hasSource && !screenCrop.editing && !root.pillHidden && (root.fullscreen ? root.fullControls && !root.fullLocked
                                                    : root.cinema && root.shownPage === "min"
                                                      && root.leavingPage === "" && dialogs.dialog === ""
                                                      && root.visibility !== Window.Minimized)
@@ -800,6 +995,9 @@ Window {
     // Subtitles keep clear of the control pill: fullscreen bar 24px margin + pill,
     // windowed cinema pill straddling the picture's bottom edge.
     Binding { target: veyra; property: "subtitleBottomInset"; value: fullBar.shown ? (root.fullscreen ? 84 : 56) : 0 }
+    readonly property bool playlistActionEnabled: !root.fullLocked && !root.onboardingActive
+        && !root.ps5InputLocked && !veyra.moonlightCaptured && !screenCrop.editing && dialogs.dialog === ""
+        && (!settingsPage.visible || settingsPage.capturingKey === "")
     // Rebindable (设置 → 快捷键); the hold-to-compare key is handled by the bridge's
     // application event filter because it needs the key release too.
     Shortcut { sequence: veyra.shortcuts.playPause; enabled: !screenCrop.editing; onActivated: veyra.togglePlayPause() }
@@ -849,6 +1047,13 @@ Window {
     Shortcut { sequence: "Ctrl+E"; onActivated: root.page = "exp" }
     // Mirror window (second screen) on/off from any page.
     Shortcut { sequence: "Ctrl+M"; onActivated: veyra.setMirrorWindowOpen(!veyra.mirrorWindowOpen) }
+    Shortcut {
+        objectName: "open-playlist-shortcut"
+        sequence: veyra.shortcuts.playlist
+        autoRepeat: false
+        enabled: root.playlistActionEnabled
+        onActivated: veyra.showPlaylist()
+    }
     Shortcut {
         sequence: veyra.shortcuts.lock
         enabled: root.fullscreen
@@ -930,6 +1135,67 @@ Window {
         }
     }
 
+    // 性能诊断 (设置 → 关于): the dialog, a timer pill over the picture while it
+    // records (also in fullscreen), and Ctrl+Alt+M to mark a stutter.
+    PerfDiagnosticsDialog { id: perfDialog }
+    Rectangle {
+        id: perfPill
+        objectName: "videoCover"
+        property real coverRadius: 9
+        readonly property var diag: veyra.perfDiagnostics
+        readonly property bool recording: diag && diag.state === "recording"
+        readonly property bool finished: diag && (diag.state === "analyzing" || diag.state === "done")
+        z: 31
+        visible: recording || finished
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.topMargin: 12
+        anchors.rightMargin: 16
+        width: perfPillRow.implicitWidth + 20
+        height: perfPillRow.implicitHeight + 12
+        radius: 9
+        color: "#1C1A26"
+        border.width: 1
+        border.color: recording ? Qt.rgba(1, 0.365, 0.42, 0.55) : Theme.stroke2
+        function clock(seconds) {
+            const s = Math.max(0, Math.floor(seconds))
+            return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0")
+        }
+        Row {
+            id: perfPillRow
+            anchors.centerIn: parent
+            spacing: 8
+            Rectangle { width: 8; height: 8; radius: 4; anchors.verticalCenter: parent.verticalCenter
+                        color: perfPill.recording ? "#FF5D6C" : "#3DDC84"; visible: perfPill.recording || perfPill.diag.state === "done" }
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                color: "#ECEAF2"; font.family: Theme.fontUi; font.pixelSize: 12
+                text: !perfPill.diag ? ""
+                      : perfPill.recording ? qsTr("诊断记录中 %1 / %2 · Ctrl+Alt+M 标记").arg(perfPill.clock(perfPill.diag.elapsedSeconds)).arg(perfPill.clock(perfPill.diag.durationSeconds))
+                      : perfPill.diag.state === "analyzing" ? qsTr("诊断：正在分析…")
+                      : qsTr("诊断完成 · 查看结果")
+            }
+        }
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: perfDialog.open()
+        }
+    }
+    Shortcut {
+        sequence: "Ctrl+Alt+M"
+        context: Qt.ApplicationShortcut
+        enabled: veyra.perfDiagnostics && veyra.perfDiagnostics.state === "recording"
+        onActivated: veyra.perfDiagnostics.mark()
+    }
+    Connections {
+        target: veyra.perfDiagnostics
+        function onMarked(number) { toast.show(qsTr("已标记 #%1").arg(number), false) }
+        function onFinished(ok) {
+            toast.show(ok ? qsTr("性能诊断完成，点右上角查看结果") : qsTr("性能诊断已结束，分析没有完成，原始数据已保存"), !ok, ok)
+        }
+    }
+
     // RivaTuner, NVIDIA's overlay or GamePP started after Veyra (QmlPlayerBridge): RTSS's
     // OSD is kept out until a restart; the other two cannot be, and froze 2.0 in the field.
     VConfirm {
@@ -952,6 +1218,12 @@ Window {
         function onNotice(text, isError) { toast.show(text, isError) }
         function onWarningNotice(text) { toast.show(text, false, true) }
         function onOverlayRestartSuggested(kind) { onboarding.close(); overlayRestart.kind = kind; overlayRestart.open() }
+        function onStartupFullscreenRequested() {
+            const picturePage = root.page === "pro" || root.page === "min" || root.page === "node"
+            if (picturePage && !root.fullscreen && root.visibility !== Window.Minimized &&
+                dialogs.dialog === "" && !root.onboardingActive && !overlayRestart.shown)
+                root.toggleFullscreen()
+        }
         function onNavigate(p) {
             onboarding.close()
             // A dialog key opens the dialog; anything else is a page.
@@ -1048,7 +1320,15 @@ Window {
         root.x = a.x + Math.round((a.width - root.width) / 2)
         root.y = a.y + Math.round((a.height - root.height) / 2)
     }
-    onClosing: if (!root.fullscreen && !root.maximized && !root.cinema) veyra.rememberWindowSize(root.width, root.height)
+    onClosing: function(event) {
+        if (veyra.updates.portable.installing) {
+            event.accepted = false
+            dialogs.open("update")
+            return
+        }
+        if (!root.fullscreen && !root.maximized && !root.cinema)
+            veyra.rememberWindowSize(root.width, root.height)
+    }
     // 日落 startup intro (DuskIntro.qml, 2026-11-15): on a plain start to the home page in the
     // dusk palette, unless 设置 → 外观 → 启动动画 is off, animations are reduced or a test
     // switch is set. Its clock starts with the first frame on screen; a page change (a file
@@ -1119,7 +1399,7 @@ Window {
 
     // Startup music plays once, continuing after the intro or without it. Media-open
     // intent or the shared setting/button permanently stops it for this launch.
-    readonly property bool musicOn: typeof vyMusic !== "undefined" && veyra.preferences.introMusic !== false
+    readonly property bool musicOn: typeof vyMusic !== "undefined" && veyra.preferences.introMusic === true
     readonly property bool musicSounding: typeof vyMusic !== "undefined" && (vyMusic.state === "loading" || vyMusic.state === "playing")
     function stopStartupMusicForSession() {
         if (typeof vyMusic === "undefined") return

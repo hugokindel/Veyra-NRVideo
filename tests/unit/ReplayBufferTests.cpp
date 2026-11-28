@@ -2,6 +2,7 @@
 // sound alongside the picture, coverage and the end of a segment; the
 // recording audio tap with two listeners (a recording and the replay buffer).
 #include "veyra/engine/ReplayBuffer.h"
+#include "veyra/engine/RecordingGrid.h"
 #include "veyra/sink/RecordingAudioTap.h"
 
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include <vector>
 
 using veyra::engine::ReplayBuffer;
+using veyra::engine::RecordingGrid;
 namespace {
 int failures=0,passes=0;
 void check(bool ok,const char* what){std::printf("%s %s\n",ok?"PASS":"FAIL",what);ok?++passes:++failures;}
@@ -35,6 +37,47 @@ struct Collect final : veyra::sink::RecordingAudioSink {
 }
 
 int main(){
+    {
+        const RecordingGrid grid(60);
+        check(grid.indexAt(16'667)==1&&grid.indexAt(33'333)==2,
+              "regular 60 fps pictures each get a grid index");
+        check(grid.indexAt(16'450)==1&&grid.indexAt(16'724)==1,
+              "close pictures can be rejected before conversion");
+        check(grid.indexAt(150'000)==9&&grid.indexAt(3'000'000)==180,
+              "gaps leave missing ticks for repeating the previous picture");
+        check(grid.deadlineUs(3)==58'334&&grid.indexAt(58'333)==3&&grid.indexAt(58'334)==4,
+              "the deadline falls after the final eligible clock tick");
+        const RecordingGrid thirty(30);
+        int64_t last=-1;
+        bool continuous=true;
+        for(int i=0;i<=1200;++i){
+            const auto at=grid.timeUs(i)+(i%4==1?380:i%4==3?-420:0);
+            const auto next=thirty.indexAt(at);
+            if(next<=last)continue;
+            continuous&=next==last+1;
+            last=next;
+        }
+        check(continuous&&last==600,"jittering 60 Hz input selects one picture per 30 fps tick");
+        for(const uint32_t fps:{30u,60u,120u,143u}){
+            const RecordingGrid rate(fps);
+            const auto afterHours=int64_t(fps)*12*3600;
+            check(rate.timeUs(afterHours)==43'200'000'000&&
+                  rate.indexAt(rate.timeUs(afterHours-1))==afterHours-1,
+                  "frame indices round-trip with no accumulated drift");
+        }
+        ReplayBuffer buffer(10'000'000,1<<20);
+        auto fixed=format();
+        fixed.cfr=true;
+        buffer.setFormat(std::move(fixed),{});
+        buffer.setOrigin(23'456'789);
+        for(int i=0;i<4;++i){
+            const auto pts=grid.timeUs(i);
+            buffer.pushVideo({bytes(100),pts,grid.timeUs(i+1)-pts,i==0},i,0);
+        }
+        const auto clip=buffer.clip(23'456'789+48'000);
+        check(clip.video.cfr&&clip.videoPackets.size()==3&&clip.endUs==50'000,
+              "CFR replay preserves whole ticks and the recording clock offset");
+    }
     {
         ReplayBuffer empty(10'000'000,size_t(64)<<20);
         empty.setFormat(format(),{{nullptr,"Veyra sound"}});

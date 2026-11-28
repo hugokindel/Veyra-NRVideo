@@ -3,11 +3,15 @@
 #include "veyra/source/WasapiAudioInput.h"
 #include "VirtualCaptureAudioSetup.h"
 #include <dxgi1_6.h>
+#include <limits>
+#include <utility>
 #include <wrl/client.h>
 #include <map>
 
 namespace veyra::ui {
 // --- capture dialog ----------------------------------------------------------
+// Menu action only. The matched endpoint is stored using the normal capture settings.
+constexpr int kMatchElgatoAudio = std::numeric_limits<int>::min();
 static std::vector<source::CaptureDevice> captureAudioDeviceDetails() {
     auto devices = source::CaptureCardSource::deviceDetails(true);
     for (auto& endpoint : source::WasapiAudioInput::devices(true))
@@ -41,11 +45,16 @@ void QmlPlayerBridge::setCaptureDeviceId(const QString& value) {
     impl_->captureRequestedResolution.clear();
     impl_->captureFormatKey=impl_->captureDevice==impl_->capturePrefs.videoPath?impl_->capturePrefs.formatKey:std::wstring{};
     impl_->captureDriverFormatKey.clear();
-    // Colour follows the device, as in 1.4.4; audio returns to "none" unless it
-    // is the remembered device.
+    // Keep the saved choice, including explicitly disabled audio.
     impl_->captureColor = impl_->capturePrefs.colorForDevice(impl_->captureDevice);
     if(impl_->captureDevice==impl_->capturePrefs.videoPath)impl_->restoreCaptureForm();
-    else {impl_->captureAudioChoice=source::kCaptureAudioDisabled;impl_->captureAudioMissing=false;}
+    else {
+        const auto audio = source::CaptureCardSource::recommendElgatoCaptureAudio(
+            impl_->captureDevice, impl_->captureVideo, impl_->captureAudio);
+        impl_->captureAudioChoice = audio.value_or(source::kCaptureAudioDisabled);
+        impl_->captureAudioMissing = false;
+        if (audio) log::info("capture-ui", "selected matching Elgato capture audio");
+    }
     if(!impl_->persistCaptureSelection())emit notice(tr("采集设置保存失败，请检查配置目录是否可写"),true);
     if (!impl_->captureDevice.empty()) queryCapture(1, impl_->captureDevice);
     emit captureChanged();
@@ -194,9 +203,13 @@ void QmlPlayerBridge::setCapturePixelId(const QString& id) {
     setCaptureFormatKey(id);
 }
 QVariantList QmlPlayerBridge::captureAudioInputs() const {
-    // Only what the user picks explicitly is ever opened (1.4.4 rule).
     QVariantList out{QVariantMap{{"id", source::kCaptureAudioDisabled}, {"label", tr("不采集音频")}}};
     if(impl_->captureAudioMissing)out<<QVariantMap{{"id",-4},{"label",tr("上次的音频输入未连接")},{"disabled",true}};
+    if (const auto audio = source::CaptureCardSource::recommendElgatoCaptureAudio(
+            impl_->captureDevice, impl_->captureVideo, impl_->captureAudio)) {
+        const auto target = *audio < 0 ? tr("视频设备内置音频（已检测）") : utf8Of(impl_->captureAudio[size_t(*audio)].name);
+        out << QVariantMap{{"id", kMatchElgatoAudio}, {"label", tr("自动") + QStringLiteral(" · ") + target}};
+    }
     for (const auto& d : impl_->captureVideo)
         if (d.path == impl_->captureDevice)
             out << QVariantMap{{"id", source::kCaptureAudioFromVideoDevice},
@@ -211,6 +224,12 @@ QVariantList QmlPlayerBridge::captureAudioInputs() const {
 }
 int QmlPlayerBridge::captureAudioChoice() const { return impl_->captureAudioMissing?-4:impl_->captureAudioChoice; }
 void QmlPlayerBridge::setCaptureAudioChoice(int choice) {
+    if (choice == kMatchElgatoAudio) {
+        const auto audio = source::CaptureCardSource::recommendElgatoCaptureAudio(
+            impl_->captureDevice, impl_->captureVideo, impl_->captureAudio);
+        if (!audio) return;
+        choice = *audio;
+    }
     if (choice < source::kCaptureAudioFromVideoDevice || choice >= int(impl_->captureAudio.size())) return;
     impl_->captureAudioChoice = choice;
     impl_->captureAudioMissing=false;
@@ -259,6 +278,7 @@ void QmlPlayerBridge::setCaptureBufferMode(int value) {
     emit settingsChanged();
 }
 bool QmlPlayerBridge::captureQueryBusy() const { return impl_->captureBusy || impl_->captureDriverSettingsOpen; }
+bool QmlPlayerBridge::captureQueryTimedOut() const { return impl_->captureQueryTimedOut; }
 QString QmlPlayerBridge::captureStatus() const { return impl_->captureStatus; }
 bool QmlPlayerBridge::captureBlackmagicDevice() const {
     for (const auto& d : impl_->captureVideo) if (d.path == impl_->captureDevice) return source::decklink::isPath(d.path)||source::isBlackmagicCaptureDevice(d.name, d.path);
@@ -335,42 +355,77 @@ void QmlPlayerBridge::openCaptureVirtualAudioVendor() {
 
 void QmlPlayerBridge::refreshCaptureDevices() {
     if (impl_->captureDriverSettingsOpen) return;
-    impl_->captureVirtualAudioInstalled = !source::WasapiAudioInput::devices(true,true).empty();
     impl_->capturePrefs = ui::CapturePreferenceStore(impl_->dataDir).load();
     queryCapture(0, {});
 }
-void QmlPlayerBridge::queryCapture(int kind, std::wstring device) {
+void QmlPlayerBridge::queryCapture(int kind, std::wstring device, bool startupFullscreen) {
     auto& i = *impl_;
-    if (captureQueryBusy()) { i.captureNextQuery=std::pair{kind,std::move(device)};return; }
+    if (captureQueryBusy()) { i.captureNextQuery=Impl::CaptureQueryRequest{kind,std::move(device),startupFullscreen};return; }
     i.captureBusy = true; i.captureQueryKind = kind;
+    i.captureQueryTimedOut = false;
+    i.captureQueryStarted = std::chrono::steady_clock::now();
     i.captureStatus = kind == 0 ? tr("正在查询采集设备…当前播放继续") : tr("正在读取设备支持的格式…");
     const auto preferred=kind==2?i.capturePrefs.formatKey:
         kind==3&&!i.captureDriverFormatKey.empty()?i.captureDriverFormatKey:i.captureFormatKey;
     const auto requested=kind==4?i.captureRequestedResolution:
         preferred.empty()&&wideOf(i.prefs.value("captureDraftDevice").toString())==device?
             wideOf(i.prefs.value("captureDraftResolution").toString()):std::wstring{};
-    i.captureQuery = std::async(std::launch::async, [kind, device, preferred, requested] {
+    // A DirectShow enumeration can fail to return. A packaged task owns
+    // only its argument values, and its future does not join on UI teardown.
+    std::packaged_task<Impl::CaptureQuery()> query([kind, device, preferred, requested, startupFullscreen] {
         Impl::CaptureQuery q; q.kind = kind; q.device = device;q.requestedResolution=requested;
+        q.startupFullscreen = startupFullscreen;
         const auto initialized=CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if(FAILED(initialized)){q.info.code=initialized;q.info.stage=L"COM initialization";return q;}
         try {
-            if (kind == 0) { q.video = source::CaptureCardSource::deviceDetails(); q.audio = captureAudioDeviceDetails(); }
-            else {
-                if (kind == 2) { q.video = source::CaptureCardSource::deviceDetails(); q.audio = captureAudioDeviceDetails(); }
+            if (kind == 0 || kind == 2) {
+                q.video = source::CaptureCardSource::deviceDetails();
+                q.audio = captureAudioDeviceDetails();
+                if (kind == 0) q.virtualAudioInstalled = !source::WasapiAudioInput::devices(true,true).empty();
+            }
+            if (kind != 0) {
                 q.formats = source::CaptureCardSource::formatsByPath(device,&q.info,preferred,requested);
             }
         } catch (...) {q.info.code=E_FAIL;q.info.stage=L"Capture capability exception";}
         CoUninitialize();
         return q;
     });
+    i.captureQuery = query.get_future();
+    try {
+        std::thread(std::move(query)).detach();
+    } catch (const std::system_error& error) {
+        i.captureBusy = false;
+        i.captureStatus = tr("无法打开视频，请查看诊断");
+        log::error("capture-query", error.what());
+    }
     emit captureChanged();
 }
 void QmlPlayerBridge::tickCapture() {
     auto& i = *impl_;
-    if (!i.captureBusy || i.captureQuery.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    if (!i.captureBusy) return;
+    if (i.captureQuery.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        if (!i.captureQueryTimedOut && std::chrono::steady_clock::now() - i.captureQueryStarted >= std::chrono::seconds(12)) {
+            // Keep ownership of the worker. A driver call can still return,
+            // and a second concurrent probe could contend for the same filter.
+            i.captureQueryTimedOut = true;
+            i.captureStatus = tr("采集设备查询超时。请关闭占用采集卡的软件。如果驱动一直未返回，请重启 Veyra。");
+            log::warn("capture-query", std::format("driver query deadline exceeded kind={} elapsedMs=12000",i.captureQueryKind));
+            emit captureChanged();
+        }
+        return;
+    }
     auto q = i.captureQuery.get();
+    const bool timedOut = std::exchange(i.captureQueryTimedOut, false);
     i.captureBusy = false;
-    if(i.captureNextQuery){auto next=std::move(*i.captureNextQuery);i.captureNextQuery.reset();queryCapture(next.first,std::move(next.second));return;}
+    if (i.captureNextQuery) {
+        auto next = std::move(*i.captureNextQuery);
+        i.captureNextQuery.reset();
+        if (!next.startupFullscreen || i.startupFullscreen.awaitingSession())
+            queryCapture(next.kind, std::move(next.device), next.startupFullscreen);
+        else emit captureChanged();
+        return;
+    }
+    if (q.startupFullscreen && !i.startupFullscreen.awaitingSession()) { emit captureChanged(); return; }
     if(FAILED(q.info.code)&&q.formats.empty()){
         if(q.kind!=0&&q.device!=i.captureDevice){emit captureChanged();return;}
         if(q.kind!=0&&q.kind!=4){i.captureFormatList.clear();++i.captureFormatGeneration;i.captureResolutionChoice.clear();i.captureRateChoice.clear();}
@@ -379,7 +434,12 @@ void QmlPlayerBridge::tickCapture() {
                  uiText(source::captureFailureAdvice(q.info.code)));
         emit notice(i.captureStatus,true);emit captureChanged();return;
     }
-    if (q.kind == 0 || q.kind == 2) { i.captureVideo = std::move(q.video); i.captureAudio = std::move(q.audio); i.captureListed = true; }
+    if (q.kind == 0 || q.kind == 2) {
+        i.captureVideo = std::move(q.video);
+        i.captureAudio = std::move(q.audio);
+        if (q.kind == 0) i.captureVirtualAudioInstalled = q.virtualAudioInstalled;
+        i.captureListed = true;
+    }
     // The remembered rate and audio input, matched against the inputs listed now. Both the
     // panel (kind 0) and 继续上次 (kind 2) need it: the resume path skipped it and connected
     // without sound until the panel was opened once (field report 2026-10-02).
@@ -389,7 +449,7 @@ void QmlPlayerBridge::tickCapture() {
     if (q.kind == 2 && q.device == i.capturePrefs.videoPath) restoreRememberedAudio();
     if (q.kind == 0) {
         veyra::log::info("capture-ui", std::format("devices video={} audio={}", i.captureVideo.size(), i.captureAudio.size()));
-        // Restore the remembered device; otherwise the first one. Never guess audio.
+        // Restore the remembered device; otherwise select the first available one.
         std::wstring pick;
         const auto choices=captureDevices();
         auto allowed=[&](std::wstring_view path){for(const auto& value:choices)if(wideOf(value.toMap().value("id").toString())==path)return true;return false;};
@@ -454,13 +514,17 @@ void QmlPlayerBridge::tickCapture() {
         .arg(utf8Of(q.info.stage),QString::number(quint32(q.info.code),16).rightJustified(8,QLatin1Char('0')));
     veyra::log::info("capture-ui", std::format("formats={} selected={} raw={} rejected={} partial={} fallback={}", i.captureFormatList.size(), !i.captureFormatKey.empty(),q.info.advertised,q.info.rejected,q.info.partial,q.info.fallback));
     emit captureChanged();
-    if (q.kind == 2) {
+    if (q.kind == 2 && !timedOut) {
         if (i.captureFormatKey.empty()) emit notice(tr("上次的采集格式不可用，请在采集卡面板重新选择"), true);
-        else startCaptureSession();
+        else startCaptureSession(q.startupFullscreen);
     }
 }
-bool QmlPlayerBridge::startCaptureSession() {
+bool QmlPlayerBridge::startCaptureSession() { return startCaptureSession(false); }
+
+bool QmlPlayerBridge::startCaptureSession(bool startupFullscreen) {
+    if (!acceptSourceRequest(startupFullscreen)) return false;
     auto& i = *impl_;
+    if (i.captureQueryTimedOut) { emit notice(i.captureStatus, true); return false; }
     if (captureQueryBusy()) { emit notice(tr("设备查询或驱动设置尚未完成"), true); return false; }
     int device = -1;
     for (size_t k = 0; k < i.captureVideo.size(); ++k) if (i.captureVideo[k].path == i.captureDevice) device = int(k);
@@ -505,11 +569,13 @@ bool QmlPlayerBridge::startCaptureSession() {
     // holds the console's slot until the capture replaces it; the tick starts
     // PS5 手柄控制 once the capture card is live instead.
     if (i.prefBool("ps5CaptureControl", false) && !i.snapshot.remotePlay) startPs5Control(false);
-    openSourceUri(path, i.captureVideo[size_t(device)].name);
+    openSourceUri(path, i.captureVideo[size_t(device)].name, false, startupFullscreen);
     emit snapshotChanged();
     return true;
 }
-void QmlPlayerBridge::openSourceUri(const std::wstring& uri, const std::wstring& label, bool screenFill) {
+void QmlPlayerBridge::openSourceUri(const std::wstring& uri, const std::wstring& label, bool screenFill,
+                                   bool startupFullscreen) {
+    if (!acceptSourceRequest(startupFullscreen)) return;
     impl_->screenCropPreview = false;
     rememberPosition(true);
     emit mediaOpenRequested();
@@ -520,16 +586,17 @@ void QmlPlayerBridge::openSourceUri(const std::wstring& uri, const std::wstring&
     impl_->screenFillActive = screenFill;
     const bool screen = uri.starts_with(L"screen:");
     veyra::log::info("capture-ui", "open uri " + QString::fromStdWString(uri).toStdString());
-    openAfterLivePage(screen ? tr("正在开始屏幕捕获…") : tr("正在打开采集设备 · %1").arg(utf8Of(label)), [this, uri] {
+    openAfterLivePage(screen ? tr("正在开始屏幕捕获…") : tr("正在打开采集设备 · %1").arg(utf8Of(label)), [this, uri, startupFullscreen] {
         if (impl_->preOpen) impl_->preOpen();
         impl_->engine.previewView({});
         impl_->engine.open(impl_->videoWindow, uri, impl_->options);
-        impl_->openingSessionId = impl_->engine.snapshot().sessionId;
+        bindOpeningSession(startupFullscreen);
         refreshSubtitles({});
-    }, screen ? QStringLiteral("min") : QStringLiteral("pro"));
+    }, screen ? QStringLiteral("min") : QStringLiteral("pro"), startupFullscreen);
 }
 
-void QmlPlayerBridge::openAfterLivePage(const QString& pending, std::function<void()> open, const QString& homeTarget) {
+void QmlPlayerBridge::openAfterLivePage(const QString& pending, std::function<void()> open, const QString& homeTarget,
+                                       bool startupFullscreen) {
     const int gen = ++impl_->liveOpenGen;
     const bool fromHome = impl_->currentPage.isEmpty() || impl_->currentPage == QLatin1String("home");
     if (fromHome) emit navigate(homeTarget);
@@ -542,11 +609,15 @@ void QmlPlayerBridge::openAfterLivePage(const QString& pending, std::function<vo
     emit snapshotChanged();
     const int delay = reducedMotion() ? 0 : 820;
     veyra::log::info("ui-live-open", std::format("deferred ms={} gen={}", delay, gen));
-    QTimer::singleShot(delay, this, [this, gen, open = std::move(open)] {
+    QTimer::singleShot(delay, this, [this, gen, startupFullscreen, open = std::move(open)] {
         if (gen != impl_->liveOpenGen) { veyra::log::info("ui-live-open", std::format("superseded gen={}", gen)); return; }
         impl_->pendingLiveText.clear();
-        veyra::log::info("ui-live-open", std::format("open gen={}", gen));
-        open();
+        if (startupFullscreen && !impl_->startupFullscreen.awaitingSession()) {
+            impl_->openingSource = false;
+        } else {
+            veyra::log::info("ui-live-open", std::format("open gen={}", gen));
+            open();
+        }
         emit snapshotChanged();
     });
 }

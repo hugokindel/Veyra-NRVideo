@@ -32,7 +32,10 @@ class LiveTranslation final : public QObject {
     Q_PROPERTY(int recognitionThreads READ recognitionThreads WRITE setRecognitionThreads NOTIFY changed)
     Q_PROPERTY(int recognitionEffectiveThreads READ recognitionEffectiveThreads NOTIFY changed)
     Q_PROPERTY(QString recognitionStatus READ recognitionStatus NOTIFY changed)
+    Q_PROPERTY(QString recognitionDirectory READ recognitionDirectory CONSTANT)
+    Q_PROPERTY(QString recognitionInstallLayout READ recognitionInstallLayout NOTIFY changed)
     Q_PROPERTY(bool recognitionInstalled READ recognitionInstalled NOTIFY changed)
+    Q_PROPERTY(bool recognitionRuntimeUpdateAvailable READ recognitionRuntimeUpdateAvailable NOTIFY changed)
     Q_PROPERTY(bool recognitionDownloading READ recognitionDownloading NOTIFY changed)
     Q_PROPERTY(double recognitionProgress READ recognitionProgress NOTIFY changed)
     Q_PROPERTY(qint64 recognitionBytes READ recognitionBytes NOTIFY changed)
@@ -77,7 +80,10 @@ public:
     int recognitionThreads() const { return recognitionThreads_; }
     int recognitionEffectiveThreads() const { return asr_.threads(); }
     QString recognitionStatus() const { return asr_.status(); }
+    QString recognitionDirectory() const { return asr_.directory(); }
+    QString recognitionInstallLayout() const { return asr_.installLayout(); }
     bool recognitionInstalled() const { return asr_.installed(); }
+    bool recognitionRuntimeUpdateAvailable() const { return asr_.runtimeUpdateAvailable(); }
     bool recognitionDownloading() const { return asr_.downloading(); }
     double recognitionProgress() const { return asr_.progress(); }
     qint64 recognitionBytes() const { return asr_.downloadBytes(); }
@@ -123,6 +129,7 @@ public:
     Q_INVOKABLE void downloadModel();
     Q_INVOKABLE void cancelModelDownload();
     Q_INVOKABLE void downloadRecognitionModel();
+    Q_INVOKABLE bool openRecognitionDirectory() const;
     Q_INVOKABLE void cancelRecognitionDownload() { asr_.cancel(); }
     Q_INVOKABLE void deleteRecognitionModel();
     void setPlayback(quint64 session, bool active, bool discontinuity);

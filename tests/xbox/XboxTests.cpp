@@ -19,6 +19,7 @@
 #include <sstream>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -51,6 +52,7 @@ struct FakeTransport final : HttpsTransport {
     std::deque<Reply> script;
     std::vector<HttpsRequest> seen;
     std::mutex mutex;
+    std::function<void()> beforeReply;
     HttpsResponse send(const HttpsRequest& r) override {
         std::lock_guard lock(mutex);
         seen.push_back(r);
@@ -58,6 +60,7 @@ struct FakeTransport final : HttpsTransport {
         Reply reply = script.front();
         if (reply.host != r.host || reply.path != r.path) return {598, "unexpected request " + r.method + " " + r.host + r.path + " (wanted " + reply.host + reply.path + ")"};
         script.pop_front();
+        if (beforeReply) beforeReply();
         return {reply.status, reply.body};
     }
     void add(std::string host, std::string path, int status, std::string body) { script.push_back({std::move(host), std::move(path), status, std::move(body)}); }
@@ -66,6 +69,14 @@ struct FakeTransport final : HttpsTransport {
 // ---------------------------------------------------------------- protocol
 
 void protocolTests() {
+    const auto mouse = mouseReport(9, 20., {-17, 65, 120, -240, 5, true});
+    check(mouse.size() == 33 && mouse[0] == ReportMouse && mouse[14] == 1 &&
+          detail::get32(mouse.data() + 15) == uint32_t(-17) && detail::get32(mouse.data() + 19) == 65 &&
+          detail::get32(mouse.data() + 23) == 120 && detail::get32(mouse.data() + 27) == uint32_t(-240) &&
+          mouse[31] == 5 && mouse[32] == 0, "native mouse report preserves signed motion, wheel, buttons and relative flag");
+    const auto keyboard = keyboardReport(10, 20., {'W', true});
+    check(keyboard.size() == 18 && keyboard[0] == ReportKeyboard && keyboard[14] == 1 &&
+          keyboard[15] == 2 && keyboard[16] == 1 && keyboard[17] == 'W', "native keyboard report marks a VKey press");
     const auto meta = clientMetadataReport(0, 12.5, 1);
     check(meta.size() == 15 && meta[0] == 8 && meta[1] == 0 && meta[14] == 1, "client metadata report: type 8, 15 bytes, touch points last");
     double t = 0;
@@ -83,8 +94,13 @@ void protocolTests() {
     check(r[16] == uint8_t((BtnA | BtnMenu | BtnNexus) & 0xFF) && r[17] == 0, "button mask little-endian");
     check(r[18] == 0xE8 && r[19] == 0x03 && r[20] == 0xFE && r[21] == 0xFF, "left stick X/Y as signed little-endian");
     check(r[26] == 0xFF && r[27] == 0xFF && r[28] == 0x01 && r[29] == 0x01, "triggers 0..65535");
-    check(r[30] == 1 && r[31] == 0 && r[32] == 0 && r[33] == 0 && r[34] == 0 && r[35] == 0 && r[36] == 0 && r[37] == 1,
-          "physicality LE 1 then virtual physicality written big-endian, as the reference client");
+    const uint32_t phys = PhysA | PhysMenu | PhysNexus | PhysLeftTrigger | PhysRightTrigger |
+                          PhysLeftThumbX | PhysLeftThumbY | PhysRightThumbX | PhysRightThumbY;
+    check(r[30] == uint8_t(phys & 0xffu) && r[31] == uint8_t((phys >> 8) & 0xffu) && r[32] == uint8_t((phys >> 16) & 0xffu) && r[33] == uint8_t((phys >> 24) & 0xffu),
+          "physicality: little-endian bits for every button, trigger and stick in use");
+    check(r[34] == 0 && r[35] == 0 && r[36] == 0 && r[37] == 0, "virtual physicality 0");
+    check(gamepadPhysicality(GamepadFrame{}) == 0, "an idle pad reports no physicality");
+    check(clientMetadataReport(0, 0)[14] == 0, "client metadata defaults to no touch points");
 
     veyra::remoteplay::ControllerState s;
     s.inputActive = true;
@@ -136,6 +152,25 @@ void apiTests() {
         check(body["serverId"] == "F1" && body["settings"]["nanoVersion"] == "V3;WebrtcTransport.dll" && !http->seen.back().headers["X-MS-Device-Info"].empty(),
               "play sends the server id, nano V3 and the device info header");
     }
+    check(json::parse(http->seen.back().headers["X-MS-Device-Info"])["dev"]["os"]["name"] == "Windows 11",
+          "full Xbox streaming keeps the existing device profile");
+    http->add(host, "/v5/sessions/home/play", 200, R"({"sessionPath":"v5/sessions/home/CONTROLLER"})");
+    check(api.play("F1", "en-US", true) == "CONTROLLER" &&
+          json::parse(http->seen.back().headers["X-MS-Device-Info"])["dev"]["os"]["name"] == "android",
+          "controller-only Xbox requests the low-bandwidth device profile");
+    const auto controllerProfile = http->seen.back().headers.at("X-MS-Device-Info");
+    for (const auto resolution : {StreamResolution::FullHd, StreamResolution::QuadHd}) {
+        http->add(host, "/v5/sessions/home/play", 200, R"({"sessionPath":"v5/sessions/home/EXPLICIT"})");
+        check(api.play("F1", "en-US", false, resolution) == "EXPLICIT", "play accepts an explicit stream resolution");
+        const auto [width, height] = streamExtent(resolution);
+        const auto device = json::parse(http->seen.back().headers.at("X-MS-Device-Info"));
+        check(device["dev"]["displayInfo"]["dimensions"] == json{{"widthInPixels", width}, {"heightInPixels", height}},
+              "full Xbox stream advertises the requested display dimensions");
+    }
+    http->add(host, "/v5/sessions/home/play", 200, R"({"sessionPath":"v5/sessions/home/CONTROLLER"})");
+    check(api.play("F1", "en-US", true, StreamResolution::QuadHd) == "CONTROLLER" &&
+          http->seen.back().headers.at("X-MS-Device-Info") == controllerProfile,
+          "controller-only Xbox keeps its device profile when a video resolution is supplied");
     http->add(host, "/v5/sessions/home/ABC-123/state", 200, R"({"state":"Failed","errorDetails":{"code":"WNSError","message":"WaitingForServerToRegister"}})");
     const auto st = api.state("ABC-123");
     check(st.state == "Failed" && st.errorCode == "WNSError" && st.errorMessage == "WaitingForServerToRegister", "state with error details");
@@ -155,6 +190,34 @@ void apiTests() {
     bool threw = false;
     try { api.connect("ABC-123", "LPT"); } catch (const ServiceError& e) { threw = e.status == 401; }
     check(threw, "a refused connect is a ServiceError with the status");
+
+    const std::string keepalive = "/v5/sessions/home/ABC-123/keepalive";
+    int renewals = 0;
+    http->add(host, keepalive, 401, "{}");
+    http->add(host, keepalive, 200, "{}");
+    api.keepalive("ABC-123", [&] { ++renewals; return std::string("RENEWED"); });
+    check(renewals == 1 && http->seen.back().headers.at("Authorization") == "Bearer RENEWED",
+          "an expired keepalive lease is renewed and retried once");
+    http->add(host, keepalive, 401, "{}");
+    http->add(host, keepalive, 401, "{}");
+    threw = false;
+    try { api.keepalive("ABC-123", [&] { ++renewals; return std::string("REJECTED"); }); }
+    catch (const ServiceError& e) { threw = e.status == 401; }
+    check(threw && renewals == 2 && http->script.empty(), "a second 401 is reported without another renewal");
+    http->add(host, keepalive, 401, "original service error");
+    threw = false;
+    try { api.keepalive("ABC-123", []() -> std::string { throw NetworkError("simulated renewal timeout"); }); }
+    catch (const ServiceError& e) { threw = e.status == 401 && e.body == "original service error"; }
+    check(threw, "a renewal timeout retains the original keepalive failure");
+    http->add(host, keepalive, 404, "{}");
+    threw = false;
+    try { api.keepalive("ABC-123", [&] { ++renewals; return std::string("UNUSED"); }); }
+    catch (const ServiceError& e) { threw = e.status == 404; }
+    check(threw && renewals == 2, "an ended session is not renewed");
+    api.setToken("PROACTIVE");
+    http->add(host, keepalive, 200, "{}");
+    api.keepalive("ABC-123");
+    check(http->seen.back().headers.at("Authorization") == "Bearer PROACTIVE", "an early renewal is used on the next keepalive");
 
     // The xHome wrapper is nullable even on success (Greenlight's SDPResponse).
     // A pending wrapper is different from a console error; neither may be turned
@@ -233,7 +296,7 @@ void accountTests() {
         Account account(http, file);
         account.setClock([&] { return now; });
         check(account.signedIn(), "the sign-in survives a restart");
-        http->add("user.auth.xboxlive.com", "/user/authenticate", 200, R"({"Token":"UT","NotAfter":"2027-01-01T00:00:00.0000000Z","DisplayClaims":{"xui":[{"uhs":"123"}]}})");
+        http->add("user.auth.xboxlive.com", "/user/authenticate", 200, R"({"Token":"UT","NotAfter":"2032-01-01T00:00:00.0000000Z","DisplayClaims":{"xui":[{"uhs":"123"}]}})");
         http->add("xsts.auth.xboxlive.com", "/xsts/authorize", 200, R"({"Token":"GSSV","NotAfter":"2027-01-01T00:00:00Z","DisplayClaims":{"xui":[{"uhs":"123"}]}})");
         http->add("xhome.gssv-play-prod.xboxlive.com", "/v2/login/user", 200,
                   R"({"offeringSettings":{"regions":[{"name":"WestEurope","baseUri":"https://weu.core.gssv-play-prodxhome.xboxlive.com","isDefault":false},{"name":"EastAsia","baseUri":"https://eas.core.gssv-play-prodxhome.xboxlive.com/","isDefault":true}]},"market":"CN","gsToken":"GS","tokenType":"bearer","durationInSeconds":14400})");
@@ -247,6 +310,40 @@ void accountTests() {
         const size_t before = http->seen.size();
         account.streamingAccess();
         check(http->seen.size() == before, "a valid streaming token is reused");
+
+        auto renewal = std::make_shared<FakeTransport>();
+        renewal->add("xsts.auth.xboxlive.com", "/xsts/authorize", 503, "{}");
+        std::promise<void> requestEntered, releaseRequest;
+        auto requestPending = requestEntered.get_future();
+        auto release = releaseRequest.get_future();
+        renewal->beforeReply = [&] { requestEntered.set_value(); release.wait(); };
+        auto failedRenewal = std::async(std::launch::async, [&] {
+            try { account.tryRenewStreamingAccess("GS", *renewal); }
+            catch (const ServiceError& e) { return e.status == 503; }
+            return false;
+        });
+        const bool pending = requestPending.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+        FakeTransport competing;
+        auto status = std::async(std::launch::async, [&] {
+            if (!account.signedIn()) return false;
+            try { return !account.tryRenewStreamingAccess("GS", competing) && competing.seen.empty(); }
+            catch (const std::exception&) { return false; }
+        });
+        const bool statusReady = status.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+        releaseRequest.set_value();
+        check(pending && statusReady && status.get(), "UI status stays responsive and a concurrent renewal skips a busy account without sending HTTP");
+        check(failedRenewal.get() && account.signedIn() && account.streamingAccess().gsToken == "GS",
+              "an unavailable renewal endpoint preserves the valid lease and sign-in");
+        renewal->beforeReply = {};
+        renewal->add("xsts.auth.xboxlive.com", "/xsts/authorize", 200, R"({"Token":"GSSV2"})");
+        renewal->add("xhome.gssv-play-prod.xboxlive.com", "/v2/login/user", 200,
+                     R"({"offeringSettings":{"regions":[{"name":"EastAsia","baseUri":"https://eas.core.gssv-play-prodxhome.xboxlive.com/","isDefault":true}]},"gsToken":"GS2","durationInSeconds":14400})");
+        const auto access2 = account.tryRenewStreamingAccess("GS", *renewal);
+        check(access2 && access2->gsToken == "GS2" && access2->expiresAt == now + 14400 && account.streamingAccess().gsToken == "GS2",
+              "forced renewal uses the session transport and publishes the replacement lease");
+        const auto reused = account.tryRenewStreamingAccess("GS", *renewal);
+        check(reused && reused->gsToken == "GS2" && renewal->seen.size() == 3,
+              "a caller holding a stale lease reuses the already renewed one");
 
         http->add("login.live.com", "/oauth20_token.srf", 200, R"({"access_token":"LPT","refresh_token":"RT-X"})");
         check(account.transferToken() == "LPT", "console transfer token");
@@ -315,7 +412,8 @@ public:
                     else text = std::get<std::string>(data);
                     const json j = json::parse(text);
                     std::lock_guard l(mutex);
-                    messages.push_back(j.value("type", "") + " " + j.value("target", ""));
+                    messages.push_back(j);
+                    if (j.value("type", "") == "ReceiverCancel") cancelledTouchId = j.value("id", "");
                     if (j.value("type", "") == "Handshake") {
                         const std::string ack = json{{"type", "HandshakeAck"}, {"id", j.value("id", "")}, {"cv", ""}}.dump();
                         message->send(ack);
@@ -328,7 +426,7 @@ public:
                     if (auto* b = std::get_if<rtc::binary>(&data)) text.assign(reinterpret_cast<const char*>(b->data()), b->size());
                     else text = std::get<std::string>(data);
                     std::lock_guard l(mutex);
-                    control.push_back(json::parse(text).value("message", ""));
+                    control.push_back(json::parse(text));
                     cv.notify_all();
                 });
             } else if (dc->label() == "input") {
@@ -381,15 +479,41 @@ public:
     std::vector<std::shared_ptr<rtc::DataChannel>> channels;
     std::mutex mutex;
     std::condition_variable cv;
-    std::vector<std::string> labels, messages, control;
+    std::vector<std::string> labels;
+    std::vector<json> messages, control;
     std::vector<std::vector<uint8_t>> reports;
     std::string offerSdp;
+    std::string cancelledTouchId;
 };
 
 std::vector<uint8_t> nal(uint8_t header, size_t size, uint8_t seed) {
     std::vector<uint8_t> out = {0, 0, 0, 1, header};
     for (size_t i = 0; i < size; ++i) out.push_back(uint8_t((i * 31 + seed) | 1));   // never a start-code pattern
     return out;
+}
+
+void videoRtpWindowTests() {
+    VideoRtpReceiveWindow window;
+    window.observe(42, 65534);
+    const auto gap = window.observe(42, 0);
+    check(gap.received == 2 && gap.pendingMissing == 1 && gap.expiredMissing == 0,
+          "video RTP treats a skipped packet across 16-bit wrap as pending");
+    const auto recovered = window.observe(42, 65535);
+    check(recovered.pendingMissing == 0 && recovered.recoveredReorder == 1 && recovered.expiredMissing == 0,
+          "a late packet can fill the wrapped sequence gap");
+    check(window.observe(42, 65535).duplicate == 1, "a repeated sequence does not create another recovery");
+    const auto aged = window.observe(42, 72);
+    check(aged.expiredMissing == 8 && aged.pendingMissing == 63,
+          "a jump past the observation window confirms only the aged-out holes");
+    const auto late = window.observe(42, 2);
+    check(late.outsideWindow == 1 && late.expiredMissing == 8 && late.recoveredReorder == 1,
+          "an arrival older than the tracked window does not rewrite the loss history");
+    check(window.observe(42, 4000).sequenceResets == 0, "one distant sequence does not create a discontinuity");
+    const auto restart = window.observe(42, 4001);
+    check(restart.sequenceResets == 1 && restart.pendingMissing == 0 && restart.expiredMissing == 8,
+          "two consecutive packets confirm a sequence restart without counting unknown loss");
+    check(window.observe(43, 500).sequenceResets == 1, "one other SSRC does not replace the current video sequence");
+    check(window.observe(43, 501).sequenceResets == 2, "a new consecutive SSRC closes the old sequence epoch");
 }
 
 void webrtcTests() {
@@ -428,17 +552,24 @@ void webrtcTests() {
     check(console.waitFor([&] { return console.control.size() >= 4; }), "control messages arrive");
     {
         std::lock_guard l(console.mutex);
-        check(console.control.size() >= 2 && console.control[0] == "authorizationRequest" && console.control[1] == "gamepadChanged", "control: authorization, then the pad");
+        check(console.control.size() >= 2 && console.control[0].value("message", "") == "authorizationRequest" &&
+              console.control[1].value("message", "") == "gamepadChanged", "control: authorization, then the pad");
     }
     check(console.waitFor([&] { return !console.reports.empty(); }), "the input channel receives the client metadata report");
     {
         std::lock_guard l(console.mutex);
-        check(!console.reports.empty() && console.reports[0].size() == 15 && console.reports[0][0] == 8, "first input report is client metadata");
+        check(!console.reports.empty() && console.reports[0].size() == 15 && console.reports[0][0] == 8 && console.reports[0][14] == 0,
+              "first input report advertises no touch points");
     }
     check(console.waitFor([&] {
-        for (const auto& s : console.messages) if (s.find("/streaming/characteristics/dimensionschanged") != std::string::npos) return true;
+        for (const auto& packet : console.messages)
+            if (packet.value("target", "") == "/streaming/characteristics/dimensionschanged") return true;
         return false;
     }), "the client sends its configuration messages");
+    console.message->send(json{{"type", "TransactionStart"}, {"target", "/streaming/touchcontrols/showlayoutv2"},
+                               {"id", "touch-layout"}, {"content", "{}"}}.dump());
+    check(console.waitFor([&] { return console.cancelledTouchId == "touch-layout"; }),
+          "a console touch layout is declined on the message channel");
 
     GamepadFrame pad;
     pad.buttons = BtnA;
@@ -450,6 +581,22 @@ void webrtcTests() {
         const auto r = console.reports.empty() ? std::vector<uint8_t>{} : console.reports.back();
         const auto expected = gamepadReport(1, 0, {pad});
         check(r.size() == expected.size() && std::equal(r.begin() + 14, r.end(), expected.begin() + 14) && r[0] == 2, "gamepad report bytes as built");
+    }
+    session.sendKeyboard({'W', true});
+    session.sendMouse({-22, 5, 0, 120, 1, true});
+    session.sendKeyboard({'W', false});
+    check(console.waitFor([&] { return console.reports.size() >= 5; }), "native keyboard and mouse reports reach the peer");
+    {
+        std::lock_guard lock(console.mutex);
+        if (console.reports.size() >= 5) {
+            const auto& down = console.reports[2];
+            const auto& mouse = console.reports[3];
+            const auto& up = console.reports[4];
+            check(down.size() == 18 && down[0] == ReportKeyboard && down[16] == 1 &&
+                  mouse.size() == 33 && mouse[0] == ReportMouse && detail::get32(mouse.data() + 15) == uint32_t(-22) &&
+                  up.size() == 18 && up[0] == ReportKeyboard && up[16] == 0,
+                  "native key edge order and relative motion on WebRTC");
+        }
     }
 
     // Console -> client: a vibration report and the server's video size on the input channel.
@@ -498,11 +645,41 @@ void webrtcTests() {
         check(serverW == 1920 && serverH == 1080, "server video size reaches the callback");
     }
     session.requestKeyframe();
-    check(console.waitFor([&] { for (const auto& c : console.control) if (c == "videoKeyframeRequested") return true; return false; }), "a keyframe request goes out on the control channel");
+    check(console.waitFor([&] { for (const auto& c : console.control) if (c.value("message", "") == "videoKeyframeRequested") return true; return false; }), "a keyframe request goes out on the control channel");
     const auto stats = session.stats();
     if (!(stats.videoUnits >= 2 && stats.audioPackets >= 2 && stats.handshakeDone && stats.videoBytes > 5000))
         std::printf("stats: units=%llu audio=%llu handshake=%d bytes=%llu\n", (unsigned long long)stats.videoUnits, (unsigned long long)stats.audioPackets, int(stats.handshakeDone), (unsigned long long)stats.bytesReceived);
     check(stats.videoUnits >= 2 && stats.audioPackets >= 2 && stats.handshakeDone && stats.videoBytes > 5000, "statistics");
+    check(stats.videoRtp.received > stats.videoUnits && stats.videoRtp.pendingMissing == 0,
+          "native RTP counts fragments separately from depacketized pictures");
+    const auto rtpReady = [&](uint64_t packets) {
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < limit) {
+            if (session.stats().videoRtp.received >= packets) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    };
+    const auto sendVideo = [&] {
+        ts += 1500;
+        console.video->sendFrame(reinterpret_cast<const std::byte*>(p2.data()), p2.size(), rtc::FrameInfo(ts));
+    };
+    const uint16_t missingSequence = console.videoConfig->sequenceNumber++;
+    sendVideo();
+    check(rtpReady(stats.videoRtp.received + 1) && session.stats().videoRtp.pendingMissing == 1,
+          "one intentionally delayed local video RTP packet appears as a pending gap");
+    const uint16_t nextSequence = console.videoConfig->sequenceNumber;
+    console.videoConfig->sequenceNumber = missingSequence;
+    sendVideo();
+    console.videoConfig->sequenceNumber = nextSequence;
+    check(rtpReady(stats.videoRtp.received + 2) && session.stats().videoRtp.recoveredReorder == 1 &&
+          session.stats().videoRtp.pendingMissing == 0,
+          "the late SRTP packet reaches native receive diagnostics and recovers the gap");
+    ++console.videoConfig->sequenceNumber;
+    for (int count = 0; count < 64; ++count) sendVideo();
+    check(rtpReady(stats.videoRtp.received + 66) && session.stats().videoRtp.expiredMissing == 1 &&
+          session.stats().videoRtp.pendingMissing == 0,
+          "one omitted loopback packet ages into the expired sequence counter");
     // Malformed fields used to throw through the asynchronous callback.
     console.message->send(std::string("{\"type\":null}"));
     console.message->send(std::string("{\"type\":\"Message\",\"target\":null}"));
@@ -520,6 +697,17 @@ void webrtcTests() {
           detail::get32(encoded.data()+23)==102&&detail::get32(encoded.data()+27)==103&&
           detail::get32(encoded.data()+31)==104&&detail::get32(encoded.data()+35)==1234&&
           detail::get32(encoded.data()+39)==1234,"frame feedback matches Greenlight's seven-field wire format");
+    const auto arrival=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()/100;
+    session.videoPresented(42,arrival,arrival,arrival,arrival);
+    check(console.waitFor([&]{
+        for(const auto& report:console.reports)
+            if(report.size()==43&&report[0]==ReportMetadata&&detail::get32(report.data()+15)==42) {
+                const auto t=detail::get32(report.data()+19);
+                return t==detail::get32(report.data()+23)&&t==detail::get32(report.data()+27)&&t==detail::get32(report.data()+31);
+            }
+        return false;
+    }),"discarded keepalive frame reports arrival for all four timestamps");
     // Exercise real transport shutdown while the caller sends input/keyframe
     console.message->send(json{{"type","TransactionStart"},{"target","/streaming/sessionLifetimeManagement/serverInitiatedDisconnect"},{"id","shutdown-test"},{"content",json{{"reason","KickForServerShutdown"}}.dump()}}.dump());
     for(unsigned i=0;i<100;++i){ {std::lock_guard l(m);if(!endedReason.empty())break;} std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
@@ -535,6 +723,95 @@ void webrtcTests() {
     session.close();stopped=true;sender.join();
     session.sendGamepad(pad);session.requestKeyframe();session.close();
     check(!session.ready(), "remote/local close with active sends is contained and clears readiness");
+}
+
+void videoPreferenceTests(unsigned width, unsigned height, bool explicitRequest) {
+    FakeConsole console;
+    WebRtcSession session;
+    session.setBindAddress("127.0.0.1");
+    if (height != 1080 || explicitRequest) session.preferVideoSize(width, height, explicitRequest);
+    std::string error;
+    const bool connected = session.start(console, &error, std::chrono::seconds(15)) &&
+                           session.waitReady(std::chrono::seconds(5));
+    check(connected, ("video preference connects to local peer: " + error).c_str());
+    if (!connected) return;
+    const auto* dimensionsTarget = "/streaming/characteristics/dimensionschanged";
+    const size_t controlCount = explicitRequest ? 6 : 4;
+    const auto isDimensions = [dimensionsTarget](const json& packet) {
+        return packet.value("target", "") == dimensionsTarget;
+    };
+    check(console.waitFor([&] {
+        return console.control.size() >= controlCount &&
+               std::any_of(console.messages.begin(), console.messages.end(), isDimensions);
+    }), "local console receives the expected setup messages");
+    {
+        std::lock_guard lock(console.mutex);
+        const auto dimensions = std::find_if(console.messages.begin(), console.messages.end(), isDimensions);
+        check(dimensions != console.messages.end() &&
+              json::parse(dimensions->at("content").get<std::string>()) ==
+                json{{"horizontal", width}, {"vertical", height}, {"preferredWidth", width}, {"preferredHeight", height},
+                     {"safeAreaLeft", 0}, {"safeAreaTop", 0}, {"safeAreaRight", width}, {"safeAreaBottom", height},
+                     {"supportsCustomResolution", true}},
+              "console receives matching display, preference and safe-area dimensions");
+        check(console.control.size() == controlCount, "only explicit preferences add control messages");
+        if (explicitRequest) {
+            const json extent = {{"width", width}, {"height", height}};
+            check(console.control.size() == 6 &&
+                  console.control[4] == json{{"message", "VideoPreference"}, {"type", "VideoPreference"},
+                      {"resolution", extent}, {"dimensions", extent}, {"maxFPS", 60}} &&
+                  console.control[5] == json{{"message", "userRequestedResolutionUpdate"},
+                      {"resolutionAlias", std::to_string(height)}},
+                  "both explicit resolution messages match the requested stream profile");
+        }
+    }
+    session.close();
+}
+
+void controlVideoFeedbackTests() {
+    FakeConsole console;
+    std::atomic<unsigned> payloadCallbacks{0};
+    WebRtcSession session;
+    session.setBindAddress("127.0.0.1");
+    session.preferVideoSize(1280, 720);
+    WebRtcCallbacks callbacks;
+    callbacks.video = [&](std::vector<uint8_t>&&, uint32_t, int64_t) { ++payloadCallbacks; };
+    callbacks.videoKeepalive = [&](uint32_t rtp, int64_t arrival) {
+        session.videoPresented(rtp, arrival, arrival, arrival, arrival);
+    };
+    session.setCallbacks(std::move(callbacks));
+    std::string error;
+    const bool connected = session.start(console, &error, std::chrono::seconds(15)) &&
+                           session.waitReady(std::chrono::seconds(5));
+    check(connected, ("controller-only media feedback connects to a second local peer: " + error).c_str());
+    if (!connected) return;
+    const bool videoReady = console.waitFor([&] { return console.video && console.video->isOpen(); });
+    check(videoReady, "controller-only session keeps a video track");
+    if (!videoReady) return;
+
+    uint32_t timestamp = 1500;
+    for (const auto& unit : {nal(0x65, 5000, 9), nal(0x41, 800, 10), nal(0x41, 100, 11)}) {
+        console.videoConfig->timestamp = timestamp;
+        console.video->sendFrame(reinterpret_cast<const std::byte*>(unit.data()), unit.size(), rtc::FrameInfo(timestamp));
+        timestamp += 1500;
+    }
+    check(console.waitFor([&] {
+        bool first = false, second = false;
+        for (const auto& report : console.reports) {
+            if (report.size() != 43 || report[0] != ReportMetadata || report[14] != 1) continue;
+            const auto time = detail::get32(report.data() + 19);
+            if (time != detail::get32(report.data() + 23) || time != detail::get32(report.data() + 27) ||
+                time != detail::get32(report.data() + 31)) continue;
+            const auto rtp = detail::get32(report.data() + 15);
+            first |= rtp == 1500;
+            second |= rtp == 3000;
+        }
+        return first && second;
+    }), "fragmented and single-packet keepalive frames acknowledge original RTP timestamps");
+    const auto counters = session.stats();
+    check(counters.videoRtp.received > counters.videoUnits && counters.videoUnits >= 2 && counters.videoBytes >= 5810,
+          "controller-only tracks maintain both RTP and depacketized frame and byte counts");
+    session.close();
+    check(payloadCallbacks.load() == 0, "controller-only timing bypasses the video payload callback");
 }
 
 } // namespace
@@ -558,6 +835,14 @@ int main(int argc, char** argv) {
               recovery.failed(false)==VideoDecodeRecoveryAction::ResetHistory&&
               recovery.failed(false)==VideoDecodeRecoveryAction::Stop,
               "persistent failure after software fallback ends explicitly");
+        const auto start = std::chrono::steady_clock::time_point{};
+        check(!recovery.keyframeWaitExpired(start) && !recovery.keyframeWaitExpired(start + std::chrono::milliseconds(7999)) &&
+              recovery.keyframeWaitExpired(start + std::chrono::seconds(8)),
+              "a continuous run of unusable input gets one bounded recovery interval");
+        recovery.picture();
+        check(!recovery.keyframeWaitExpired(start + std::chrono::seconds(9)) &&
+              recovery.keyframeWaitExpired(start + std::chrono::seconds(17)),
+              "a valid picture starts a fresh wait interval without refilling the hardware retry budget");
         struct Unit { unsigned id; bool inputLoss=false; };
         std::deque<Unit> queue;
         for(unsigned i=0;i<8;++i)queue.push_back({i});
@@ -599,7 +884,13 @@ int main(int argc, char** argv) {
     protocolTests();
     apiTests();
     accountTests();
+    videoRtpWindowTests();
     webrtcTests();
+    videoPreferenceTests(1920, 1080, false); // Auto
+    videoPreferenceTests(1920, 1080, true);
+    videoPreferenceTests(2560, 1440, true);
+    videoPreferenceTests(1280, 720, false);  // Controller-only
+    controlVideoFeedbackTests();
     std::printf("xbox tests: %d checks, %d failures\n", g_checks, g_failures);
     rtc::Cleanup();
     return g_failures == 0 ? 0 : 1;

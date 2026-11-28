@@ -118,6 +118,16 @@ DialogLayer {
             }
         }
         VRow {
+            visible: !!veyra.ps5Input
+            label: qsTr("手柄控制")
+            ControllerPanelButton {
+                objectName: "controller-panel-ps5-entry"
+                text: qsTr("手柄映射")
+                trailingIcon: "chevronRight"
+                onClicked: dialogHost.openPs5Mapping()
+            }
+        }
+        VRow {
             label: qsTr("仅观看")
             hint: qsTr("不向 PS5 转发电脑手柄输入")
             VSwitch { checked: veyra.ps5.viewOnly === true; onToggled: checked => veyra.ps5Set("viewOnly", checked) }
@@ -146,15 +156,19 @@ DialogLayer {
             VButton { text: veyra.ps5.calibrating ? qsTr("校准中…") : qsTr("校准"); ghost: true; onClicked: veyra.ps5Calibrate() }
         }
     }
-    DialogSection { text: qsTr("登录 PIN") }
+    readonly property var loginPrompt: veyra.ps5LoginPrompt || ({})
+    readonly property bool loginRequested: !!loginPrompt.requestId && !loginPrompt.controlOnly
+    DialogSection { visible: ps5Dialog.loginRequested; text: qsTr("登录 PIN") }
     DialogGroup {
+        visible: ps5Dialog.loginRequested
         VRow {
             label: qsTr("PS5 提示时填写")
-            hint: qsTr("不是 8 位配对码")
-            RowLayout {
-                spacing: 6
-                DialogTextField { id: loginPin; implicitWidth: 120 }
-                VButton { text: qsTr("提交"); ghost: true; onClicked: { veyra.ps5SendLoginPin(loginPin.text); loginPin.text = "" } }
+            hint: loginPin.feedback || qsTr("不是 8 位配对码")
+            Ps5LoginPinField {
+                id: loginPin
+                backend: veyra
+                prompt: ps5Dialog.loginRequested ? ps5Dialog.loginPrompt : ({})
+                active: ps5Dialog.shown && ps5Dialog.loginRequested
             }
         }
     }

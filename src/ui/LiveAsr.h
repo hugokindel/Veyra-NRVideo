@@ -20,9 +20,12 @@ public:
     QString status() const;
     int threads() const { return threads_; }
     double realTimeFactor() const { return realTimeFactor_; }
-    bool installed() const { return assets_.installed(); }
+    bool installed() const { return assets_.installed() || legacyRuntimeReady_; }
+    bool runtimeUpdateAvailable() const { return legacyRuntimeReady_; }
     bool downloading() const { return assets_.downloading(); }
     qint64 downloadBytes() const { return assets_.totalBytes(); }
+    const QString& directory() const { return root_; }
+    QString installLayout() const;
     double progress() const { return double(assets_.received()) / double(assets_.totalBytes()); }
     void download();
     void cancel() { assets_.cancel(); }
@@ -37,6 +40,7 @@ signals:
 
 private:
     void tick();
+    void refreshLegacyRuntime();
     void start();
     void stop();
     void readOutput();
@@ -54,6 +58,7 @@ private:
     int threads_ = 1, requestedThreads_ = 0;
     LiveSpeechText speechText_;
     ModelAssets assets_;
+    bool legacyRuntimeReady_ = false;
     QProcess process_;
     HANDLE job_ = nullptr;
     QTimer timer_;

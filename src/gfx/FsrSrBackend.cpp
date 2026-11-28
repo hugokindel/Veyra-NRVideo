@@ -3,10 +3,13 @@
 #include "veyra/Log.h"
 #include "veyra/RuntimePaths.h"
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <string>
 
 #ifdef VEYRA_HAS_FSR
+#include "FidelityFxModule.h"
 #include <ffx_api_loader.h>
 #include <ffx_upscale.h>
 #include <dx12/ffx_api_dx12.h>
@@ -95,8 +98,6 @@ struct FsrSrBackend::Impl {
     uint64_t failureCount = 0;
     std::string providerVersion;
 #ifdef VEYRA_HAS_FSR
-    HMODULE loader = nullptr;
-    HMODULE provider = nullptr;
     ffxFunctions functions{};
     ffxContext context = nullptr;
     uint32_t maxRenderWidth = 0, maxRenderHeight = 0;
@@ -113,26 +114,25 @@ bool FsrSrBackend::initialize(ID3D12Device* device, uint32_t maxRenderWidth, uin
 #ifdef VEYRA_HAS_FSR
     auto& p = *p_;
     if (p.available) return true;
-    const auto root = runtime::localDataDirectory() / "amd" / "fidelityfx";
-    const auto loaderPath = std::filesystem::absolute(root / "amd_fidelityfx_loader_dx12.dll");
-    const auto providerPath = std::filesystem::absolute(root / "amd_fidelityfx_upscaler_dx12.dll");
+    if (p.context) release();
+    p.providerVersion.clear();
+    const auto root = std::filesystem::absolute(runtime::localDataDirectory() / "amd" / "fidelityfx");
+    const auto loaderPath = root / "amd_fidelityfx_loader_dx12.dll";
+    const auto providerPath = root / "amd_fidelityfx_upscaler_dx12.dll";
     if (!std::filesystem::exists(loaderPath)) {
         log::warn("fsr-sr", std::format("loader missing at {}", loaderPath.string()));
         return false;
     }
     DirectoryGuard guard(root);
-    p.loader = LoadLibraryExW(loaderPath.c_str(), nullptr,
-                              LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (p.loader == nullptr) {
-        log::error("fsr-sr", std::format("loader load failed win32={}", GetLastError()));
+    const auto loader = loadResidentFidelityFxModule(loaderPath, "fsr-sr");
+    if (loader == nullptr) {
+        log::error("fsr-sr", "FidelityFX loader could not be loaded");
         return false;
     }
     if (std::filesystem::exists(providerPath)) {
-        p.provider=LoadLibraryExW(providerPath.c_str(), nullptr,
-                       LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if(!p.provider)log::warn("fsr-sr", std::format("provider preload failed win32={}", GetLastError()));
+        (void)loadResidentFidelityFxModule(providerPath, "fsr-sr");
     }
-    ffxLoadFunctions(&p.functions, p.loader);
+    ffxLoadFunctions(&p.functions, loader);
     if (p.functions.CreateContext == nullptr || p.functions.DestroyContext == nullptr ||
         p.functions.Dispatch == nullptr || p.functions.Query == nullptr) {
         log::error("fsr-sr", "loader is missing the FidelityFX API entry points");
@@ -154,11 +154,9 @@ bool FsrSrBackend::initialize(ID3D12Device* device, uint32_t maxRenderWidth, uin
         versions.versionNames = names;
         const auto listResult = countResult == FFX_API_RETURN_OK
             ? p.functions.Query(nullptr, &versions.header) : countResult;
-        if (listResult == FFX_API_RETURN_OK && capacity > 0 && names[0] != nullptr) {
-            p.providerVersion = names[0];
-        }
-        log::info("fsr-sr", std::format("providers count={} selected={}", capacity,
-                                        p.providerVersion.empty() ? "none" : p.providerVersion));
+        const bool listed = listResult == FFX_API_RETURN_OK && capacity > 0;
+        log::info("fsr-sr", std::format("provider inventory query={} count={} firstAdvertised={}",
+            returnName(listResult), listed ? capacity : 0, listed && names[0] ? names[0] : "none"));
     }
 
     ffxCreateBackendDX12Desc backendDesc{};
@@ -192,13 +190,21 @@ bool FsrSrBackend::initialize(ID3D12Device* device, uint32_t maxRenderWidth, uin
                                          unsigned(result)));
         return false;
     }
+    // The inventory describes candidates. Read the version from the context
+    // the SDK actually selected, keeping older SDKs without readback usable.
+    ffxQueryGetProviderVersion actual{};
+    actual.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+    const auto versionResult = p.functions.Query(&p.context, &actual.header);
+    const bool reported = versionResult == FFX_API_RETURN_OK && actual.versionId != 0 &&
+        actual.versionName && *actual.versionName;
+    p.providerVersion = reported ? actual.versionName : "unknown";
     p.maxRenderWidth = maxRenderWidth;
     p.maxRenderHeight = maxRenderHeight;
     p.maxUpscaleWidth = maxUpscaleWidth;
     p.maxUpscaleHeight = maxUpscaleHeight;
     p.available = true;
-    log::info("fsr-sr", std::format("provider={} maxRender={}x{} maxUpscale={}x{} hdr={}",
-                                    p.providerVersion.empty() ? "unknown" : p.providerVersion,
+    log::info("fsr-sr", std::format("actualProvider={} providerId=0x{:X} versionQuery={} maxRender={}x{} maxUpscale={}x{} hdr={}",
+                                    p.providerVersion, reported ? actual.versionId : 0, returnName(versionResult),
                                     maxRenderWidth, maxRenderHeight, maxUpscaleWidth, maxUpscaleHeight, hdr));
     return true;
 #else
@@ -210,7 +216,8 @@ bool FsrSrBackend::initialize(ID3D12Device* device, uint32_t maxRenderWidth, uin
 
 bool FsrSrBackend::evaluate(ID3D12GraphicsCommandList* list, ID3D12Resource* color, ID3D12Resource* motion,
                             ID3D12Resource* depth, ID3D12Resource* output, uint32_t renderWidth, uint32_t renderHeight,
-                            uint32_t upscaleWidth, uint32_t upscaleHeight, bool reset, float frameTimeMs) {
+                            uint32_t upscaleWidth, uint32_t upscaleHeight, bool reset, float frameTimeMs,
+                            float sharpness) {
 #ifdef VEYRA_HAS_FSR
     auto& p = *p_;
     if (!p.available || !list) return false;
@@ -259,8 +266,8 @@ bool FsrSrBackend::evaluate(ID3D12GraphicsCommandList* list, ID3D12Resource* col
     dispatch.motionVectorScale = {1.0f, 1.0f};
     dispatch.renderSize = {renderWidth, renderHeight};
     dispatch.upscaleSize = {upscaleWidth, upscaleHeight};
-    dispatch.enableSharpening = false;
-    dispatch.sharpness = 0.0f;
+    dispatch.sharpness = std::isfinite(sharpness) ? std::clamp(sharpness, 0.0f, 1.0f) : 0.0f;
+    dispatch.enableSharpening = dispatch.sharpness > 0.0f;
     dispatch.frameTimeDelta = frameTimeMs > 0.0f ? frameTimeMs : 16.6f;
     dispatch.preExposure = 1.0f;
     dispatch.reset = reset;
@@ -280,7 +287,7 @@ bool FsrSrBackend::evaluate(ID3D12GraphicsCommandList* list, ID3D12Resource* col
     return true;
 #else
     (void)list; (void)color; (void)motion; (void)depth; (void)output; (void)renderWidth; (void)renderHeight;
-    (void)upscaleWidth; (void)upscaleHeight; (void)reset; (void)frameTimeMs;
+    (void)upscaleWidth; (void)upscaleHeight; (void)reset; (void)frameTimeMs; (void)sharpness;
     return false;
 #endif
 }
@@ -294,15 +301,8 @@ void FsrSrBackend::release() {
                                         p.evaluateCount, p.failureCount));
         p.context = nullptr;
     }
-    if (p.loader != nullptr) {
-        FreeLibrary(p.loader);
-        p.loader = nullptr;
-    }
-    if (p.provider != nullptr) {
-        FreeLibrary(p.provider);
-        p.provider = nullptr;
-    }
     p.available = false;
+    p.providerVersion.clear();
 #endif
 }
 

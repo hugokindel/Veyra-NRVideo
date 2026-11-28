@@ -21,7 +21,9 @@ Textual conflicts are the easy part; the 2.2.1 merge merged cleanly and still br
 
 - `src/engine/VideoPresenter.cpp`, `include/veyra/engine/VideoPresenter.h`, `include/veyra/engine/MirrorOutput.h`:
   the mirror is a second `PresentSink` recorded after the main present. If upstream changes the present path
-  (new swap chain types, HDR output, scaling), make the mirror follow it.
+  (new swap chain types, HDR output, scaling), make the mirror follow it. Since 2.2.2 the blit has two pipeline
+  states (`pass_.pso` and `adaptiveBlit_` for the adaptive ultrawide view, ratio in `dims[14]`): the mirror
+  computes its own `adaptiveWidthRatio` on the mirror client size and picks its own PSO.
 - `src/engine/EngineController.cpp` (+ `EngineControllerImage.cpp`, `EngineController.h`): **every place a
   `VideoPresenter` is created, replaced or swapped must hand the mirror over** (`old->releaseMirror()`,
   `new->setMirror(&mirror_)`). 2.2.1 added the capture "promote" swap (raw -> enhanced presenter) and the mirror
@@ -39,6 +41,8 @@ Textual conflicts are the easy part; the 2.2.1 merge merged cleanly and still br
   (YUV constants lane 7 = `packYuvChromaWord(...)`), `shaders/YuvToLinearRgb.hlsl` (`yuvDimensions.w`: bits 0..7
   chroma location, 8..15 / 16..23 Cb/Cr steps). If upstream adds chroma locations above 255, uses those bits,
   or rearranges the YUV root constants, re-pack them; the pass is near the 64 root-constant limit.
+  2.2.2 builds the same shader a second time as `P210ToLinearRgb.dxil` (`VEYRA_P210`): its `ReconstructChroma`
+  branch must also use `yuvDimensions.w & 0xFF`, and that DXIL differs from the official one (goes in the patch).
 - Tests: `tests/integration/MirrorOutputGpuTests.cpp`, `tests/integration/HdrColorTests.cpp`, `tests/unit/ElgatoHdrCases.h`.
 - Docs: fork sections at the top of `AGENTS.md`, `docs/CURRENT_STATUS.md`, `docs/WORKLOG.md` (upstream often
   rewrites or archives these; keep upstream's text and re-add the fork sections).
@@ -53,7 +57,8 @@ Textual conflicts are the easy part; the 2.2.1 merge merged cleanly and still br
    vcpkg commit/overlay), `docs/DEVELOPMENT.md` (libdovi, Magewell SDK), `docs/RIFE_DIRECTML.md` (ORT/DirectML).
    Fork copies of the build scripts: [scripts/fork/build-full.ps1](../scripts/fork/build-full.ps1) and
    [scripts/fork/fetch-sdks.ps1](../scripts/fork/fetch-sdks.ps1) (paths are this machine's
-   `D:/Projects/Veyra-work`; keep the copies there and here in sync).
+   `D:/Projects/Veyra-work`; keep the copies there and here in sync). Since 2.2.2 the fork `fetch-sdks.ps1` also
+   stages the DLSS SDK and nv-codec-headers from GitHub archives at upstream's pinned commits.
 4. Build: `powershell -File scripts/fork/build-full.ps1 -Targets veyra_qml_ui,veyra_mirror_output_gpu_tests,veyra_vfg_gpu_tests,veyra_capture_color_tests,veyra_hdr_color_tests -Jobs 2 *> D:/Projects/Veyra-work/logs/build-full-N.log`.
    Configure log must have no "unavailable in this build" / "not configured" line for XeSS, FSR, AMF, RIFE,
    libdovi, libass, DeckLink, Magewell, Remote Play, Moonlight, Xbox.
@@ -86,4 +91,9 @@ Textual conflicts are the easy part; the 2.2.1 merge merged cleanly and still br
   (log: `[mirror] detach ... next=1` followed by a new `attach`).
 - Remote Play, Moonlight, Xbox, DeckLink, Magewell and AMD paths compiled but not exercised on hardware.
 - Remaining ~-1 Cb code on 4K Pro colour patches (content-dependent); next check with the HDR10 pattern.
+- 2.2.2 Y210/P210 capture: `CaptureCardSource` only runs `ElgatoHdrControl::configure` for P010 and 8-bit
+  formats, so a 4K Pro in Y210/P210 (if its driver offers them) gets neither the standard-limited chroma rule nor
+  the centre correction. Unmeasured; decide after a pattern test in those formats.
+- Fork build compiles against FFmpeg 9.0.1 import libraries; official 2.2.2 ships 9.0.2 DLLs (same sonames,
+  same major ABI). Rebuild `deps/ffmpeg-root` from 9.0.2 if a mismatch ever shows.
 - GitHub Releases for the patch tags not created (browser step).

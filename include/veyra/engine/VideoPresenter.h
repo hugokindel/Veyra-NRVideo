@@ -117,6 +117,7 @@ public:
     uint64_t xessGeneratedCount() const {return sink_.xess()?sink_.xess()->generatedCount():0;}
     uint64_t xessPresentedCount() const {return sink_.xess()?sink_.xess()->presentedCount():0;}
     bool xessActive() const {return sink_.xess()!=nullptr;}
+    uint32_t xessMaxInterpolatedFrames() const {return sink_.xess()?sink_.xess()->maxInterpolatedFrames():0;}
     bool xessFailed() const {return xessFailed_;}
     // Sustained under-rate may suppress SDK-owned XeSS-FG generation over a
     // stable interval (xefgSwapChainSetEnabled); re-enabling goes through the
@@ -178,7 +179,11 @@ private:
     gfx::CommandSlotRing presentationRing_;
     diagnostics::GpuTimer gpuTimer_;
     gfx::PresentSink sink_;
+    bool ensureAdaptivePasses(gfx::D3D12DeviceContext&,pipeline::EnhanceGraph&);
     pipeline::GraphicsPass pass_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> adaptiveBlit_;
+    pipeline::ComputePass adaptiveMotionPass_;
+    bool adaptivePassesAttempted_=false;
     pipeline::ComputePass presentMotionPass_;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>,2> presentMotion_;
     PreviewView previousXessView_{};

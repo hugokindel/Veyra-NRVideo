@@ -824,6 +824,20 @@ __declspec(noinline) void testEditorGlobalSettings() {
     check(PresetLibrary::applyToEditor(*entry, *target, values).accepted &&
           target->globals == document->globals && target->layout == document->layout,
           "globals: complete preset restores disconnected draft globals");
+    auto nodeSettings = initial;
+    nodeSettings.multiplier = 4;
+    nodeSettings.frameGenerationBackend = FrameGenerationBackend::Vfg;
+    nodeSettings.vfgQuality = 2;
+    target->nodes = toChain(nodeSettings);
+    target->nodes.mode = ChainMode::Node;
+    target->layout.initialize(target->nodes);
+    target->globals = ChainGlobalSettings::capture(nodeSettings);
+    entry->nodeConfiguration = ChainConfiguration::capture(entry->chain, initial);
+    entry->contents = presetContentMask(PresetContent::Chain);
+    values = initial;
+    check(PresetLibrary::applyToEditor(*entry, *target, values).accepted &&
+          target->nodes.fgMultiplier == 4 && target->globals->fgBackend == FrameGenerationBackend::Vfg &&
+          target->globals->vfgQuality == 2, "globals: partial chain keeps the draft's VFG settings and multiplier");
     auto invalid = std::make_unique<ChainSession>(*restored);
     const auto retained = std::make_unique<ChainSession>(*invalid);
     { std::ofstream file(draftPath, std::ios::binary | std::ios::trunc); file << bytes << "garbage"; }
@@ -1132,6 +1146,46 @@ __declspec(noinline) void testDualSrStorage() {
     check(readBytes(std::filesystem::path(sessionPath).concat(L".dual-sr")).starts_with("VEYRA_CHAIN_SESSION 12"),"dual session uses v12 sidecar");
     auto back=std::make_unique<ChainSession>();ChainSessionStore reload(sessionPath);
     check(reload.load(*back)&&back->configurations[0].dualSrEnabled&&back->configurations[0].dualSrQuality==2&&back->configurations[0].dualSrTarget==s.dualSrTarget,"session reload preserves independent second target and quality");
+}
+// Smart SR (2026-11-22): library v29 / session v24 in .smart-sr files; every
+// older file keeps its bytes, and the sidecar keeps owning later saves.
+__declspec(noinline) void testSmartSrStorage() {
+    EnhancementSettings source;source.nr=false;source.sr=true;source.videoSrQuality=4;
+    const auto libraryPath=scratch(L"smart-sr-library.v1");
+    for(const auto* suffix:{L".field-render",L".field-render.smart-sr",L".smart-sr"})std::filesystem::remove(std::filesystem::path(libraryPath).concat(suffix));
+    PresetLibrary writer(libraryPath);writer.setIncludeBuiltins(false);
+    PresetEntry entry;entry.name=L"smart";entry.kind=ChainMode::List;
+    entry.contents=presetContentMask(PresetContent::Chain);entry.chain=toChain(source);
+    entry.globals=ChainGlobalSettings::capture(source);
+    check(writer.load()&&writer.put(entry),"smart SR presets: save a library without it");
+    const auto legacyLibrary=std::filesystem::path(libraryPath).concat(L".field-render");
+    const auto rollback=readBytes(legacyLibrary);
+    check(!rollback.empty()&&!rollback.starts_with("VEYRA_PRESET_LIBRARY 29"),"smart SR presets: off keeps the older format");
+    entry.globals->smartSr=true;entry.globals->fsrSrSharpness=35;
+    check(writer.put(entry,true)&&readBytes(legacyLibrary)==rollback,"smart SR presets: the older library keeps its bytes");
+    check(readBytes(std::filesystem::path(libraryPath).concat(L".smart-sr")).starts_with("VEYRA_PRESET_LIBRARY 29"),"smart SR presets: v29 sidecar");
+    PresetLibrary reader(libraryPath);reader.setIncludeBuiltins(false);
+    check(reader.load()&&reader.entries().size()==1&&reader.entries()[0].globals&&reader.entries()[0].globals->smartSr,"smart SR presets: a fresh reader finds the sidecar");
+    auto applied=source;if(!reader.entries().empty())PresetLibrary::apply(reader.entries()[0],applied);
+    check(applied.smartSr&&applied.fsrSrSharpness==35,"smart SR presets: applying the chain restores the switch");
+    const auto exported=scratch(L"smart-sr-export.v29");
+    check(writer.exportEntry(0,exported)&&readBytes(exported).starts_with("VEYRA_PRESET_LIBRARY 29"),"smart SR presets: export declares v29");
+    entry.globals->smartSr=false;
+    check(writer.put(entry,true)&&readBytes(legacyLibrary)==rollback,"smart SR presets: turning it off stays in the sidecar");
+
+    const auto sessionPath=scratch(L"smart-sr-session.v1");
+    for(const auto* suffix:{L".smart-sr",L".p3-editor",L".p3-editor.p3-globals",L".p3-editor.smart-sr"})std::filesystem::remove(std::filesystem::path(sessionPath).concat(suffix));
+    std::filesystem::remove(sessionPath);
+    auto session=std::make_unique<ChainSession>(ChainSession::initial(source));
+    ChainSessionStore sessions(sessionPath);
+    check(sessions.save(*session),"smart SR session: save the file without it");
+    const auto sessionRollback=readBytes(sessionPath);
+    session->configurations[0].smartSr=true;session->configurations[0].fsrSrSharpness=35;
+    check(sessions.save(*session)&&readBytes(sessionPath)==sessionRollback,"smart SR session: the older session keeps its bytes");
+    check(readBytes(std::filesystem::path(sessionPath).concat(L".smart-sr")).starts_with("VEYRA_CHAIN_SESSION 24"),"smart SR session: v24 sidecar");
+    auto restored=std::make_unique<ChainSession>();ChainSessionStore reopened(sessionPath);
+    check(reopened.load(*restored)&&*restored==*session&&restored->configurations[0].smartSr&&!restored->configurations[1].smartSr,
+          "smart SR session: List and Node values round-trip independently");
 }
 __declspec(noinline) void testSrStageStorage() {
     EnhancementSettings source;source.nr=false;source.sr=true;source.videoSrQuality=3;
@@ -1494,6 +1548,29 @@ __declspec(noinline) void testHalfRateVariants() {
     std::wstring name;
     check(imported.load()&&imported.importFile(exported,name)&&imported.entries().size()==1&&imported.entries()[0]==original,
           "half-rate variants: .vpreset imports its original cadence");
+    // Versions 22 and later stored an auto-multiplier flag immediately after strict admission.
+    // Import a legacy preset with the flag enabled and preserve the user's explicit multiplier.
+    auto legacyBytes=readBytes(exported);
+    std::istringstream legacyFields(legacyBytes);
+    std::string header;
+    std::getline(legacyFields,header);
+    std::getline(legacyFields,header);
+    std::string nameField,noteField;
+    legacyFields>>std::quoted(nameField)>>std::quoted(noteField);
+    for(int field=0;field<11;++field){int value=0;legacyFields>>value;}
+    legacyFields>>std::ws;
+    const auto flagAt=static_cast<size_t>(legacyFields.tellg());
+    const bool foundFlag=flagAt<legacyBytes.size()&&legacyBytes[flagAt]=='0';
+    check(foundFlag,"legacy auto FG: locate retired field in exported v25 preset");
+    if(foundFlag){
+        legacyBytes[flagAt]='1';
+        const auto legacyFile=scratch(L"legacy-auto-on.vpreset");
+        {std::ofstream file(legacyFile,std::ios::binary);file<<legacyBytes;}
+        PresetLibrary legacy(scratch(L"legacy-auto-import.v1"));legacy.setIncludeBuiltins(false);
+        std::wstring importedName;
+        check(legacy.load()&&legacy.importFile(legacyFile,importedName)&&legacy.entries().size()==1&&legacy.entries()[0]==original,
+              "legacy auto FG: import enabled bit and preserve explicit settings");
+    }
     check(reopened.erase(1),"half-rate variants: delete original-only preset");
     PresetLibrary finalReader(path);finalReader.setIncludeBuiltins(false);
     check(finalReader.load()&&finalReader.entries().size()==1&&finalReader.entries()[0]==entry&&
@@ -1526,18 +1603,82 @@ __declspec(noinline) void testAutomaticMultiplierCompatibility() {
     editor->nodes=session->configurations[1].chain;
     check(editor->layout.initialize(editor->nodes).accepted,"auto FG: initialize editor layout");
     editor->globals=static_cast<const ChainGlobalSettings&>(session->configurations[1]);
-    editor->nodes.fgAutoMultiplier=true;
+    editor->nodes.fgMultiplier=4;
     session->configurations[1].editor=editor;
-    session->configurations[0].chain.fgAutoMultiplier=true;
+    session->configurations[0].chain.fgMultiplier=3;
     const auto path=scratch(L"auto-fg-session.v1");
     ChainSessionStore writer(path);
-    check(writer.save(*session),"auto FG: session v17 with independent editor serializes");
+    check(writer.save(*session),"manual FG: session with independent editor serializes");
     auto restored=std::make_unique<ChainSession>();ChainSessionStore reader(path);
-    check(reader.load(*restored)&&*restored==*session,"auto FG: list and editor flags survive restart");
+    check(reader.load(*restored)&&*restored==*session,"auto FG: manual list and editor multipliers survive restart");
     PresetLibrary library(scratch(L"auto-fg-library.v1"));library.setIncludeBuiltins(false);library.load();
     PresetEntry entry;entry.name=L"auto FG";entry.kind=ChainMode::Node;
     entry.chain=session->configurations[1].chain;entry.nodeConfiguration=session->configurations[1];
-    check(library.put(entry),"auto FG: preset with editor v17 serializes");
+    check(library.put(entry),"manual FG: preset with editor serializes");
+}
+__declspec(noinline) void testFrameGenerationOffPreset() {
+    auto on = sample();
+    auto chain = toChain(on);
+    auto settings = on;
+    check(chain.firstOf(EffectType::FrameGeneration) && chain.firstOf(EffectType::FrameGeneration)->enabled,
+          "FG off preset: fixture starts with frame generation on");
+    auto off = on;
+    off.multiplier = 1;
+    PresetEntry entry;
+    entry.name = L"FG off";
+    entry.kind = ChainMode::List;
+    entry.contents = presetContentMask(PresetContent::Chain);
+    entry.chain = toChain(off);
+    entry.fg = {1, on.frameGenerationBackend};
+    entry.color = off.color;
+    const auto applied = PresetLibrary::applyToChain(entry, chain, settings);
+    const auto* node = chain.firstOf(EffectType::FrameGeneration);
+    check(applied.accepted && node && !node->enabled && settings.multiplier == 1,
+          "a chain saved with frame generation off stays off after an FG preset");
+    check(PresetLibrary::matchesChain(entry.chain, chain),
+          "the off preset matches the chain it applied, so the selection can move");
+
+    chain = toChain(on);
+    settings = on;
+    entry.contents = presetContentMask(PresetContent::Chain) | presetContentMask(PresetContent::FrameGeneration);
+    entry.fg.multiplier = 1;
+    const auto explicitOff = PresetLibrary::applyToChain(entry, chain, settings);
+    node = chain.firstOf(EffectType::FrameGeneration);
+    check(explicitOff.accepted && node && !node->enabled && settings.multiplier == 1,
+          "frame-generation content of multiplier 1 disables FG");
+
+    chain = toChain(off);
+    settings = off;
+    PresetEntry twice;
+    twice.kind = ChainMode::List;
+    twice.contents = presetContentMask(PresetContent::FrameGeneration);
+    twice.fg = {2, on.frameGenerationBackend};
+    twice.chain = toChain(on);
+    const auto backOn = PresetLibrary::applyToChain(twice, chain, settings);
+    node = chain.firstOf(EffectType::FrameGeneration);
+    check(backOn.accepted && node && node->enabled && settings.multiplier == 2 && chain.fgMultiplier == 2,
+          "an FG multiplier above 1 still turns frame generation on");
+
+    auto current = std::make_unique<NodeEditorDocument>();
+    current->nodes = toChain(on);
+    current->nodes.mode = ChainMode::Node;
+    removeLegacyNodeProtection(current->nodes);
+    check(current->layout.initialize(current->nodes).accepted, "FG off editor: live graph");
+    settings = on;
+    PresetEntry editor = entry;
+    editor.kind = ChainMode::Node;
+    editor.contents = presetContentMask(PresetContent::Chain);
+    editor.chain = toChain(off);
+    editor.chain.mode = ChainMode::Node;
+    removeLegacyNodeProtection(editor.chain);
+    editor.nodeConfiguration = ChainConfiguration::capture(editor.chain, off);
+    auto saved = std::make_shared<NodeEditorDocument>();
+    saved->nodes = editor.chain;
+    check(saved->layout.initialize(saved->nodes).accepted, "FG off editor: saved graph");
+    editor.nodeConfiguration->editor = saved;
+    check(PresetLibrary::applyToEditor(editor, *current, settings).accepted && settings.multiplier == 1 &&
+          current->nodes.firstOf(EffectType::FrameGeneration) &&
+          !current->nodes.firstOf(EffectType::FrameGeneration)->enabled, "FG off editor: saved disabled node remains off");
 }
 __declspec(noinline) void testDisabledFrameGenerationMatch() {
     EnhancementSettings off;
@@ -1549,7 +1690,7 @@ __declspec(noinline) void testDisabledFrameGenerationMatch() {
         newNode.type=EffectType::FrameGeneration;
         newNode.enabled=false;
     }
-    saved.fgMultiplier=4;saved.fgAutoMultiplier=true;
+    saved.fgMultiplier=4;
     running.fgMultiplier=2;running.fgStrictAdmission=true;
     check(PresetLibrary::matchesChain(saved,running),"FG off still matches after switching presets");
     auto* node=saved.firstOf(EffectType::FrameGeneration);
@@ -1613,6 +1754,7 @@ __declspec(noinline) void testVideoDenoiseStorage() {
 
 int main(int argc,char** argv) {
     testVideoDenoiseStorage();
+    testFrameGenerationOffPreset();
     testDisabledFrameGenerationMatch();
     if(argc==2&&std::string_view(argv[1])=="--dedup-migration"){
         testDedupModeMigration();testHalfRateVariants();testFlowStorage();testFlowApplication();return failures?1:0;
@@ -1626,6 +1768,7 @@ int main(int argc,char** argv) {
     testBeautyNodeStorage();
     testDlssSrModels();
     testSrStageStorage();
+    testSmartSrStorage();
     testDualSrStorage();
     testFlowStorage();
     testFlowApplication();

@@ -1,12 +1,15 @@
 #include "veyra/pipeline/EnhanceGraph.h"
+#include "LanczosReference.h"
 #include "veyra/engine/GraphDescription.h"
 #include "veyra/gfx/D3D12DeviceContext.h"
 #include "veyra/gfx/CommandSlotRing.h"
+#include "veyra/gfx/XessSrBackend.h"
 #include "veyra/sink/ImageExportSink.h"
 #include "veyra/source/MediaFileSource.h"
 #include "veyra/RuntimePaths.h"
 #include "veyra/Log.h"
 #include <DirectXPackedVector.h>
+#include <d3d12sdklayers.h>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -24,7 +27,7 @@ extern "C" {
 
 // Matched deterministic frames, actual SDK evaluation and output pixels.
 // Readbacks are restricted to this test; these are not playback timings.
-static int referenceTest(const std::filesystem::path& directory,const std::wstring& path,int seconds,bool moving,bool zeroMotion,int inputHeight,int outputHeight,bool models=false){
+static int referenceTest(const std::filesystem::path& directory,const std::wstring& path,int seconds,bool moving,bool zeroMotion,int inputHeight,int outputHeight,bool models=false,bool xessOnly=false){
     using namespace veyra;
     std::filesystem::create_directories(directory);Logger::instance().openFile((directory/L"engine.log").wstring());
     gfx::D3D12DeviceContext ctx;gfx::CommandSlotRing ring;Status status;
@@ -33,6 +36,7 @@ static int referenceTest(const std::filesystem::path& directory,const std::wstri
     bool ok=true;
     const std::vector<Case> cases=models
         ?std::vector<Case>{{"dlss-K",0,false,true,0},{"dlss-M",0,false,true,1},{"dlss-L",0,false,true,2}}
+        :xessOnly?std::vector<Case>{{"reference",4,true,false},{"bilinear",4,false,false},{"xess",engine::kVideoSrXess,false,true}}
         :std::vector<Case>{{"reference",4,true,false},{"bilinear",4,false,false},
             {"vsr1",1,false,true},{"vsr4",4,false,true},{"dlss",0,false,true},{"fsr",5,false,true}};
     for(const auto test:cases){
@@ -93,10 +97,10 @@ static int referenceTest(const std::filesystem::path& directory,const std::wstri
 
 
 // ---- double RTX Video SR and supersampling (2026-10-28) ------------------------
-// Base SR, an exact area reduction of the first AI result, then a second SR with
-// real SDK evaluations: sizes, the reduction against a CPU area average of the
+// Base SR, a Lanczos-2 AA reduction of the first AI result, then a second SR with
+// real SDK evaluations: sizes, the reduction against a CPU reference of the
 // graph's own first result, and both HDR restores against the bases they must
-// use. Supersampling: one pass shrunk into the output, against a CPU area average
+// use. Supersampling: one pass shrunk into the output, against a CPU reference
 // of the same graph's larger result. Readbacks are restricted to this test.
 namespace stage {
 using namespace veyra;
@@ -173,10 +177,11 @@ Frame hdrFrame(const sink::RgbaImage& img){
     }
     return f;
 }
-struct Run{bool ok=false;sink::RgbaImage output,srInput,firstLinear;double srMs=-1;uint64_t evaluations=0;pipeline::Extent srIn{},srOut{},work{},first{};bool enabled=false;};
+struct Run{bool ok=false;sink::RgbaImage output,srInput,firstLinear;double srMs=-1,srP95Ms=-1;uint64_t evaluations=0;pipeline::Extent srIn{},srOut{},work{},first{};bool enabled=false;};
 Run run(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,const AVFrame* frame,bool hdr,const engine::EnhancementSettings& settings,
-        bool readSrInput,bool still=false,bool uncompressed=false,unsigned frames=6,bool readFirst=false){
+        bool readSrInput,bool still=false,bool uncompressed=false,unsigned frames=6,bool readFirst=false,uint32_t liveSharpness=0){
     engine::StageRequest request;request.width=unsigned(frame->width);request.height=unsigned(frame->height);request.sr=settings.sr;
+    request.nvidiaAdapter=ctx.adapter().isNvidia;request.amdAdapter=ctx.adapter().vendorId==0x1002;
     request.stillImage=still;request.uncompressedSource=uncompressed;request.nr=settings.nr;
     pipeline::EnhanceGraphDesc desc;engine::describeStages(request,settings,desc);
     desc.rgbInput=!hdr;desc.hdrInput=hdr;desc.hdrOutput=hdr;desc.outputDitherStep=0;desc.runtimeAbsPath=runtime::localRuntimeDirectory().wstring();
@@ -186,6 +191,10 @@ Run run(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,const AVFrame* f
     if(!graph.initialize(desc)||!graph.createViews()){graph.shutdown();return r;}
     graph.recordGpuTimings();std::vector<double> ms;pipeline::EnhanceGraph::FrameOutputs out;bool ok=true;
     for(unsigned i=0;i<frames&&ok;++i){
+        if(i==2&&liveSharpness){
+            auto edited=settings;edited.fsrSrSharpness=liveSharpness;
+            if(engine::requiresGraphRebuild(settings,edited)||!graph.applySettings(edited)){ok=false;break;}
+        }
         out={};ok=graph.process(frame,i*33.333333,i==0,out,i+1)&&ring.waitIdle();
         for(const auto& t:graph.takeGpuTimings()){const auto& v=t.gpu[size_t(diagnostics::GpuStage::Sr)];if(v.milliseconds&&t.identity.sourceFrameId>2)ms.push_back(*v.milliseconds);}
     }
@@ -195,7 +204,10 @@ Run run(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,const AVFrame* f
     if(ok&&readSrInput)ok=read(ctx,ring,graph.diagnosticVideoSrInput(),hdr?D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE:D3D12_RESOURCE_STATE_COMMON,4,r.srInput);
     if(ok&&readFirst)ok=read(ctx,ring,graph.diagnosticFirstSrLinear(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,8,r.firstLinear);
     r.evaluations=graph.metrics().srEvaluateCount;r.enabled=graph.srEnabled();
-    if(!ms.empty()){std::sort(ms.begin(),ms.end());r.srMs=ms[ms.size()/2];}
+    if(!ms.empty()){
+        std::sort(ms.begin(),ms.end());r.srMs=ms[ms.size()/2];
+        r.srP95Ms=ms[(ms.size()*95+99)/100-1];
+    }
     r.ok=ok;out={};ring.drainQueue();graph.shutdown();return r;
 }
 engine::EnhancementSettings vsr(unsigned quality,pipeline::SrTarget target){
@@ -208,28 +220,69 @@ engine::EnhancementSettings twoPass(unsigned quality,pipeline::SrTarget target,p
     auto s=vsr(quality,target);s.dualSrEnabled=true;s.srPrescale=reduce;s.dualSrTarget=second;s.dualSrQuality=secondQuality;
     return s;
 }
-// CPU area average of an image by an integer factor, SDR (sRGB) or scRGB FP16.
-std::vector<double> shrink(const sink::RgbaImage& img,unsigned factor,bool hdr){
-    const unsigned w=img.width/factor,h=img.height/factor;std::vector<double> out(size_t(w)*h*3);
-    for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x)for(unsigned c=0;c<3;++c){
-        double sum=0;for(unsigned j=0;j<factor;++j)for(unsigned i=0;i<factor;++i){
-            const size_t p=(size_t(y*factor+j)*img.width+x*factor+i)*4+c;sum+=hdr?half(img,p):decode(img.pixels[p]);}
-        out[(size_t(y)*w+x)*3+c]=sum/(factor*factor);
-    }
-    return out;
-}
-// CPU exact area resample to linear RGB with NrDownsample's weights; fp16 reads
-// linear/scRGB FP16 texels, otherwise sRGB bytes.
-std::vector<double> area(const sink::RgbaImage& img,unsigned w,unsigned h,bool fp16){
-    std::vector<double> out(size_t(w)*h*3);const double sx=double(img.width)/w,sy=double(img.height)/h;
-    for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){
-        const double x0=x*sx,x1=(x+1)*sx,y0=y*sy,y1=(y+1)*sy;double sum[3]{},weights=0;
-        for(unsigned j=unsigned(y0);j<unsigned(std::ceil(y1))&&j<img.height;++j)for(unsigned i=unsigned(x0);i<unsigned(std::ceil(x1))&&i<img.width;++i){
-            const double weight=(std::min(x1,i+1.0)-std::max(x0,double(i)))*(std::min(y1,j+1.0)-std::max(y0,double(j)));
-            if(weight<=0)continue;weights+=weight;
-            for(unsigned c=0;c<3;++c){const size_t p=(size_t(j)*img.width+i)*4+c;sum[c]+=weight*(fp16?half(img,p):decode(img.pixels[p]));}
+// Exact sinc reference in linear light. SR's 8-bit surface is decoded before
+// filtering; first-pass textures and scRGB outputs are already linear.
+std::vector<double> shrink(const sink::RgbaImage& img, unsigned w, unsigned h, bool fp16, bool hdr = false)
+{
+    struct Tap { int i; double weight; };
+    using Color = std::array<double,3>;
+    const auto axis = [](unsigned source, unsigned output) {
+        std::vector<std::vector<Tap>> result(output);
+        const double scale = double(source)/output;
+        for (unsigned p = 0; p < output; ++p) {
+            const double center = (p+0.5)*scale-0.5, stretch = std::max(1.0,scale);
+            double sum = 0;
+            for (int i = int(std::floor(center-2*stretch))+1; i < int(std::ceil(center+2*stretch)); ++i) {
+                const double weight = lanczos2((i-center)/stretch);
+                if (std::abs(weight) < 1e-14) continue;
+                result[p].push_back({std::clamp(i,0,int(source)-1),weight});
+                sum += weight;
+            }
+            for (auto& tap : result[p]) tap.weight /= sum;
         }
-        for(unsigned c=0;c<3;++c)out[(size_t(y)*w+x)*3+c]=sum[c]/weights;
+        return result;
+    };
+    const auto sample = [hdr](const std::vector<Tap>& taps, const auto& read) {
+        Color sum{}, lo{1e30,1e30,1e30}, hi{-1e30,-1e30,-1e30};
+        double peak = 0;
+        for (const auto& [i,weight] : taps) {
+            const auto value = read(i);
+            for (unsigned c = 0; c < 3; ++c) {
+                const double v = value[c];
+                sum[c] += weight*v;
+                if (hdr) {
+                    peak = std::max(peak,v);
+                    if (weight > 0) {
+                        lo[c] = std::min(lo[c],v);
+                        hi[c] = std::max(hi[c],v);
+                    }
+                }
+            }
+        }
+        if (peak > 1)
+            for (unsigned c = 0; c < 3; ++c) sum[c] = std::clamp(sum[c],lo[c],hi[c]);
+        return sum;
+    };
+    const auto xs = axis(img.width,w), ys = axis(img.height,h);
+    std::array<double,256> sRgb{};
+    for (unsigned c = 0; c < sRgb.size(); ++c) sRgb[c] = decode(uint8_t(c));
+    std::vector<std::array<float,3>> rows(size_t(w)*img.height);
+    for (unsigned y = 0; y < img.height; ++y) {
+        for (unsigned x = 0; x < w; ++x) {
+            const auto px = sample(xs[x], [&](int i) {
+                const size_t p = (size_t(y)*img.width+i)*4;
+                if (fp16) return Color{half(img,p),half(img,p+1),half(img,p+2)};
+                return Color{sRgb[img.pixels[p]],sRgb[img.pixels[p+1]],sRgb[img.pixels[p+2]]};
+            });
+            rows[size_t(y)*w+x] = {float(px[0]),float(px[1]),float(px[2])};
+        }
+    }
+    std::vector<double> out(size_t(w)*h*3);
+    for (unsigned y = 0; y < h; ++y) {
+        for (unsigned x = 0; x < w; ++x) {
+            const auto px = sample(ys[y], [&](int i) { return rows[size_t(i)*w+x]; });
+            for (unsigned c = 0; c < 3; ++c) out[(size_t(y)*w+x)*3+c] = px[c];
+        }
     }
     return out;
 }
@@ -249,7 +302,7 @@ double bilinear(const std::vector<double>& img,unsigned w,unsigned h,unsigned W,
 // SDR input/output transparency (the A/B baseline) and both HDR restores of
 // double SR. HdrRestore returns its base plus a delta clamped to +-0.5*203/80,
 // so every output lies within that bound of the base it sampled: the first
-// restore must sample the source, the second the area reduction of the first
+// restore must sample the source, the second the Lanczos-2 reduction of the first
 // AI result. A full-size base would break the bound on the thin 1000-nit lines.
 int restore(const std::filesystem::path& directory){
     std::filesystem::create_directories(directory);Logger::instance().openFile((directory/L"engine.log").wstring());
@@ -270,7 +323,7 @@ int restore(const std::filesystem::path& directory){
     check(source.ok&&source.output.width==2560&&two.ok&&two.evaluations==6&&two.firstLinear.width==3840&&two.output.width==3840,
           "HDR double SR: 2560x1440 -> base 3840x2160 -> 1920x1080 -> second 3840x2160");
     if(source.ok&&two.ok&&source.output.width==2560&&two.firstLinear.width==3840&&two.output.width==3840){
-        const auto base=linear(source.output),reduced=area(two.firstLinear,1920,1080,true);
+        const auto base=linear(source.output),reduced=shrink(two.firstLinear,1920,1080,true,true);
         const double bound=0.5*203.0/80.0+0.05;double first=0,second=0;size_t bad=0;
         for(unsigned y=0;y<2160;++y)for(unsigned x=0;x<3840;++x)for(unsigned c=0;c<3;++c){
             const size_t i=(size_t(y)*3840+x)*4+c;const double f=half(two.firstLinear,i),o=half(two.output,i);
@@ -294,10 +347,10 @@ int dual(const std::filesystem::path& directory){
     const auto two=run(ctx,ring,sdr.get(),false,s,true,false,false,3,true);
     check(two.ok&&two.evaluations==6&&two.firstLinear.width==3840&&two.srInput.width==1920&&two.work==pipeline::Extent{3840,2160},"two independent AI evaluations per frame, with first 4K output retained");
     if(two.ok){
-        const auto expected=shrink(two.firstLinear,2,true);int worst=0;
+        const auto expected=shrink(two.firstLinear,1920,1080,true);int worst=0;
         for(size_t p=0;p<size_t(1920)*1080;++p)for(unsigned c=0;c<3;++c)
             worst=std::max(worst,std::abs(int(two.srInput.pixels[p*4+c])-int(std::lround(encode(expected[p*3+c])))));
-        check(worst<=2,"second input is the area reduction of the FIRST AI result, max difference "+std::to_string(worst));
+        check(worst<=2,"second input is the Lanczos-2 reduction of the FIRST AI result, max difference "+std::to_string(worst));
     }
     s.srTarget=pipeline::SrTarget::Uhd8K;
     const auto eightThenFour=run(ctx,ring,sdr.get(),false,s,false,false,false,2);
@@ -337,10 +390,10 @@ int boundaries(const std::filesystem::path& directory){
     check(manual.ok&&manual.srIn==Extent{2880,1620}&&manual.firstLinear.width==3840&&manual.work==Extent{3840,2160}&&manual.evaluations==6,
           "75 % of the 4K first result is 2880x1620");
     if(manual.ok&&manual.srInput.width==2880&&manual.firstLinear.width==3840){
-        const auto expected=area(manual.firstLinear,2880,1620,true);int worst=0;size_t over=0;
+        const auto expected=shrink(manual.firstLinear,2880,1620,true);int worst=0;size_t over=0;
         for(size_t p=0;p<size_t(2880)*1620;++p)for(unsigned c=0;c<3;++c){
             const int d=std::abs(int(manual.srInput.pixels[p*4+c])-int(std::lround(encode(expected[p*3+c]))));worst=std::max(worst,d);over+=d>1;}
-        check(worst<=2&&over*1000<size_t(2880)*1620*3,"the non-integer reduction equals the exact area average (max "+std::to_string(worst)+", >1: "+std::to_string(over)+")");
+        check(worst<=2&&over*1000<size_t(2880)*1620*3,"the non-integer reduction matches Lanczos-2 AA (max "+std::to_string(worst)+", >1: "+std::to_string(over)+")");
     }
     ring.shutdown();ctx.shutdown();std::cout<<"DUAL_BOUNDARIES passed="<<ok<<std::endl;return ok?0:1;
 }
@@ -391,6 +444,50 @@ std::pair<double,bool> meanLinear(const sink::RgbaImage& img){
 
 // Moving detail with an integer translation at both input and output. Save the
 // actual FSR pixels and compare motion-compensated temporal error against zero.
+int xess(const std::filesystem::path& directory,uint32_t vendor){
+    std::filesystem::create_directories(directory);
+    Logger::instance().openFile((directory/L"engine.log").wstring());
+    gfx::D3D12DeviceContext ctx;gfx::CommandSlotRing ring;Status status;
+    gfx::DeviceContextDesc device;device.enableDebugLayer=true;device.requiredVendorId=vendor;
+    if(!ctx.initialize(device,status)||!ring.initialize(ctx.device(),ctx.directQueue(),ctx.fence(),ctx.fenceEvent(),4,status))return 2;
+    gfx::ComPtr<ID3D12InfoQueue> info;
+    ctx.device()->QueryInterface(IID_PPV_ARGS(&info));
+    if(info)info->ClearStoredMessages();
+    const auto source=pattern(1280,720);
+    const auto sdr=sdrFrame(source),hdr=hdrFrame(source);
+    if(!sdr||!hdr)return 2;
+    constexpr auto quality=engine::kVideoSrXess;
+    using pipeline::SrTarget;using pipeline::SrPrescale;
+    auto single=vsr(quality,SrTarget::Qhd);
+    const auto dual=twoPass(quality,SrTarget::Qhd,SrPrescale::P1080,SrTarget::Uhd4K,quality);
+    auto flow=single;flow.srMotion=engine::MotionSource::OpticalFlow;
+    struct Case {const char* name;const AVFrame* frame;bool hdr,dual;engine::EnhancementSettings settings;};
+    const Case cases[]={{"sdr",sdr.get(),false,false,single},{"sdr-flow",sdr.get(),false,false,flow},
+                        {"p010",hdr.get(),true,false,single},{"dual",sdr.get(),false,true,dual}};
+    bool ok=true;
+    const auto expectedMean=meanLinear(source).first;
+    for(const auto& test:cases){
+        const auto result=run(ctx,ring,test.frame,test.hdr,test.settings,false,false,false,6,test.dual);
+        const auto [mean,finite]=meanLinear(result.output);
+        const bool passed=result.ok&&result.enabled&&finite&&result.evaluations==(test.dual?12u:6u)&&
+            result.output.width==(test.dual?3840u:2560u)&&(test.hdr?mean>0:std::abs(mean-expectedMean)<0.05);
+        if(passed&&!test.hdr)ok=sink::saveImage((directory/(std::string(test.name)+".png")).wstring(),result.output,false)&&ok;
+        ok=ok&&passed;
+        std::cout<<"XESS_SR case="<<test.name<<" vendor="<<ctx.adapter().vendorId<<" evaluations="<<result.evaluations
+                 <<" srP50Ms="<<result.srMs<<" srP95Ms="<<result.srP95Ms<<" mean="<<mean<<" passed="<<passed<<std::endl;
+    }
+    unsigned errors=0;
+    if(info)for(UINT64 i=0;i<info->GetNumStoredMessagesAllowedByRetrievalFilter();++i){
+        SIZE_T size=0;info->GetMessage(i,nullptr,&size);std::vector<uint8_t> bytes(size);
+        auto* message=reinterpret_cast<D3D12_MESSAGE*>(bytes.data());
+        if(SUCCEEDED(info->GetMessage(i,message,&size))&&message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){
+            std::cout<<"D3D12_ERROR "<<message->pDescription<<std::endl;++errors;
+        }
+    }
+    std::cout<<"XESS_SR debugErrors="<<errors<<std::endl;
+    return ok&&errors==0?0:1;
+}
+
 int fsrFlow(const std::filesystem::path& directory){
     std::filesystem::create_directories(directory);
     Logger::instance().openFile((directory/L"engine.log").wstring());
@@ -561,10 +658,10 @@ int supersample(const std::filesystem::path& directory){
         check(full.ok&&full.output.width==7680&&fit.ok&&fit.enabled&&fit.srOut==Extent{7680,4320}&&fit.work==Extent{3840,2160}&&
               fit.output.width==3840&&fit.output.height==2160&&fit.evaluations==6,"SDR: SR writes 7680x4320 once per frame, the chain runs at 3840x2160");
         if(full.ok&&fit.ok&&full.output.width==7680&&fit.output.width==3840){
-            const auto reference=shrink(full.output,2,false);int worst=0;size_t over=0,count=0;
+            const auto reference=shrink(full.output,3840,2160,false);int worst=0;size_t over=0,count=0;
             for(size_t p=0;p<size_t(3840)*2160;++p)for(unsigned c=0;c<3;++c){
                 const int d=std::abs(int(fit.output.pixels[p*4+c])-int(std::lround(encode(reference[p*3+c]))));worst=std::max(worst,d);over+=d>1;++count;}
-            check(worst<=2&&over*200<count,"SDR shrink equals the area average of the 8K result (max "+std::to_string(worst)+", >1: "+std::to_string(over)+")");
+            check(worst<=2&&over*200<count,"SDR shrink matches Lanczos-2 AA on the 8K result (max "+std::to_string(worst)+", >1: "+std::to_string(over)+")");
         }
         std::cout<<"SUPERSAMPLE_TIMING case=sdr-2k-8k-4k q=2 fullSrMs="<<full.srMs<<" shrinkSrMs="<<fit.srMs<<std::endl;
     }
@@ -573,11 +670,11 @@ int supersample(const std::filesystem::path& directory){
         const auto fit=run(ctx,ring,qhdHdr.get(),true,shrunk(2,SrTarget::Uhd8K,SrOutput::Uhd4K),false);
         check(full.ok&&fit.ok&&fit.enabled&&fit.output.width==3840&&full.output.width==7680,"HDR: the 8K SR result is shrunk to 3840x2160");
         if(full.ok&&fit.ok&&full.output.width==7680&&fit.output.width==3840){
-            const auto reference=shrink(full.output,2,true);size_t over=0,count=0,bad=0;double worst=0,peak=0;
+            const auto reference=shrink(full.output,3840,2160,true,true);size_t over=0,count=0,bad=0;double worst=0,peak=0;
             for(size_t p=0;p<size_t(3840)*2160;++p)for(unsigned c=0;c<3;++c){
                 const double v=half(fit.output,p*4+c),r=reference[p*3+c];if(!std::isfinite(v)){++bad;continue;}
                 const double d=std::abs(v-r);worst=std::max(worst,d);peak=std::max(peak,v);over+=d>0.003+0.003*std::abs(r);++count;}
-            check(!bad&&over*1000<count,"HDR shrink equals the area average of the 8K restore (worst "+std::to_string(worst)+", over "+std::to_string(over)+", peak "+std::to_string(peak)+")");
+            check(!bad&&over*1000<count,"HDR shrink matches Lanczos-2 AA on the 8K restore (worst "+std::to_string(worst)+", over "+std::to_string(over)+", peak "+std::to_string(peak)+")");
         }
     }
     {
@@ -590,6 +687,117 @@ int supersample(const std::filesystem::path& directory){
         check(both.ok&&both.evaluations==4&&both.output.width==3840,"double SR runs both passes and ignores a kept shrink");
     }
     ring.shutdown();ctx.shutdown();std::cout<<"SUPERSAMPLE_RESULT passed="<<ok<<std::endl;return ok?0:1;
+}
+// Smart SR on HDR10: a 1080p picture enlarged to 4K in PQ codes by each known scaler is
+// found, and strokes keep their width through descale, RTX Video SR and the HDR restore.
+// With a raw RGBA32F scRGB 3840x2160 file it runs that picture and stores the result.
+double pqOf(double nits){const double y=std::pow(std::clamp(nits/10000.0,0.0,1.0),2610.0/16384.0);
+    return std::pow((3424.0/4096.0+2413.0/128.0*y)/(1+2392.0/128.0*y),2523.0/32.0);}
+// PQ codes (BT.2020 R'G'B', three per pixel) as P010.
+Frame pqFrame(const std::vector<double>& code,unsigned w,unsigned h){
+    Frame f(av_frame_alloc());if(!f)return {};
+    f->format=AV_PIX_FMT_P010;f->width=int(w);f->height=int(h);
+    f->color_range=AVCOL_RANGE_MPEG;f->colorspace=AVCOL_SPC_BT2020_NCL;f->color_primaries=AVCOL_PRI_BT2020;f->color_trc=AVCOL_TRC_SMPTE2084;
+    if(av_frame_get_buffer(f.get(),32)<0)return {};
+    const auto luma=[&](size_t i){return 0.2627*code[i*3]+0.6780*code[i*3+1]+0.0593*code[i*3+2];};
+    const auto q=[](double v){return uint16_t(std::clamp(std::lround(v),0l,1023l)<<6);};
+    for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x)
+        reinterpret_cast<uint16_t*>(f->data[0]+size_t(y)*f->linesize[0])[x]=q(64+876*luma(size_t(y)*w+x));
+    for(unsigned y=0;y<h/2;++y)for(unsigned x=0;x<w/2;++x){
+        double cb=0,cr=0;for(unsigned k=0;k<4;++k){const size_t i=size_t(y*2+k/2)*w+x*2+k%2;const double l=luma(i);cb+=(code[i*3+2]-l)/1.8814/4;cr+=(code[i*3]-l)/1.4746/4;}
+        auto* row=reinterpret_cast<uint16_t*>(f->data[1]+size_t(y)*f->linesize[1]);row[x*2]=q(512+896*cb);row[x*2+1]=q(512+896*cr);
+    }
+    return f;
+}
+int smart(const std::filesystem::path& directory,const std::filesystem::path& raw){
+    std::filesystem::create_directories(directory);Logger::instance().openFile((directory/L"engine.log").wstring());
+    gfx::D3D12DeviceContext ctx;gfx::CommandSlotRing ring;Status status;
+    if(!ctx.initialize({},status)||!ring.initialize(ctx.device(),ctx.directQueue(),ctx.fence(),ctx.fenceEvent(),4,status))return 2;
+    using pipeline::SmartSrScaler;
+    constexpr unsigned W=3840,H=2160,w=1920,h=1080;
+    struct Result{bool ok=false;pipeline::Extent extent{};SmartSrScaler scaler{};sink::RgbaImage image;double srMs=-1;};
+    const auto process=[&](const AVFrame* frame){
+        Result r;auto settings=vsr(4,pipeline::SrTarget::Uhd4K);settings.smartSr=true;
+        engine::StageRequest request;request.width=W;request.height=H;request.sr=true;request.uncompressedSource=true;
+        pipeline::EnhanceGraphDesc desc;engine::describeStages(request,settings,desc);
+        desc.hdrInput=desc.hdrOutput=true;desc.outputDitherStep=0;desc.runtimeAbsPath=runtime::localRuntimeDirectory().wstring();
+        pipeline::EnhanceGraph graph(ctx,ring);
+        if(!graph.initialize(desc)||!graph.createViews()){graph.shutdown();return r;}
+        graph.recordGpuTimings();std::vector<double> ms;pipeline::EnhanceGraph::FrameOutputs out;bool ok=true;
+        for(unsigned i=0;i<150&&ok;++i){
+            out={};ok=graph.process(frame,i*16.666667,i==0,out,i+1)&&ring.waitIdle();
+            for(const auto& t:graph.takeGpuTimings()){const auto& v=t.gpu[size_t(diagnostics::GpuStage::Sr)];if(v.milliseconds&&t.identity.sourceFrameId>120)ms.push_back(*v.milliseconds);}
+        }
+        if(ok){auto* tex=graph.videoFrameResource(out.videoSlot);
+            ok=tex&&tex->GetDesc().Format==DXGI_FORMAT_R16G16B16A16_FLOAT&&read(ctx,ring,tex,D3D12_RESOURCE_STATE_COMMON,8,r.image);}
+        r.extent=graph.smartSrExtent();r.scaler=graph.smartSrVerdict().scaler;r.ok=ok;
+        if(!ms.empty()){std::sort(ms.begin(),ms.end());r.srMs=ms[ms.size()/2];}
+        out={};ring.drainQueue();graph.shutdown();return r;
+    };
+    if(!raw.empty()){
+        std::ifstream in(raw,std::ios::binary);std::vector<float> px(size_t(W)*H*4);
+        if(!in.read(reinterpret_cast<char*>(px.data()),std::streamsize(px.size()*sizeof(float))))return 2;
+        std::vector<double> code(size_t(W)*H*3);
+        constexpr double m[9]={.627404,.329283,.043313,.069097,.919540,.011362,.016391,.088013,.895595};
+        for(size_t i=0;i<size_t(W)*H;++i)for(unsigned c=0;c<3;++c)
+            code[i*3+c]=pqOf(80.0*std::max(0.0,m[c*3]*px[i*4]+m[c*3+1]*px[i*4+1]+m[c*3+2]*px[i*4+2]));
+        const auto frame=pqFrame(code,W,H);if(!frame)return 2;
+        const auto r=process(frame.get());
+        std::cout<<"SMART_HDR raw extent="<<r.extent.width<<'x'<<r.extent.height<<" aligned="<<(r.scaler==SmartSrScaler::Aligned2x)<<" srMs="<<r.srMs<<" ok="<<r.ok<<std::endl;
+        if(r.ok){std::ofstream o(directory/L"smart-output.f16",std::ios::binary);o.write(reinterpret_cast<const char*>(r.image.pixels.data()),std::streamsize(r.image.pixels.size()));}
+        ring.shutdown();ctx.shutdown();return r.ok?0:1;
+    }
+    // 1080p render in PQ codes. Left: text-like strokes, dark on 211 nits above and bright
+    // (203 nits) on black below; right: detail at every frequency for the detection.
+    const double paper=pqOf(211),ink=pqOf(1.2),light=pqOf(203),night=pqOf(0.2);
+    std::vector<double> render(size_t(w)*h);
+    const auto texture=pattern(w,h);
+    for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){
+        double v;
+        if(x<w/2){
+            const bool top=y<h/2;
+            const unsigned u=x%37,s=y%41;
+            const bool stroke=(u>=8&&u<10)||(s>=12&&s<14)||((x+y)%53<2)||(u>=20&&u<23&&s>18&&s<36);
+            v=top?(stroke?ink:paper):(stroke?light:night);
+        }else v=pqOf(decode(texture.pixels[(size_t(y)*w+x)*4+1])*200);
+        render[size_t(y)*w+x]=v;
+    }
+    bool ok=true;
+    for(const auto scaler:{SmartSrScaler::Bilinear,SmartSrScaler::Aligned2x}){
+        const auto weight=[&](uint32_t j,uint32_t high,uint32_t low,int i){
+            if(scaler==SmartSrScaler::Aligned2x)return pipeline::smartSrAlignedWeight(j,i);
+            int i0,i1;double w0,w1;pipeline::smartSrBilinear(j,high,low,i0,w0,i1,w1);
+            return (i==i0?w0:0.0)+(i==i1?w1:0.0);
+        };
+        std::vector<double> rows(size_t(W)*h),code(size_t(W)*H*3);
+        for(unsigned y=0;y<h;++y)for(unsigned x=0;x<W;++x){
+            double v=0;for(int i=int(x/2)-4;i<=int(x/2)+4;++i)if(const double k=weight(x,W,w,i))v+=k*render[size_t(y)*w+size_t(std::clamp(i,0,int(w)-1))];
+            rows[size_t(y)*W+x]=v;
+        }
+        for(unsigned y=0;y<H;++y)for(unsigned x=0;x<W;++x){
+            double v=0;for(int i=int(y/2)-4;i<=int(y/2)+4;++i)if(const double k=weight(y,H,h,i))v+=k*rows[size_t(std::clamp(i,0,int(h)-1))*W+x];
+            for(unsigned c=0;c<3;++c)code[(size_t(y)*W+x)*3+c]=std::clamp(v,0.0,1.0);
+        }
+        const auto frame=pqFrame(code,W,H);if(!frame)return 2;
+        const auto r=process(frame.get());
+        const bool found=r.ok&&r.extent==pipeline::Extent{w,h}&&r.scaler==scaler&&r.image.width==W&&r.image.height==H;
+        // Stroke area: samples past half way (in PQ codes) from the background to the stroke,
+        // against the strokes of the render itself (four output samples per render sample).
+        double area[2][2]{};
+        if(found)for(unsigned y=16;y<H-16;++y)for(unsigned x=16;x<W/2-16;++x){
+            if(y>H/2-16&&y<H/2+16)continue;
+            const bool top=y<H/2;const double middle=top?(paper+ink)/2:(light+night)/2;
+            const size_t p=(size_t(y)*W+x)*4;
+            const double out=pqOf(80.0*std::max(0.0,0.212639*half(r.image,p)+0.715169*half(r.image,p+1)+0.072192*half(r.image,p+2)));
+            area[top?0:1][0]+=(render[size_t(y/2)*w+x/2]<middle)==top;area[top?0:1][1]+=(out<middle)==top;
+        }
+        const double dark=found?area[0][1]/area[0][0]:0,bright=found?area[1][1]/area[1][0]:0;
+        const bool passed=found&&dark>0.92&&dark<1.08&&bright>0.92&&bright<1.08;
+        std::cout<<"SMART_HDR scaler="<<(scaler==SmartSrScaler::Aligned2x?"aligned2x":"bilinear")<<" extent="<<r.extent.width<<'x'<<r.extent.height
+                 <<" darkStrokes="<<dark<<" brightStrokes="<<bright<<" srMs="<<r.srMs<<" passed="<<passed<<std::endl;
+        ok=ok&&passed;
+    }
+    ring.shutdown();ctx.shutdown();std::cout<<"SMART_HDR_RESULT passed="<<ok<<std::endl;return ok?0:1;
 }
 pipeline::SrPrescale reduceArg(std::wstring_view v){
     if(v==L"720")return pipeline::SrPrescale::P720;if(v==L"900")return pipeline::SrPrescale::P900;
@@ -608,13 +816,16 @@ pipeline::SrOutput shrinkArg(std::wstring_view v){
 }
 // One A/B picture: <dir> sr-image <input.png> <name> <quality 0..4> <target> <shrink off|source|2k..7k>
 //   <reduce off|720|900|1080|1440|NN%> <second-target> <second-quality> [video|still|capture]
+// Prefix the mode (e.g. amd-still) to select an AMD adapter on a dual-GPU machine.
 // Quality 0 leaves SR off; a shrink supersamples one pass; reduce "off" keeps a single pass.
 int image(const std::filesystem::path& directory,const std::wstring& input,const std::wstring& name,unsigned quality,std::wstring_view target,
           std::wstring_view shrinkTo,std::wstring_view reduce,std::wstring_view second,unsigned secondQuality,std::wstring_view mode){
     std::filesystem::create_directories(directory);Logger::instance().openFile((directory/(name+L".log")).wstring());
     sink::RgbaImage source;if(!sink::loadImage(input,source))return 2;
     gfx::D3D12DeviceContext ctx;gfx::CommandSlotRing ring;Status status;
-    if(!ctx.initialize({},status)||!ring.initialize(ctx.device(),ctx.directQueue(),ctx.fence(),ctx.fenceEvent(),4,status))return 2;
+    gfx::DeviceContextDesc device;
+    if(mode.starts_with(L"amd-")){device.requiredVendorId=0x1002;mode.remove_prefix(4);}
+    if(!ctx.initialize(device,status)||!ring.initialize(ctx.device(),ctx.directQueue(),ctx.fence(),ctx.fenceEvent(),4,status))return 2;
     const auto frame=sdrFrame(source);if(!frame)return 2;
     auto settings=quality&&reduce!=L"off"?twoPass(quality,targetArg(target),reduceArg(reduce),targetArg(second),secondQuality):vsr(quality,targetArg(target));
     settings.srOutput=shrinkArg(shrinkTo);
@@ -627,6 +838,68 @@ int image(const std::filesystem::path& directory,const std::wstring& input,const
              <<" srActive="<<r.enabled<<" evaluations="<<r.evaluations<<" srMs="<<r.srMs<<" passed="<<saved<<std::endl;
     ring.shutdown();ctx.shutdown();return saved?0:1;
 }
+
+int fsrRcas(const std::filesystem::path& directory,bool amd,const wchar_t* input){
+    std::filesystem::create_directories(directory);
+    Logger::instance().openFile((directory/L"engine.log").wstring());
+    gfx::DeviceContextDesc device;device.enableDebugLayer=true;device.requiredVendorId=amd?0x1002:0;
+    gfx::D3D12DeviceContext ctx;gfx::CommandSlotRing ring;Status status;
+    if(!ctx.initialize(device,status)||!ring.initialize(ctx.device(),ctx.directQueue(),ctx.fence(),ctx.fenceEvent(),4,status))return 2;
+    sink::RgbaImage source;
+    if(input){if(!sink::loadImage(input,source))return 2;}
+    else source=pattern(960,540);
+    auto frame=sdrFrame(source);
+    if(!frame)return 2;
+    constexpr auto fsr=engine::kVideoSrFsr,nis=engine::kVideoSrNis;
+    using pipeline::SrTarget;using pipeline::SrPrescale;
+    struct Case{
+        const char* name;
+        engine::EnhancementSettings settings;
+        bool sharpenFinal;
+    };
+    std::vector<Case> cases{
+        {"fsr",vsr(fsr,SrTarget::Qhd),true},
+        {"fsr-fsr",twoPass(fsr,SrTarget::Qhd,SrPrescale::P720,SrTarget::Qhd,fsr),true},
+        {"fsr-nis",twoPass(fsr,SrTarget::Qhd,SrPrescale::P720,SrTarget::Qhd,nis),false},
+        {"nis-fsr",twoPass(nis,SrTarget::Qhd,SrPrescale::P720,SrTarget::Qhd,fsr),true}
+    };
+    if(gfx::XessSrBackend::runtimeAvailable()){
+        constexpr auto xess=engine::kVideoSrXess;
+        cases.push_back({"xess-fsr",twoPass(xess,SrTarget::Qhd,SrPrescale::P720,SrTarget::Qhd,fsr),true});
+        cases.push_back({"fsr-xess",twoPass(fsr,SrTarget::Qhd,SrPrescale::P720,SrTarget::Qhd,xess),false});
+    }
+    constexpr unsigned frames=12;
+    bool ok=true;
+    for(const auto& test:cases){
+        const bool dual=test.settings.dualSrEnabled;
+        const auto off=run(ctx,ring,frame.get(),false,test.settings,false,false,false,frames,dual);
+        const auto on=run(ctx,ring,frame.get(),false,test.settings,false,false,false,frames,dual,60);
+        const bool firstIdentical=!dual||(!off.firstLinear.pixels.empty()&&off.firstLinear.pixels==on.firstLinear.pixels);
+        const bool outputsChanged=off.output.pixels!=on.output.pixels;
+        const uint64_t evaluations=frames*(dual?2u:1u);
+        const auto name=std::string(test.name);
+        const bool passed=off.ok&&on.ok&&off.enabled&&on.enabled&&firstIdentical&&
+            outputsChanged==test.sharpenFinal&&off.evaluations==evaluations&&on.evaluations==evaluations&&
+            sink::saveImage((directory/(name+"-off.png")).wstring(),off.output,false)&&
+            sink::saveImage((directory/(name+"-on.png")).wstring(),on.output,false);
+        ok=ok&&passed;
+        std::cout<<"FSR_RCAS case="<<name<<" firstIdentical="<<firstIdentical<<" outputsChanged="<<outputsChanged
+                 <<" offP50Ms="<<off.srMs<<" offP95Ms="<<off.srP95Ms
+                 <<" onP50Ms="<<on.srMs<<" onP95Ms="<<on.srP95Ms<<" passed="<<passed<<std::endl;
+    }
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> info;
+    unsigned errors=0;
+    if(SUCCEEDED(ctx.device()->QueryInterface(IID_PPV_ARGS(&info)))){
+        for(UINT64 n=0;n<info->GetNumStoredMessagesAllowedByRetrievalFilter();++n){
+            SIZE_T size=0;info->GetMessage(n,nullptr,&size);
+            std::vector<uint8_t> bytes(size);
+            auto* message=reinterpret_cast<D3D12_MESSAGE*>(bytes.data());
+            if(SUCCEEDED(info->GetMessage(n,message,&size))&&message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR)++errors;
+        }
+    }
+    std::cout<<"FSR_RCAS debugErrors="<<errors<<std::endl;
+    ring.shutdown();ctx.shutdown();return ok&&errors==0?0:1;
+}
 }
 
 int wmain(int argc,wchar_t** argv){
@@ -634,27 +907,38 @@ int wmain(int argc,wchar_t** argv){
     if(argc<2)return 2;
     const HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(FAILED(com))return 2;
+    if((argc==3||argc==4)&&(std::wstring_view(argv[2])==L"fsr-rcas"||std::wstring_view(argv[2])==L"fsr-rcas-amd")){
+        const int result=stage::fsrRcas(argv[1],std::wstring_view(argv[2])==L"fsr-rcas-amd",argc==4?argv[3]:nullptr);
+        CoUninitialize();return result;
+    }
     if(argc==3&&std::wstring_view(argv[2])==L"dual"){const int result=stage::dual(argv[1]);CoUninitialize();return result;}
     if(argc==3&&std::wstring_view(argv[2])==L"dual-restore"){const int result=stage::restore(argv[1]);CoUninitialize();return result;}
     if(argc==3&&std::wstring_view(argv[2])==L"dual-boundaries"){const int result=stage::boundaries(argv[1]);CoUninitialize();return result;}
     if(argc==3&&std::wstring_view(argv[2])==L"dual-capabilities"){const int result=stage::capabilities(argv[1]);CoUninitialize();return result;}
     if(argc==3&&std::wstring_view(argv[2])==L"dual-any"){const int result=stage::any(argv[1]);CoUninitialize();return result;}
     if(argc==3&&std::wstring_view(argv[2])==L"fsr-flow"){const int result=stage::fsrFlow(argv[1]);CoUninitialize();return result;}
+    if(argc==3&&(std::wstring_view(argv[2])==L"xess"||std::wstring_view(argv[2])==L"xess-amd"||std::wstring_view(argv[2])==L"xess-intel")){
+        const auto mode=std::wstring_view(argv[2]);
+        const int result=stage::xess(argv[1],mode==L"xess-amd"?0x1002:mode==L"xess-intel"?0x8086:0);
+        CoUninitialize();return result;
+    }
     if((argc==3||argc==5)&&(std::wstring_view(argv[2])==L"dual-any-hdr"||std::wstring_view(argv[2])==L"dual-any-sdr")){
         const bool hdr=std::wstring_view(argv[2])==L"dual-any-hdr";
         const int result=stage::any(argv[1],hdr,!hdr,argc==5?std::stoi(argv[3]):-1,argc==5?std::stoi(argv[4]):-1);
         CoUninitialize();return result;
     }
+    if((argc==3||argc==4)&&std::wstring_view(argv[2])==L"smart-hdr"){const int result=stage::smart(argv[1],argc==4?argv[3]:L"");CoUninitialize();return result;}
     if(argc==3&&std::wstring_view(argv[2])==L"supersample"){const int result=stage::supersample(argv[1]);CoUninitialize();return result;}
     if(argc>=11&&std::wstring_view(argv[2])==L"sr-image"){
         const int result=stage::image(argv[1],argv[3],argv[4],unsigned(std::stoi(argv[5])),argv[6],argv[7],argv[8],argv[9],unsigned(std::stoi(argv[10])),argc>11?argv[11]:L"video");
         CoUninitialize();return result;
     }
-    if(argc>5&&(std::wstring_view(argv[2])==L"reference"||std::wstring_view(argv[2])==L"models")){
+    if(argc>5&&(std::wstring_view(argv[2])==L"reference"||std::wstring_view(argv[2])==L"models"||std::wstring_view(argv[2])==L"xess-reference")){
         const std::wstring_view mode=argv[5];
         if(mode.starts_with(L"legacy-"))return 2; // withdrawn experiment; no production toggle remains
         const int result=referenceTest(argv[1],argv[3],std::stoi(argv[4]),mode.ends_with(L"moving"),mode.starts_with(L"zero-"),
-            mode.find(L"p720")!=std::wstring_view::npos?720:1080,mode.find(L"qhd")!=std::wstring_view::npos?1440:2160,std::wstring_view(argv[2])==L"models");
+            mode.find(L"p720")!=std::wstring_view::npos?720:1080,mode.find(L"qhd")!=std::wstring_view::npos?1440:2160,
+            std::wstring_view(argv[2])==L"models",std::wstring_view(argv[2])==L"xess-reference");
         CoUninitialize();return result;
     }
     const bool baseline=argc>2&&std::wstring_view(argv[2])==L"baseline";

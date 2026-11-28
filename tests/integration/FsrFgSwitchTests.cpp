@@ -3,6 +3,8 @@
 #include "veyra/gfx/D3D12DeviceContext.h"
 #include "veyra/sink/ImageExportSink.h"
 #include <d3d12sdklayers.h>
+#include <algorithm>
+#include <array>
 #include <filesystem>
 #include <iostream>
 #include <vector>
@@ -16,8 +18,11 @@ extern "C" {
 int wmain(int argc, wchar_t** argv) {
     using namespace veyra;
     if(argc<2||FAILED(CoInitializeEx(nullptr,COINIT_MULTITHREADED)))return 2;
-    const bool amd=argc>2&&std::wstring_view(argv[2])==L"amd";
-    const bool localBackends=argc>2&&std::wstring_view(argv[2])==L"local-backends";
+    const std::wstring_view mode=argc>2?argv[2]:L"";
+    const bool srLifetime=mode==L"fsr-sr-lifetime"||mode==L"fsr-sr-lifetime-amd";
+    const bool rifeBudget=mode==L"rife-budget"||mode==L"rife-budget-amd";
+    const bool amd=mode==L"amd"||mode==L"fsr-sr-lifetime-amd"||mode==L"rife-budget-amd";
+    const bool localBackends=mode==L"local-backends";
     std::filesystem::create_directories(argv[1]);
     HWND window=CreateWindowExW(0,L"STATIC",L"Veyra FG switch acceptance",WS_POPUP,
         40,40,640,360,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
@@ -44,9 +49,16 @@ int wmain(int argc, wchar_t** argv) {
     frame->format=AV_PIX_FMT_RGBA;frame->width=640;frame->height=360;
     frame->color_range=AVCOL_RANGE_JPEG;frame->color_trc=AVCOL_TRC_IEC61966_2_1;
     ok=av_frame_get_buffer(frame,32)>=0;
-    struct Case{engine::FrameGenerationBackend backend;unsigned multiplier;};
+    struct Case{engine::FrameGenerationBackend backend;unsigned multiplier;bool sr=false;};
     std::vector<Case> cases;
-    if(localBackends){
+    if(srLifetime){
+        for(unsigned repeat=0;repeat<4;++repeat){
+            cases.push_back({engine::FrameGenerationBackend::Fsr,2,true});
+            cases.push_back({engine::FrameGenerationBackend::Fsr,2});
+        }
+    }else if(rifeBudget){
+        cases={{engine::FrameGenerationBackend::Rife,2},{engine::FrameGenerationBackend::Rife,3}};
+    }else if(localBackends){
         cases={{engine::FrameGenerationBackend::Fsr,2},{engine::FrameGenerationBackend::Rife,2},
             {engine::FrameGenerationBackend::Rife,3}};
     }else for(unsigned repeat=0;repeat<3;++repeat){
@@ -57,6 +69,13 @@ int wmain(int argc, wchar_t** argv) {
         cases.push_back({engine::FrameGenerationBackend::Dlss,1});
         if(!amd)cases.push_back({engine::FrameGenerationBackend::Dlss,2});
     }
+    const auto fidelityFxModules=[]{
+        return std::array{
+            GetModuleHandleW(L"amd_fidelityfx_loader_dx12.dll"),
+            GetModuleHandleW(L"amd_fidelityfx_upscaler_dx12.dll"),
+            GetModuleHandleW(L"amd_fidelityfx_framegeneration_dx12.dll")};
+    };
+    std::array<HMODULE,3> resident{};
     uint64_t source=0;unsigned cycles=0,totalGenerated=0;
     for(const auto& c:cases){
         if(!ok)break;++cycles;
@@ -65,7 +84,14 @@ int wmain(int argc, wchar_t** argv) {
         desc.fgMultiplier=std::max(2u,c.multiplier);desc.frameGenerationBackend=c.backend;
         desc.runtimeAbsPath=runtime::localRuntimeDirectory().wstring();desc.settingsRevision=cycles;
         desc.opticalFlowBackend=amd?engine::OpticalFlowBackend::AmdFidelityFx:engine::OpticalFlowBackend::Nvidia;
+        if(c.sr){
+            desc.enableSr=true;desc.videoSrQuality=engine::kVideoSrFsr;
+            desc.srMotion=engine::MotionSource::Zero;
+            desc.workWidth=1280;desc.workHeight=720;
+        }
         ok=graph.initialize(desc)&&presenter.open(ctx,window,graph)&&graph.createViews();
+        if(c.sr)ok=ok&&graph.fsrSrEnabled();
+        if(rifeBudget){ok=ok&&graph.rifeActive();graph.recordGpuTimings();}
         if(!ok){std::cout<<"SWITCH_OPEN_FAIL backend="<<engine::frameGenerationBackendName(c.backend)<<" multiplier="<<c.multiplier<<std::endl;break;}
         for(unsigned slot=0;slot<2;++slot){
             graph.videoFrameResource(slot)->SetName(L"Veyra acceptance graph video");
@@ -73,7 +99,10 @@ int wmain(int argc, wchar_t** argv) {
         }
         if(graph.presentDepth())graph.presentDepth()->SetName(L"Veyra acceptance graph depth");
         diagnose(cycles,0,"open");
+        const auto srEvaluationsBefore=graph.metrics().srEvaluateCount;
         unsigned generated=0,nonblack=0;
+        int64_t previousPts=0;
+        std::vector<double> firstMs,groupMs;
         for(unsigned i=0;ok&&i<40;++i){
             if(i==20)SetWindowPos(window,nullptr,40,40,800,450,SWP_NOZORDER|SWP_NOACTIVATE);
             if(i==30)SetWindowPos(window,nullptr,40,40,640,360,SWP_NOZORDER|SWP_NOACTIVATE);
@@ -86,11 +115,60 @@ int wmain(int argc, wchar_t** argv) {
             ok=presenter.beginSourceInput()&&presenter.beginSourceProcessing();
             pipeline::EnhanceGraph::FrameOutputs out;
             ++source;
-            ok=ok&&graph.process(frame,double(source-1)*1000/30,i==0||i==24,out,source);
+            using Decision=pipeline::EnhanceGraph::FgDecision;
+            const bool skip=rifeBudget&&i==8;
+            const bool reduced=rifeBudget&&c.multiplier==3&&i==10;
+            pipeline::EnhanceGraph::FgAdmission admission;
+            if(skip||reduced)admission=[&](const auto&,bool warming){
+                ok=ok&&!warming;
+                return skip?Decision::Skip:Decision::Reduced;
+            };
+            const bool processed=ok&&graph.process(frame,double(source-1)*1000/30,i==0||i==24,out,source,nullptr,nullptr,true,admission);
+            ok=ok&&processed;
             diagnose(cycles,i,"process");
             if(!ok)break;
             presenter.sourceProcessed(out.batch.identity);
             ok=ctx.waitForFenceValue(std::max(out.videoFenceValue,out.genFenceValue))&&graph.resolveGeneration(out);
+            if(rifeBudget&&ok){
+                using diagnostics::GpuStage;
+                using diagnostics::SampleState;
+                const auto timings=graph.takeGpuTimings();
+                if(i!=0&&i!=24){
+                    const unsigned expected=skip?0u:reduced?1u:c.multiplier-1;
+                    const unsigned divisor=reduced?2u:c.multiplier;
+                    const int64_t duration=out.batch.b100ns-previousPts;
+                    ok=out.batch.a100ns==previousPts&&duration>0&&out.batch.count==expected+1&&
+                        out.fgEvaluated==expected&&out.fgReduced==reduced&&!out.historyReset&&!out.fgRecovery&&
+                        out.fgSkippedBeforeEval==c.multiplier-1-expected;
+                    for(unsigned sub=0;ok&&sub<expected;++sub){
+                        const auto& f=out.batch.frames[sub];
+                        ok=f.kind==pipeline::FrameKind::Generated&&f.validity==pipeline::GenerationValidity::Valid&&
+                            f.pts100ns==previousPts+((sub+1)*duration+divisor/2)/divisor;
+                    }
+                    if(ok){
+                        const auto& real=out.batch.frames[out.batch.count-1];
+                        ok=real.kind==pipeline::FrameKind::Real&&real.pts100ns==out.batch.b100ns;
+                    }
+                    const auto sample=std::find_if(timings.begin(),timings.end(),[&](const auto& v){return v.identity==out.batch.identity;});
+                    if(sample==timings.end())ok=false;
+                    else{
+                        const auto& first=sample->gpu[size_t(GpuStage::Fg1)];
+                        const auto& whole=sample->gpu[size_t(GpuStage::FgBatch)];
+                        if(skip)ok=ok&&first.state==SampleState::NotExecuted&&whole.state==SampleState::NotExecuted;
+                        else{
+                            ok=ok&&first.milliseconds&&whole.milliseconds&&*first.milliseconds>0&&
+                                whole.begin<=first.begin&&first.end<=whole.end&&(expected==1||first.end<whole.end);
+                            if(ok&&!reduced){firstMs.push_back(*first.milliseconds);groupMs.push_back(*whole.milliseconds);}
+                        }
+                        if(i==8||i==9||i==10||i==11)
+                            std::cout<<"RIFE_PAIR multiplier="<<c.multiplier<<" input="<<i<<" evaluated="<<out.fgEvaluated
+                                <<" a="<<out.batch.a100ns<<" b="<<out.batch.b100ns<<" firstPts="<<out.batch.frames[0].pts100ns
+                                <<" firstGpuMs="<<first.milliseconds.value_or(0)<<" groupGpuMs="<<whole.milliseconds.value_or(0)
+                                <<" pass="<<ok<<std::endl;
+                    }
+                }
+                previousPts=out.batch.b100ns;
+            }
             for(unsigned k=0;ok&&k<out.batch.count;++k){
                 const auto& item=out.batch.frames[k];const bool gen=item.kind==pipeline::FrameKind::Generated;
                 if(gen&&item.validity!=pipeline::GenerationValidity::Valid)continue;
@@ -114,7 +192,7 @@ int wmain(int argc, wchar_t** argv) {
                         if(ok)++nonblack;
                         if(gen&&i==10){
                             auto name=std::to_wstring(cycles)+L"-generated";
-                            if(localBackends)name+=L"-"+std::to_wstring(k);
+                            if(localBackends||rifeBudget)name+=L"-"+std::to_wstring(k);
                             ok=sink::saveImage((std::filesystem::path(argv[1])/(name+L".png")).wstring(),image)&&ok;
                         }
                     }
@@ -125,13 +203,31 @@ int wmain(int argc, wchar_t** argv) {
         }
         const unsigned minGenerated=(c.multiplier-1)*25;
         ok=ok&&generated>=minGenerated&&nonblack>=2;
+        if(rifeBudget&&ok){
+            const auto p95=[](std::vector<double>& samples){
+                if(samples.empty())return -1.0;
+                std::sort(samples.begin(),samples.end());
+                return samples[(samples.size()*95+99)/100-1];
+            };
+            std::cout<<"RIFE_GPU multiplier="<<c.multiplier<<" samples="<<firstMs.size()<<" firstP95Ms="<<p95(firstMs)
+                <<" groupP95Ms="<<p95(groupMs)<<std::endl;
+        }
+        const bool srActive=graph.fsrSrEnabled();
+        const auto srEvaluations=graph.metrics().srEvaluateCount-srEvaluationsBefore;
+        if(srLifetime)ok=ok&&srActive==c.sr&&srEvaluations==(c.sr?40u:0u);
         totalGenerated+=generated;
         std::cout<<"SWITCH_CASE cycle="<<cycles<<" pid="<<GetCurrentProcessId()<<" hwnd="<<window
             <<" backend="<<engine::frameGenerationBackendName(c.backend)<<" multiplier="<<c.multiplier
-            <<" generated="<<generated<<" nonblack="<<nonblack<<" pass="<<ok<<std::endl;
+            <<" generated="<<generated<<" srEvaluations="<<srEvaluations<<" nonblack="<<nonblack<<" pass="<<ok<<std::endl;
+        if(srLifetime&&cycles==1)resident=fidelityFxModules();
         ok=ring.drainQueue()&&ok;presenter.close();graph.shutdown();
+        if(srLifetime){
+            const bool allResident=resident[0]&&resident[1]&&resident[2]&&fidelityFxModules()==resident;
+            std::cout<<"FSR_MODULE_LIFETIME cycle="<<cycles<<" resident="<<allResident<<std::endl;
+            ok=ok&&allResident;
+        }
     }
-    if(ok&&!localBackends){
+    if(ok&&!localBackends&&!srLifetime&&!rifeBudget){
         // Unsupported FSR 4 must fail before a swapchain is touched. The same
         // HWND must subsequently reopen, with no FSR 3.1 mislabeled as ML.
         pipeline::EnhanceGraphDesc ml;ml.sourceWidth=ml.workWidth=640;ml.sourceHeight=ml.workHeight=360;

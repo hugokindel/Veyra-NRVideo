@@ -301,6 +301,8 @@ __declspec(noinline) static int runContentCadenceReplay(engine::EngineController
     std::cout<<" frames="<<end->frames-start->frames<<" skipped="<<end->captureRateSkipped-start->captureRateSkipped<<" generated="<<end->generated-start->generated
              <<" contentFps="<<end->contentFps<<" realPresented="<<end->metrics.flow.counters.realPresented-start->metrics.flow.counters.realPresented
              <<" generatedPresented="<<end->metrics.flow.counters.generatedPresented-start->metrics.flow.counters.generatedPresented
+             <<" smartSrActive="<<end->smartSrActive<<" smartSrSettled="<<end->smartSrSettled
+             <<" smartSrExtent="<<end->smartSrWidth<<'x'<<end->smartSrHeight
              <<" fgInvalid="<<end->metrics.flow.counters.fgInvalid-start->metrics.flow.counters.fgInvalid
              <<" submit1PercentLow="<<end->submissionLow1Fps.value_or(0)<<std::endl;
     const auto minimumFrames=engine::isCaptureHalfRate(start->applied.content)?sampleSeconds*15:300;
@@ -406,7 +408,9 @@ int wmain(int argc,wchar_t**argv){
     SetEnvironmentVariableW(L"VEYRA_VERBOSE_FRAME_LOGS",L"1");
     const bool settingsRebuild=argc==4&&wcscmp(argv[3],L"--settings-rebuild")==0;
     const bool captureRelease=argc==4&&wcscmp(argv[3],L"--capture-release")==0;
-    const bool captureNoVideo=captureRelease||(argc==4&&wcscmp(argv[3],L"--capture-no-video")==0);
+    const bool captureDriverExit=argc==4&&wcscmp(argv[3],L"--capture-driver-exit")==0;
+    const bool captureDriverWait=captureDriverExit||(argc==4&&wcscmp(argv[3],L"--capture-driver-wait")==0);
+    const bool captureNoVideo=captureRelease||captureDriverWait||(argc==4&&wcscmp(argv[3],L"--capture-no-video")==0);
     if(!settingsRebuild&&!captureNoVideo&&argc!=3&&!(argc==4&&(wcscmp(argv[3],L"--backend-recovery")==0||wcscmp(argv[3],L"--nr-first")==0||wcscmp(argv[3],L"--seek-stress")==0||wcscmp(argv[3],L"--half-rate")==0||wcscmp(argv[3],L"--overload")==0||wcscmp(argv[3],L"--file-overload")==0||wcscmp(argv[3],L"--source-gap")==0||wcscmp(argv[3],L"--file-endpoint")==0||wcscmp(argv[3],L"--file-continuity")==0||wcscmp(argv[3],L"--file-fg-recovery")==0||wcscmp(argv[3],L"--reset-rollback")==0||std::wstring(argv[3]).rfind(L"--dedup-",0)==0)))return 2;SetProcessDPIAware();CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     std::filesystem::create_directories(argv[2]);Logger::instance().startAsync();Logger::instance().openFile((std::filesystem::path(argv[2])/"engine.log").wstring());Logger::instance().setConsoleEnabled(false);
     HWND window=CreateWindowExW(0,L"STATIC",L"Live scheduler replay",WS_POPUP,0,0,960,540,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
@@ -453,7 +457,10 @@ int wmain(int argc,wchar_t**argv){
             engine.requestPresentation(display);
         }
         if(dedupMode.starts_with(L"nr-")){options.nr=true;dedupMode.erase(0,3);}
-        if(dedupMode.starts_with(L"sr-")){options.sr=true;options.settings.videoSrQuality=2;dedupMode.erase(0,3);}
+        if(dedupMode.starts_with(L"sr-")){
+            options.sr=true;options.settings.videoSrQuality=2;dedupMode.erase(0,3);
+            if(dedupMode.starts_with(L"smart-")){options.settings.smartSr=true;dedupMode.erase(0,6);}
+        }
         options.settings.frameGenerationBackend=engine::FrameGenerationBackend::Dlss;
         if(dedupMode.starts_with(L"anr-")){options.settings.frameGenerationBackend=engine::FrameGenerationBackend::Anr;dedupMode.erase(0,4);}
         else if(dedupMode.starts_with(L"vfg-")){options.settings.frameGenerationBackend=engine::FrameGenerationBackend::Vfg;dedupMode.erase(0,4);}
@@ -470,7 +477,44 @@ int wmain(int argc,wchar_t**argv){
     auto until=[&](auto predicate,int seconds=8){auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(seconds);while(std::chrono::steady_clock::now()<deadline){MSG msg;while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}auto s=engine.snapshot();if(s.failed){std::wcerr<<s.status<<'\n';return false;}if(predicate(s))return true;std::this_thread::sleep_for(5ms);}return false;};
     if(captureNoVideo)SetEnvironmentVariableW(L"VEYRA_TEST_REPLAY_CAPTURE_NO_VIDEO",L"1");
     if(captureRelease)SetEnvironmentVariableW(L"VEYRA_TEST_REPLAY_CAPTURE_RELEASE",L"1");
+    if(captureDriverWait)SetEnvironmentVariableW(L"VEYRA_TEST_REPLAY_CAPTURE_DRIVER_WAIT",L"1");
     engine.open(window,argv[1],options);
+    if(captureDriverWait){
+        check(until([](const auto& s){return s.frames>=120&&s.captureRecovering&&s.captureReconnectAttempts==1;},25),
+              "the capture reconnect attempt starts after the replay stops delivering frames");
+        const auto logPath=std::filesystem::path(argv[2])/"engine.log";
+        const auto entered=[&]{
+            Logger::instance().flush();
+            std::ifstream log(logPath);
+            std::string line;
+            while(std::getline(log,line))
+                if(line.find("driver operation entered an indefinite wait")!=std::string::npos)return true;
+            return false;
+        };
+        check(until([&](const auto&){return entered();},5),"capture worker is blocked on the injected operation");
+        if(captureDriverExit){
+            std::cout<<"exiting with an active blocked capture reconnect"<<std::endl;
+            return failures?1:0; // EngineController must shut down without an explicit Stop.
+        }
+        const auto stopStarted=std::chrono::steady_clock::now();
+        engine.stop();
+        check(until([&](const auto& s){return engine.idle()&&!s.running&&!s.captureRecovering;},2),
+              "stop completes with the driver operation still blocked");
+        std::cout<<"captureStopMs="<<std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now()-stopStarted).count()<<std::endl;
+
+        // A retired capture graph must not hold the playback owner when the
+        // user opens a file. Returning from main also exercises normal exit.
+        options.captureReplayForTest=false;
+        engine.open(window,argv[1],options);
+        check(until([](const auto& s){return !s.capture&&s.frames>=20;},10),
+              "ordinary file playback advances while the old capture driver is blocked");
+        engine.stop();
+        check(until([&](const auto&){return engine.idle();},2),"file playback stops before normal shutdown");
+        DestroyWindow(window);
+        CoUninitialize();
+        return failures?1:0;
+    }
     if(captureNoVideo){
         bool recovering=false, startConfirmed=false;
         auto lastAttempt=0u;
@@ -495,7 +539,13 @@ int wmain(int argc,wchar_t**argv){
         DestroyWindow(window);CoUninitialize();
         return failures?1:0;
     }
-    if(dedupRun){const int result=runContentCadenceReplay(engine,dedupMode,!dedupNoFg,argv[2],options.nr,options.sr);DestroyWindow(window);CoUninitialize();return result;}
+    if(dedupRun){
+        const int result=runContentCadenceReplay(engine,dedupMode,!dedupNoFg,argv[2],options.nr,options.sr);
+        // The player's shutdown watchdog can exit with status 0 if the engine
+        // is still blocked. The replay has already flushed its failure log.
+        if(result&&!engine.idle())TerminateProcess(GetCurrentProcess(),static_cast<UINT>(result));
+        DestroyWindow(window);CoUninitialize();return result;
+    }
     if(settingsRebuild){
         check(until([](const auto& s){return s.frames>20&&s.nrActive&&s.fgActive;},30),"original NR 1080p and DLSS 2X start on the actual video");
         for(unsigned round=0;round<8&&!failures;++round){

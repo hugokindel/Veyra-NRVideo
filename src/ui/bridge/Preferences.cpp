@@ -1,6 +1,8 @@
 // QML bridge: Preferences responsibilities.
 #include "../QmlPlayerBridge_p.h"
+#include "../LoginStartup.h"
 #include <QColor>
+#include <QWindow>
 #include "veyra/ngx/AnrProvider.h"
 #include "veyra/gfx/AmfFrcBackend.h"
 #include "veyra/gfx/RifeDmlBackend.h"
@@ -150,6 +152,26 @@ void QmlPlayerBridge::copyDiagnostics() {
 
 // --- shell preferences (P4-f / P4-c / P4-d) --------------------------------
 QVariantMap QmlPlayerBridge::preferences() const { return impl_->prefs; }
+namespace {
+const std::filesystem::path& loginStartupExecutable() {
+    static const auto target = login_startup::executableForPlayer(wideOf(QCoreApplication::applicationFilePath()));
+    return target;
+}
+} // namespace
+
+bool QmlPlayerBridge::launchAtLogin() const {
+    const auto command = login_startup::commandFor(loginStartupExecutable());
+    return login_startup::entryStatus(HKEY_CURRENT_USER, command) == ERROR_SUCCESS;
+}
+void QmlPlayerBridge::setLaunchAtLogin(bool enabled) {
+    const auto status = login_startup::setEnabled(HKEY_CURRENT_USER, loginStartupExecutable(), enabled);
+    veyra::log::info("ui-startup", std::format("launch at login={} status={}", enabled, status));
+    if (status == ERROR_ALREADY_EXISTS)
+        emit notice(tr("Veyra 启动项已指向其他位置。请先移除原来的启动项。"), true);
+    else if (status != ERROR_SUCCESS)
+        emit notice(tr("没能更改 Windows 启动项（错误 %1）").arg(status), true);
+    emit launchAtLoginChanged();
+}
 QString QmlPlayerBridge::gpuPriorityStatus() const {
     const auto status=gfx::gpuPriorityStatus();
     const auto name=[](int priority){return priority==5?tr("实时"):priority==4?tr("高"):tr("普通");};
@@ -183,6 +205,42 @@ void QmlPlayerBridge::rememberWindowSize(int width, int height) {
     impl_->prefs[QStringLiteral("lastWindow")] = v;
     if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "last window size not saved");
 }
+namespace {
+QString displayInterfaceId(const QScreen* screen, QString* description = nullptr) {
+    if (!screen || QGuiApplication::platformName() != QLatin1String("windows")) return {};
+    // Qt's Windows backend keeps the virtual desktop origin in native pixels
+    // even when a screen's logical size is scaled.
+    const auto origin = screen->geometry().topLeft();
+    const auto monitor = MonitorFromPoint(POINT{origin.x(), origin.y()}, MONITOR_DEFAULTTONULL);
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO*>(&info)) ||
+        info.rcMonitor.left != origin.x() || info.rcMonitor.top != origin.y()) return {};
+    QString id;
+    for (DWORD index = 0; ; ++index) {
+        DISPLAY_DEVICEW device{};
+        device.cb = sizeof(device);
+        if (!EnumDisplayDevicesW(info.szDevice, index, &device, EDD_GET_DEVICE_INTERFACE_NAME)) break;
+        if (!(device.StateFlags & DISPLAY_DEVICE_ACTIVE) || !device.DeviceID[0]) continue;
+        const auto candidate = QString::fromWCharArray(device.DeviceID).toCaseFolded();
+        // Mirrored monitors share a desktop rectangle. Do not save an arbitrary
+        // physical output picked by the order of the native enumeration.
+        if (!id.isEmpty() && id != candidate) return {};
+        id = candidate;
+        if (description) *description = QString::fromWCharArray(device.DeviceString).trimmed();
+    }
+    return id;
+}
+
+QScreen* findFullscreenDisplay(const QString& id) {
+    if (id.isEmpty()) return nullptr;
+    for (auto* screen : QGuiApplication::screens()) {
+        if (displayInterfaceId(screen) == id) return screen;
+    }
+    return nullptr;
+}
+}
+
 QRect QmlPlayerBridge::screenAvailableAt(int x, int y) const {
     QScreen* screen = QGuiApplication::screenAt(QPoint(x, y));
     if (!screen) screen = QGuiApplication::primaryScreen();
@@ -193,6 +251,61 @@ QRect QmlPlayerBridge::launchScreenAvailable() const {
     return screenAvailableAt(at.x(), at.y());
 }
 
+QVariantList QmlPlayerBridge::fullscreenDisplays() const {
+    QVariantList displays;
+    for (const auto* screen : QGuiApplication::screens()) {
+        QString description;
+        const auto id = displayInterfaceId(screen, &description);
+        if (id.isEmpty()) continue;
+        // Model names can repeat. The position disambiguates the labels while
+        // the per-target Windows device interface is the saved choice.
+        const auto bounds = screen->geometry();
+        const auto size = bounds.size() * screen->devicePixelRatio();
+        auto name = screen->name();
+        if ((name.isEmpty() || name.startsWith(QStringLiteral("\\\\.\\"))) && !description.isEmpty()) name = description;
+        auto label = QStringLiteral("%1 · %2×%3 · %4 Hz · (%5, %6)")
+            .arg(name).arg(size.width()).arg(size.height()).arg(qRound(screen->refreshRate()))
+            .arg(bounds.x()).arg(bounds.y());
+        displays.append(QVariantMap{{"id", id}, {"label", std::move(label)}});
+    }
+    return displays;
+}
+
+QString QmlPlayerBridge::fullscreenDisplayId(QObject* object) const {
+    const auto* window = qobject_cast<QWindow*>(object);
+    return window ? displayInterfaceId(window->screen()) : QString{};
+}
+
+bool QmlPlayerBridge::placeFullscreenWindow(QObject* object, const QString& display, const QRect& restoreGeometry) const {
+    auto* window = qobject_cast<QWindow*>(object);
+    if (!window || window->visibility() == QWindow::FullScreen) return false;
+    const bool restoring = restoreGeometry.isValid();
+    auto* target = findFullscreenDisplay(display);
+    auto* current = window->screen();
+    if (!QGuiApplication::screens().contains(current)) current = nullptr;
+    if (!target && restoring) target = QGuiApplication::screenAt(restoreGeometry.center());
+    if (!target && restoring) target = current ? current : QGuiApplication::primaryScreen();
+    if (!target) return false;
+
+    if (current != target) {
+        // Setting a screen outside the current virtual desktop can recreate
+        // the top-level native window, dropping the existing video child.
+        if (current && !current->virtualSiblings().contains(target)) return false;
+        window->setScreen(target);
+    }
+    if (restoring) {
+        const auto area = target->availableGeometry();
+        const int width = std::min(restoreGeometry.width(), area.width());
+        const int height = std::min(restoreGeometry.height(), area.height());
+        const int x = std::clamp(restoreGeometry.x(), area.x(), area.x() + area.width() - width);
+        const int y = std::clamp(restoreGeometry.y(), area.y(), area.y() + area.height() - height);
+        window->setGeometry(x, y, width, height);
+    } else {
+        window->setPosition(target->geometry().topLeft());
+    }
+    return true;
+}
+
 bool QmlPlayerBridge::setPreference(const QString& key, const QVariant& value) {
     if(key==QLatin1String("blackmagicNativeCapture")){
         if(captureQueryBusy()){emit notice(tr("请等待采集设备查询完成后再切换接口"),true);return false;}
@@ -201,9 +314,11 @@ bool QmlPlayerBridge::setPreference(const QString& key, const QVariant& value) {
     static const QHash<QString, std::pair<int, int>> ranges{
         {"subtitleSize", {16, 56}}, {"subtitleFont", {0, 5}}, {"subtitleOutline", {0, 3}},
         {"subtitleMargin", {0, 240}}, {"subtitleLines", {0, 8}},
+        {"liveSubtitlePosition", {0, 1}}, {"liveSubtitleX", {0, 100}}, {"liveSubtitleY", {0, 100}},
         {"liveSubtitleSize", {0, 56}}, {"liveSubtitleShadow", {-1, 8}}, {"liveSubtitleLines", {0, 3}},
         // 列表模式 parameter panel width (ProPage splitter); QML clamps it to the window.
         {"listInspectorWidth", {376, 4000}},
+        {"controllerPanelWidth", {380, 520}},
         // Network sources (#48): seconds to collect before the first picture; -1 follows the buffer level.
         {"networkPrebuffer", {-1, 60}},
         {"networkTimeshift", {0, 600}},
@@ -213,13 +328,15 @@ bool QmlPlayerBridge::setPreference(const QString& key, const QVariant& value) {
         {"recordFps", {0, 240}},
         {"recordSplitSeconds", {0, 86400}},
         {"recordSplitMiB", {0, 1048576}},
+        // 设置 → 播放 → 二次编码: 0 off, 1 quarter-resolution first pass, 2 full.
+        {"recordMultipass", {0, 2}},
         {"virtualCameraFps", {0, 120}},
         {"fullscreenFrameStatsCorner", {0, 3}},
         // Instant replay (#103): seconds the buffer keeps.
         {"replaySeconds", {15, 600}}};
-    static const QStringList flags{"recordHevc", "recordAudio", "recordMic", "recordMicTrack", "replayEnabled", "subtitleEnabled", "subtitleBackground", "subtitleFit",
+    static const QStringList flags{"recordHevc", "recordCfr", "recordAudio", "recordMic", "recordMicTrack", "replayEnabled", "subtitleEnabled", "subtitleBackground", "subtitleFit",
                                    "subtitleSecondLanguage", "audioForceStereo", "captureAudioMonitor", "captureHdmiPassthrough", "holdCompare",
-                                   "magewellLowLatency", "blackmagicNativeCapture", "captureShowAllFrameRates", "cinePillHidden", "exportStopsPlayback", "obsGameCapture", "autoResume", "fullscreenMemoryProtection", "prewarmEnhancement", "hdrFgCompatibility", "computeOnMonitorGpu", "deinterlace", "networkAutoReconnect",
+                                   "magewellLowLatency", "blackmagicNativeCapture", "captureShowAllFrameRates", "cinePillHidden", "exportStopsPlayback", "obsGameCapture", "autoResume", "startFullscreen", "fullscreenMemoryProtection", "prewarmEnhancement", "hdrFgCompatibility", "computeOnMonitorGpu", "deinterlace", "networkAutoReconnect",
                                    // 设置 → 外观 → 启动动画 / 启动音乐 / 剔除遮罩（2.1.9）
                                    "introAnimation", "introMusic", "exclusionOverlay", "fullscreenFrameStats"};
     QVariant stored;
@@ -321,6 +438,10 @@ bool QmlPlayerBridge::setPreference(const QString& key, const QVariant& value) {
         const QString v = value.toString();
         if (!v.isEmpty() && std::none_of(impl_->gpuAdapters.begin(), impl_->gpuAdapters.end(), [&](const auto& a) { return a.id == v; })) return false;
         stored = v;
+    } else if (key == QLatin1String("fullscreenDisplay")) {
+        const auto id = value.toString().trimmed().toCaseFolded();
+        if (!id.isEmpty() && !findFullscreenDisplay(id)) return false;
+        stored = id;
     } else if (key == QLatin1String("windowSize")) {
         const QString v = value.toString();
         static const QStringList sizes{"1280x800", "1600x1000", "1920x1200", "last"};
@@ -361,8 +482,8 @@ void QmlPlayerBridge::applyPreference(const QString& key) {
     if(key==QLatin1String("captureAudioMonitor"))
         impl_->engine.setCaptureAudioMonitoring(impl_->prefBool("captureAudioMonitor",true));
     // The replay buffer re-arms with what a recording would use.
-    static const QStringList replayKeys{"replayEnabled", "replaySeconds", "recordBitrateMbps", "recordFps", "recordHevc",
-                                        "recordAudio", "recordMic", "recordMicDevice", "recordMicTrack"};
+    static const QStringList replayKeys{"replayEnabled", "replaySeconds", "recordBitrateMbps", "recordFps", "recordHevc", "recordCfr",
+                                        "recordAudio", "recordMic", "recordMicDevice", "recordMicTrack", "recordMultipass"};
     if (replayKeys.contains(key)) syncReplay();
     if(key==QLatin1String("hdrFgCompatibility")){
         impl_->presentation.hdrFgCompatibility=impl_->prefBool("hdrFgCompatibility",false);
@@ -375,9 +496,9 @@ void QmlPlayerBridge::applyPreference(const QString& key) {
     }
     if(key==QLatin1String("gpuPriority")){
         const auto value=impl_->prefString("gpuPriority");
-        // Unset means High (user default, 2026-11-13); saved choices stay explicit.
+        // Fresh profiles request the Realtime scheduling class.
         gfx::requestGpuPriority(value==QLatin1String("normal")?gfx::GpuPriority::Normal:
-                                value==QLatin1String("realtime")?gfx::GpuPriority::Realtime:gfx::GpuPriority::High);
+                                value==QLatin1String("high")?gfx::GpuPriority::High:gfx::GpuPriority::Realtime);
     }
     if(key==QLatin1String("overlayCompat"))updateLiveCompanionCompat();
     if(key==QLatin1String("fullscreenMemoryProtection")){impl_->engine.setFullscreenMemoryProtection(impl_->prefBool("fullscreenMemoryProtection",false));emit snapshotChanged();}
@@ -536,7 +657,8 @@ namespace {
 const QVariantMap& shortcutDefaults() {
     // Screenshot was Ctrl+S before 2026-10-27; saved custom keys are kept.
     static const QVariantMap d{{"playPause", "Space"}, {"fullscreen", "F"}, {"lock", "Ctrl+L"},
-                               {"hold", "V"}, {"screenshot", "F7"}, {"record", "F8"}, {"replay", "F9"}, {"fullscreenStats", "F10"}, {"toggleMode", "Tab"}};
+                               {"hold", "V"}, {"screenshot", "F7"}, {"record", "F8"}, {"replay", "F9"},
+                               {"fullscreenStats", "F10"}, {"playlist", "Ctrl+P"}, {"toggleMode", "Tab"}};
     return d;
 }
 }
@@ -700,7 +822,8 @@ bool QmlPlayerBridge::eventFilter(QObject* watched, QEvent* event) {
 void QmlPlayerBridge::rememberPosition(bool flush) {
     const auto& s = impl_->snapshot;
     const QString file = QString::fromStdWString(impl_->sourceLabel);
-    if (s.running && !s.image && !s.capture && s.duration > 0 && !file.isEmpty() && QFileInfo(file).isFile()) {
+    if (impl_->liveKind.isEmpty() && s.running && !s.image && !s.capture && s.duration > 0 &&
+        !file.isEmpty() && QFileInfo(file).isFile()) {
         auto positions = impl_->prefs.value("positions").toMap();
         const double at = s.position;
         if (at >= 0.5 && at < s.duration - 0.5) positions[file] = QVariantMap{{"at", at}, {"t", QDateTime::currentSecsSinceEpoch()}};

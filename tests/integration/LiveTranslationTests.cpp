@@ -167,9 +167,11 @@ void fallbackDownloadChecks(const QString& root, bool domestic, int model) {
     check(finished && loader.installed() && asr::verify(destination, model, true),
           "failed primary falls back and installs only SHA-verified pinned assets");
     const auto labels = origins.join(QStringLiteral(" | "));
+    const auto weightHost = domestic ? QStringLiteral("hf-mirror.com") : QStringLiteral("gh-proxy.com");
+    const auto weightRoute = QString::fromLatin1(selected.back().destination) + QStringLiteral(" · ") + weightHost;
     check(labels.contains(QStringLiteral("gh-proxy.com")) &&
           labels.contains(domestic ? QStringLiteral("cdn.jsdelivr.net") : QStringLiteral("raw.githubusercontent.com")) &&
-          labels.contains(domestic ? QStringLiteral("hf-mirror.com") : QStringLiteral("huggingface.co")),
+          labels.contains(weightRoute),
           "worker exposes active download hosts for runtime, VAD and weights");
     std::printf("model fallback origins %s | status %s\n", qPrintable(labels), qPrintable(loader.status()));
 }
@@ -190,6 +192,44 @@ void recognitionDownloadChecks(const QString& root, bool whisper) {
     const bool finished = QTest::qWaitFor([&] { return !asr.recognitionDownloading(); }, std::chrono::seconds(235));
     check(finished && asr.recognitionInstalled(), "download verifies and installs pinned recognition runtime and model");
     std::printf("Download state %s\n", qPrintable(asr.recognitionStatus()));
+}
+
+void pinnedArchiveChecks(const QString& root, const QUrl& fixtureBase, int model) {
+    using namespace veyra::ui;
+    if (fixtureBase.scheme() != QStringLiteral("http") || !QHostAddress(fixtureBase.host()).isLoopback()) {
+        check(false, "pinned archive fixture uses a loopback HTTP server");
+        return;
+    }
+    const auto pinned = asr::assets(model);
+    std::vector<ModelAsset> manifest(pinned.begin(), pinned.end());
+    std::vector<QByteArray> urls;
+    urls.reserve(manifest.size());
+    for (auto& asset : manifest) {
+        const QUrl upstream(QString::fromLatin1(asset.url));
+        urls.push_back(fixtureBase.resolved(QUrl(upstream.fileName())).toEncoded());
+        asset.url = urls.back().constData();
+        asset.fallbacks = {};
+    }
+    const QString destination = asr::root(root);
+    ModelAssets loader(destination, manifest);
+    check(!loader.installed(), "pinned archive fixture has no current runtime");
+    const bool legacyInstalled = asr::verify(destination, model, false);
+    {
+        LiveTranslation beforeUpgrade(root);
+        beforeUpgrade.setRecognitionModel(model);
+        check(beforeUpgrade.recognitionInstalled() == legacyInstalled &&
+                  beforeUpgrade.recognitionRuntimeUpdateAvailable() == legacyInstalled,
+              "a complete legacy bundle stays usable and offers the runtime upgrade");
+    }
+    loader.download();
+    check(QTest::qWaitFor([&] { return !loader.downloading(); }, std::chrono::seconds(220)) &&
+          loader.installed() && asr::verify(destination, model, true),
+          "actual archive and every installed member match the pinned ASR manifest");
+    LiveTranslation afterUpgrade(root);
+    afterUpgrade.setRecognitionModel(model);
+    check(afterUpgrade.recognitionInstalled() && !afterUpgrade.recognitionRuntimeUpdateAvailable(),
+          "the new installation is ready without another runtime upgrade");
+    std::printf("Pinned archive state %s\n", qPrintable(loader.status()));
 }
 
 void audioTapChecks() {
@@ -565,6 +605,11 @@ int main(int argc, char** argv) {
     if (args.size() == 2 && args.at(1) == QStringLiteral("--asr-worker"))
         return veyra::ui::asr::runWorker(unsigned(std::clamp(qEnvironmentVariableIntValue("VEYRA_TEST_ASR_DECODE_DELAY_MS"), 0, 3000)));
     if (args.size() < 2 || !QDir().mkpath(args.at(1))) return 2;
+    if (args.size() == 5 && args[2] == QStringLiteral("--asr-pinned-archive")) {
+        const int model = args[4] == QStringLiteral("parakeet") ? veyra::ui::asr::Parakeet : veyra::ui::asr::Whisper;
+        pinnedArchiveChecks(args[1], QUrl(args[3]), model);
+        return failures ? 1 : 0;
+    }
     if (args.size() == 6 && args[2] == QStringLiteral("--asr-stress")) {
         stressChecks(args[1], args[3], std::clamp(args[4].toInt(), 15, 270), std::clamp(args[5].toInt(), 0, 3000));
         return failures ? 1 : 0;

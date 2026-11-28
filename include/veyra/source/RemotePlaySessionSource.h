@@ -4,14 +4,20 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <windows.h>
+
+namespace veyra::remoteplay { class MappedController; }
 
 namespace veyra::source {
 // Network/decoder owner keeps consuming reference pictures while the GPU is
 // busy. Only already-decoded presentation opportunities use the latest slot.
 class RemotePlaySessionSource final : public IFrameSource {
 public:
+    explicit RemotePlaySessionSource(bool wakeOnFrame = false);
     ~RemotePlaySessionSource() override { close(); }
     bool connect(RemotePlayConnectDesc desc);
     // True while the owner loop, including its reconnect retries, still runs.
@@ -20,10 +26,12 @@ public:
     bool open(const SourceOpenDesc&) override { return false; }
     const SourceInfo& info() const override { return info_; }
     SourceReadStatus read(pipeline::FramePacket&, const AVFrame**) override;
+    HANDLE frameEvent() const { return frameEvent_.get(); }
     bool seek(const pipeline::Rational&) override { return false; }
     void close() noexcept override;
     void controller(remoteplay::ControllerState state);
-    void loginPin(std::string pin);
+    void setMappedController(std::weak_ptr<remoteplay::MappedController>, bool touchpadPressOnly);
+    bool loginPin(uint64_t requestId,std::string_view pin);
     remoteplay::ControllerFeedback takeFeedback();
     remoteplay::SessionInbox::Snapshot sessionSnapshot() const;
     uint64_t skipped() const;
@@ -34,7 +42,9 @@ public:
     sink::CaptureAudioState audioState() const { return audio_.snapshot(); }
     void setAudioGain(float value) { audio_.setGain(value); }
     void setAudioSync(unsigned mode, int offset) { audio_.setSync(mode, offset); }
-    void videoPresented(double pts, int64_t host) { audio_.videoPresented(pts, host); }
+    void videoPresented(double pts, int64_t host, std::optional<int64_t> arrival) {
+        audio_.videoPresented(pts, host, arrival);
+    }
     void videoReset(bool resetAudio=true) { audio_.videoReset(resetAudio); }
 private:
     friend struct RemotePlaySessionSourceTestAccess;
@@ -42,8 +52,13 @@ private:
     void run(std::stop_token, RemotePlayConnectDesc);
     remoteplay::ControllerState takeControllerLocked(remoteplay::HostTime now);
     struct Frame { std::shared_ptr<AVFrame> frame; pipeline::FramePacket packet; SourceInfo info; };
+    struct ControllerUpdate {
+        remoteplay::HostTime stamp;
+        remoteplay::ControllerState state;
+    };
     mutable std::mutex mutex_;
     std::condition_variable ready_;
+    std::unique_ptr<void, decltype(&CloseHandle)> frameEvent_{nullptr, &CloseHandle};
     std::jthread owner_;
     std::atomic<bool> alive_{false};
     bool initialized_=false, started_=false, failed_=false;
@@ -51,11 +66,12 @@ private:
     std::shared_ptr<AVFrame> view_;
     SourceInfo info_, publishedInfo_;
     remoteplay::SessionInbox::Snapshot snapshot_;
-    std::shared_ptr<const remoteplay::SessionInbox> telemetryInbox_;
+    std::shared_ptr<remoteplay::SessionInbox> sessionInbox_;
     remoteplay::ControllerState controller_;
-    std::deque<std::pair<remoteplay::HostTime,remoteplay::ControllerState>> pendingControllers_;
+    std::weak_ptr<remoteplay::MappedController> mappedController_;
+    bool mappedPressOnly_ = false;
+    std::deque<ControllerUpdate> pendingControllers_;
     remoteplay::HostTime controllerStamp_=0;
-    std::string pin_;
     uint64_t skipped_=0;
     Rates rates_;
     RecoveryStatus recovery_;

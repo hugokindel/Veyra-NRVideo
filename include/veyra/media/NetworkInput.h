@@ -1,11 +1,12 @@
 #pragma once
 #include <atomic>
 #include <chrono>
-#include <cwctype>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <mutex>
 #include <windows.h>
+#include "veyra/media/NetworkScheme.h"
 #include "veyra/media/NetworkSettings.h"
 extern "C" {
 #include <libavformat/avformat.h>
@@ -20,18 +21,11 @@ constexpr int kProbeTimeoutMs = 30000;       // avformat_find_stream_info
 constexpr int kReadTimeoutVodMs = 20000;     // one av_read_frame / seek on a seekable source
 constexpr int kReadTimeoutLiveMs = 10000;    // one av_read_frame on a live source
 
-inline bool datagramMediaInput(std::wstring_view path) {
-    return path.size() >= 4 && (_wcsnicmp(path.data(), L"rtp:", 4) == 0 ||
-                               _wcsnicmp(path.data(), L"udp:", 4) == 0);
+inline bool httpMediaInput(std::wstring_view path) {
+    return (path.size() >= 7 && _wcsnicmp(path.data(), L"http://", 7) == 0) ||
+           (path.size() >= 8 && _wcsnicmp(path.data(), L"https://", 8) == 0);
 }
 
-inline bool networkMediaInput(std::wstring_view path) {
-    const auto colon=path.find(L':');
-    if(colon==std::wstring_view::npos||colon>5)return false;
-    std::wstring scheme(path.substr(0,colon));
-    for(auto& ch:scheme)ch=std::towlower(ch);
-    return scheme==L"http"||scheme==L"https"||scheme==L"rtsp"||datagramMediaInput(path);
-}
 // A file on a server: a UNC path (\\host\share\...) or a drive letter mapped to a
 // network share (GetDriveType == DRIVE_REMOTE). Local extended paths (\\?\C:\...)
 // are local. Implemented in DemuxSession.cpp.
@@ -43,6 +37,19 @@ bool forceDemuxSessionForTest();
 // (export, tools) pass playback=false and keep the direct file path for NAS files.
 inline bool sharedDemuxInput(std::wstring_view path, bool playback) {
     return networkMediaInput(path) || (playback && remoteMediaPath(path)) || forceDemuxSessionForTest();
+}
+
+inline int seekMediaInput(AVFormatContext& input, int64_t targetUs, int64_t startTimeUs) {
+    // In MPEG-TS the first video keyframe's DTS can precede the first PTS.
+    // Rewind the byte stream so a timestamp seek cannot skip the initial GOP.
+    if (targetUs == 0 && input.pb && (input.pb->seekable & AVIO_SEEKABLE_NORMAL) &&
+        input.iformat == av_find_input_format("mpegts")) {
+        const int64_t position = avio_seek(input.pb, 0, SEEK_SET);
+        if (position < 0) return static_cast<int>(position);
+        return avformat_flush(&input);
+    }
+    // With stream index -1 the target is in AV_TIME_BASE units.
+    return av_seek_frame(&input, -1, targetUs + startTimeUs, AVSEEK_FLAG_BACKWARD);
 }
 
 // Per-operation deadlines only on networks; immediate owner cancellation on all inputs.

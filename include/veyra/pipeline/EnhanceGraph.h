@@ -1,5 +1,6 @@
 #pragma once
 #include "veyra/engine/EffectChain.h"
+#include <atomic>
 #include <optional>
 #include "veyra/engine/BackendRecovery.h"
 #include "veyra/pipeline/ColorGradeTables.h"
@@ -7,9 +8,11 @@
 #include "veyra/pipeline/AntiAliasPass.h"
 #include "veyra/pipeline/BeautyPass.h"
 #include "veyra/pipeline/HudLock.h"
+#include "veyra/pipeline/SubtitleHold.h"
 #include "veyra/beauty/FaceTracker.h"
 #include "veyra/pipeline/NrInstance.h"
 #include "veyra/pipeline/ResolutionPlan.h"
+#include "veyra/pipeline/SmartSr.h"
 #include "veyra/pipeline/NrTemporalPass.h"
 #include "veyra/pipeline/NrHoldPass.h"
 #include "veyra/pipeline/NrReuse.h"
@@ -55,6 +58,7 @@ namespace veyra::guidance { class AmdOpticalFlow; class GpuDisOpticalFlow; }
 namespace veyra::pipeline { class VfgBackend; class VfxSrBackend; class NisScaler; }
 
 namespace veyra::gfx {
+class XessSrBackend;
 class D3D12DeviceContext;
 class CommandSlotRing;
 class FsrSrBackend;
@@ -94,6 +98,7 @@ struct EnhanceGraphDesc {
     uint32_t workHeight = 2160;
     uint32_t videoSrQuality=0;
     uint32_t dlssSrModel=0;      // engine::EnhancementSettings::dlssSrModel (DLSS SR only)
+    float fsrSrSharpness=0.0f;   // The optional SDK RCAS pass on the final FSR SR stage.
     bool enableSr = false;       // upscale source -> work extent (1:1 bypass otherwise)
     bool enableNr = true;
     bool nrBeforeSr = false;
@@ -104,10 +109,13 @@ struct EnhanceGraphDesc {
     bool validateMotion = true; // disable only in isolated legacy A/B diagnostics
     bool enableNvofStandalone = false; // run NVOF+densify per frame without FG (quality core)
     bool deferRdna3Init = false;  // Real-time previews can send base frames during worker startup.
+    bool backgroundRdna3Init = false;  // Capture preparation may wait longer off the presentation thread.
     bool noFeatures = false;     // VEYRA_NO_FEATURES: NVOF/NGX objects skipped
     bool noNgx = false;          // VEYRA_NO_NGX: core/features skipped, NVOF only
     bool hdrInput = false;       // PQ/HLG YUV ingress; SDR tone mapping unless hdrOutput.
-    unsigned captureBitDepth = 8; // SDR P010/P016 storage, independent of HDR transfer.
+    unsigned captureBitDepth = 8; // YUV storage precision, independent of HDR transfer.
+    bool p210Input = false;      // 10-bit semiplanar 4:2:2.
+    unsigned chromaHeight(unsigned lumaHeight) const { return p210Input?lumaHeight:(lumaHeight+1)/2; }
     bool wideYuvInput() const { return hdrInput || captureBitDepth > 8; }
     bool hdrOutput = false;      // HDR-preserving output; HDR10 by default, FG requires HDR10.
     engine::HdrOutputMode hdrOutputMode=engine::HdrOutputMode::Hdr10;
@@ -147,6 +155,11 @@ struct EnhanceGraphDesc {
     // (dualSrQuality) reads its reduction. Each pass has its own backend: DLSS SR,
     // FSR or any RTX Video SR family (user 2026-11-08).
     bool dualSr=false;
+    // Smart SR (engine::describeStages): a single NGX RTX Video SR detects the source's
+    // render extent. Without one, a raw frame already at the work size is copied
+    // (smartSrNativeCopy, the skip of uncompressed sources) and anything else keeps SR.
+    // smartSrBlocked: asked for, but a stage ahead of SR changes the picture.
+    bool smartSr=false,smartSrNativeCopy=false,smartSrBlocked=false;
     uint32_t firstSrWidth=0,firstSrHeight=0,dualSrQuality=engine::kDefaultVideoSrQuality;
     uint32_t finalSrQuality()const{return dualSr?dualSrQuality:videoSrQuality;}
     bool firstSrEnlarges()const{return firstSrWidth!=sourceWidth||firstSrHeight!=sourceHeight;}
@@ -159,9 +172,18 @@ struct EnhanceGraphDesc {
     bool vfgAsyncSubmission=false; // preview-only; export retains synchronous SDK verdicts
     bool vfgAutoRegulate=false;
     bool vfgFastFallback=false; // live 2X with vfgAutoRegulate: also load the next faster VFG model
-    bool hudLock=false; // Live HUD Lock (HudLock.h, from PushFPS), graph frame generation only
+    bool hudLock=false; // Live HUD Lock (HudLock.h, from PushFPS), optionally restore original pixels on every output
     engine::HudProtectMode hudProtect=engine::HudProtectMode::Off;
+    bool subtitleHold=false;
     bool dynamicHud=false;
+    bool hudAllEffects=false;
+    bool restoresHud() const {
+        if(!hudAllEffects)return false;
+        if(hudLock||dynamicHud||subtitleHold||hudProtect==engine::HudProtectMode::Center)return true;
+        for(const auto& r:engine::hudProtectRegions(hudProtect,exclusion))if(!r.empty())return true;
+        return false;
+    }
+    bool writesProtectedOutput() const { return exclusion.enabled||restoresHud(); }
     uint64_t settingsRevision=1;
     engine::FlowQuality flowQuality=engine::FlowQuality::Balanced;
     engine::OpticalFlowBackend opticalFlowBackend=engine::OpticalFlowBackend::Nvidia;
@@ -411,6 +433,13 @@ struct EnhanceGraphDesc {
             if(fixedExecutionPlan->steps[i].type==engine::EffectType::NrEnhance)return true;
         return false;
     }
+    // A plan step behind the SR step.
+    bool afterSrStep(uint32_t s) const {
+        if(!fixedExecutionPlan)return false;
+        for(uint32_t i=0;i<s&&i<fixedExecutionPlan->stepCount&&i<fixedExecutionPlan->steps.size();++i)
+            if(fixedExecutionPlan->steps[i].type==engine::EffectType::SuperResolution)return true;
+        return false;
+    }
     bool sourcePostActive() const {
         // Without a compiled plan (tiled full-resolution images) enabled
         // anti-aliasing instances follow the list chain: behind NR when NR
@@ -429,10 +458,10 @@ struct EnhanceGraphDesc {
             // List mode: the grade is fused into the input conversion; beauty and,
             // whenever NR runs, anti-aliasing follow the whole NR group
             // (compileChainExecutionPlan). Without NR anti-aliasing runs at source
-            // size right after the input conversion.
+            // size right after the input conversion, or behind SR for smart SR.
             if(type==EffectType::VideoDenoise)return PassSlot::SourcePost;
             if(type==EffectType::Color)return videoDenoiseEnabled?PassSlot::SourcePost:PassSlot::Ingress;
-            if(type==EffectType::AntiAliasing&&!afterNrStep(s))return PassSlot::SourcePost;
+            if(type==EffectType::AntiAliasing&&!afterNrStep(s)&&!afterSrStep(s))return PassSlot::SourcePost;
             return nrBeforeSr?PassSlot::PreSr:PassSlot::Tail;
         }
         if(sourcePostStep(s))return PassSlot::SourcePost;
@@ -594,7 +623,7 @@ public:
     // Two-phase initialization: the sink (swapchain allocations) must be
     // created between the two phases - static descriptor views are only
     // safe after every allocation in the process has happened.
-    bool initialize(const EnhanceGraphDesc& desc);
+    bool initialize(const EnhanceGraphDesc& desc, const std::atomic<bool>* rdna3StartupCancel=nullptr);
     // Startup preparation can use a separate allocator/fence ring on the same
     // queue. Transfer only a prepared graph whose private ring has drained.
     bool warmCapture();
@@ -741,6 +770,13 @@ public:
     ID3D12Resource* hudBackgroundMotion(unsigned slot) const;
     ID3D12Resource* hudProtectionCounters(unsigned slot) const;
     bool srEnabled() const { return srEnabled_; }
+    // Smart SR (SmartSr.h): detection on, whether a verdict has settled, the render
+    // extent SR enlarges (empty: ordinary SR path) and the last probe's verdict.
+    bool smartSrDetecting() const { return smartSrAuto_; }
+    bool smartSrSettled() const { return smartSrSettled_; }
+    bool smartSrBlocked() const { return desc_.smartSrBlocked; }
+    Extent smartSrExtent() const { return {smartSrW_,smartSrH_}; }
+    const SmartSrVerdict& smartSrVerdict() const { return smartSrVerdict_; }
     bool nrEnabled() const { return nrEnabled_ && !nrPreparing_; }
     bool nrPreparing() const { return nrPreparing_; }
     bool fgEnabled() const { return fgEnabled_; }
@@ -792,10 +828,10 @@ public:
     bool highQualityPresentation() const { return desc_.highQualityPresentation; }
     // Live HUD Lock: 0 off, 1 running, 2 asked for but its passes could not be created,
     // 3 asked for with a frame generation that presents on its own (XeSS) or none.
-    int hudLockState() const { if(!desc_.hudLock)return 0; if(hudLock_)return 1; if(!fgEnabled_||presentSinkFg())return 3; return 2; }
+    int hudLockState() const { if(!desc_.hudLock)return 0; if(hudLock_)return 1; if(!desc_.hudAllEffects&&(!fgEnabled_||presentSinkFg()))return 3; return 2; }
     int dynamicHudState() const {
         if (!desc_.dynamicHud) return 0;
-        if (!fgEnabled_ || presentSinkFg()) return 3;
+        if (!desc_.hudAllEffects && (!fgEnabled_ || presentSinkFg())) return 3;
         return hudLock_ && hudLock_->dynamicActive() ? 1 : 2;
     }
     bool xessEnabled() const { return desc_.enableFg && !desc_.noFeatures && !desc_.stillImage && desc_.frameGenerationBackend==engine::FrameGenerationBackend::XeSS; }
@@ -806,6 +842,7 @@ public:
     bool rifeEnabled() const { return desc_.enableFg && !desc_.noFeatures && !desc_.stillImage && desc_.frameGenerationBackend==engine::FrameGenerationBackend::Rife; }
     bool rifeActive() const;
     const char* fsrProviderVersion() const;
+    const char* fsrSrProviderVersion() const;
     // XeSS generates in the present sink; FSR and DLSSG generate in the graph.
     // All backends consume the same guidance motion texture.
     bool presentSinkFg() const { return xessEnabled(); }
@@ -921,8 +958,9 @@ private:
     bool initZeroAndDepthTextures();
     bool initNvof();
     Extent firstSrMotionExtent() const;
-    bool initNgxFeatures();
+    bool initNgxFeatures(const std::atomic<bool>* rdna3StartupCancel);
     bool initFsrSr();
+    bool initXessSr();
     bool initSpatialSr();
     bool initFsrFg();
     bool initVfg();
@@ -973,6 +1011,28 @@ private:
     ComPtr<ID3D12Resource> workRgba_;
     ComPtr<ID3D12Resource> videoSrInput_,videoSrOutput_;
     ComPtr<ID3D12Resource> srPrescaled_; // linear second-SR input: the double SR reduction of the first result
+    // Smart SR (SmartSr.h): probes every kSmartSrProbeInterval frames; after
+    // kSmartSrProbeStreak equal votes the render extent (smartSrW_ x smartSrH_,
+    // top-left of the source-sized srPrescaled_) follows. The descale inverts the
+    // source's own upscale (smartSrScaler_), rows into smartSrMid_ (coded, render width x
+    // source height), columns into srPrescaled_. A zero extent keeps the ordinary
+    // SR of the whole source (or the same-size copy of a raw frame).
+    bool smartSrAuto_ = false, smartSrSettled_ = false;
+    SmartSrAxis smartSrX_, smartSrY_;
+    ComPtr<ID3D12Resource> smartSrMid_;
+    uint32_t smartSrW_ = 0, smartSrH_ = 0;
+    SmartSrScaler smartSrScaler_ = SmartSrScaler::Bilinear;
+    std::vector<SmartSrAxis> smartSrProbeAxes_;  // inverse taps per candidate width, then the aligned 2x probe
+    ComPtr<ID3D12Resource> smartSrProbeReduced_, smartSrProbeStats_;
+    ComPtr<ID3D12Resource> smartSrProbeReadback_; // one probe at a time
+    bool smartSrProbePending_ = false;            // recorded, not collected yet
+    uint64_t smartSrProbeFence_ = 0;              // ring fence value that covers it (0: not known yet)
+    uint64_t smartSrProbeFrames_ = 0, smartSrProbeCount_ = 0;
+    SmartSrTarget smartSrProbeTarget_{};
+    uint32_t smartSrProbeStreak_ = 0;
+    uint32_t smartSrKeptVotes_ = 0, smartSrNoneVotes_ = 0, smartSrOtherVotes_ = 0, smartSrFlatProbes_ = 0; // since the last report
+    SmartSrVerdict smartSrVerdict_{};
+    void collectSmartSrProbe();
     ComPtr<ID3D12Resource> firstSrInput_,firstSrOutput_,firstSrLinear_;
     // Double SR temporal passes: a first DLSS SR pass takes motion in its output
     // pixels (first result), a second FSR pass in its render pixels (SR input).
@@ -1023,9 +1083,10 @@ private:
     ComPtr<ID3D12Resource> flowTex_;
     ComPtr<ID3D12Resource> depthTex_;
     ComPtr<ID3D12Resource> genFrame_[kGeneratedPoolSlots];
+    ComPtr<ID3D12Resource> hudDetectionSource_[2];
     ComPtr<ID3D12Resource> exclusionVideo_[2],exclusionScratch_,exclusionUi_[2];
     ComputePass exclusionPass_;
-    void composeExclusion(ID3D12GraphicsCommandList*,unsigned outputIndex,unsigned rawParity,bool ui,bool historyValid);
+    void composeExclusion(ID3D12GraphicsCommandList*,unsigned outputIndex,unsigned rawParity,bool ui,bool historyValid,bool newerHud=false);
     ComPtr<ID3D12Resource> fgDisable_[kGeneratedPoolSlots],fgDisableReadback_[kGeneratedPoolSlots],fgDisableInit_;
     std::array<const volatile uint8_t*,kGeneratedPoolSlots> fgDisableMapped_{};
     ComPtr<ID3D12Resource> nrZeroMotion_;
@@ -1042,7 +1103,10 @@ private:
     ComputePass amdHdrEncodePass_, amdHdrRestorePass_;
     float toneMapPeakNits_=0; // latched per graph/source; never varies with frame brightness
     ComputePass rgbPass_,hdrVideoSrPass_;
-    ComputePass srPrescalePass_,srResolvePass_; // area shrinks: double SR reduction / supersample shrink after RTX Video SR
+    ComputePass srPrescalePass_,srResolvePass_;
+    bool srResolveSrgb_ = false; // Sampling the SDR SR result decodes sRGB before filtering.
+    ComputePass smartSrPass_;                   // SmartSrReduce: descale rows / columns
+    ComputePass smartSrProbeReducePass_, smartSrProbeResidualPass_;
     ComputePass firstSrRestorePass_;
     ComputePass downsamplePass_,residualPass_,stackProtectionPass_,flowAdaptPass_;
     ComputePass flowRefinePass_,flowFillPass_,fgFlowAdaptPass_,flowClaimPass_;
@@ -1229,6 +1293,7 @@ private:
     std::unique_ptr<gfx::RifeDmlBackend> rife_;
     std::unique_ptr<HudLock> hudLock_;  // Live HUD Lock (from PushFPS)
     bool initHudLock();
+    std::unique_ptr<SubtitleHold> subtitleHold_;
     std::unique_ptr<HudProtect> hudProtect_;
     bool initHudProtect();
     void composeHudProtect(ID3D12GraphicsCommandList*,unsigned slot,unsigned parity,unsigned subframe,unsigned multiplier);
@@ -1237,6 +1302,7 @@ private:
     // Double SR first passes on DLSS SR / FSR (the final pass keeps the members above).
     std::unique_ptr<ngx::DlssSrBackend> firstDlssSrBackend_;
     std::unique_ptr<gfx::FsrSrBackend> firstFsrSrBackend_;
+    std::unique_ptr<gfx::XessSrBackend> xessSrBackend_,firstXessSrBackend_;
     // Index 0 is the optional first pass, index 1 is the final or only pass.
     std::array<std::unique_ptr<NisScaler>, 2> nisSr_;
     std::array<std::unique_ptr<gfx::AmfVideoSrBackend>, 2> amfSr_;

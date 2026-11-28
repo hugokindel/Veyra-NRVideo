@@ -8,6 +8,7 @@
 // views are created last. Per-frame execution uses the shared command slot
 // ring (NR evaluates on a fresh list - snippet constraint).
 #include "veyra/pipeline/EnhanceGraph.h"
+#include "veyra/pipeline/Lanczos2Reduce.h"
 #include "veyra/engine/ProtectionCodec.h"
 #include "HudProtect.h"
 #include "veyra/pipeline/Rdna3NrBackend.h"
@@ -24,6 +25,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <thread>
 
 #include "veyra/Log.h"
@@ -38,6 +40,7 @@
 #include "veyra/ngx/AmpereMfgUnlock.h"
 #include "veyra/ngx/NvapiArchSpoof.h"
 #include "veyra/gfx/FsrSrBackend.h"
+#include "veyra/gfx/XessSrBackend.h"
 #include "veyra/gfx/AmfVideoSrBackend.h"
 #include "NisScaler.h"
 #include "veyra/gfx/FsrFgPresenter.h"
@@ -92,8 +95,7 @@ bool vfxFirstSrPass(const EnhanceGraphDesc& d){
 unsigned vfxVideoSrPasses(const EnhanceGraphDesc& d){
     return unsigned(engine::vfxVideoSr(finalVideoSrQuality(d)))+unsigned(vfxFirstSrPass(d));
 }
-// DLSS SR and FSR are temporal: they read guidance motion, RTX Video SR does not.
-bool temporalSrQuality(uint32_t quality){return quality==0||quality==engine::kVideoSrFsr;}
+bool temporalSrQuality(uint32_t quality){return engine::temporalVideoSr(quality);}
 bool temporalSrPass(const EnhanceGraphDesc& d){
     return temporalSrQuality(finalVideoSrQuality(d))||(d.dualSr&&temporalSrQuality(d.videoSrQuality));
 }
@@ -106,6 +108,7 @@ const char* srRuntimeName(uint32_t quality){
     switch(quality){
     case 0:return "dlss";
     case engine::kVideoSrFsr:return "fsr";
+    case engine::kVideoSrXess:return "xess";
     case engine::kVideoSrNis:return "nis";
     case engine::kVideoSrAmf10:return "amf-video-sr-1.0";
     case engine::kVideoSrAmf11:return "amf-video-sr-1.1";
@@ -114,10 +117,10 @@ const char* srRuntimeName(uint32_t quality){
 }
 
 // N1 packed capture ingress helpers. Codes match pipeline::packedInputCode:
-// 1 BGR24, 2 RGB555, 3 RGB565, 4 UYVY, 5 YVYU, 6 v210, 7 RGBXLE10.
+// 1 BGR24, 2 RGB555, 3 RGB565, 4 UYVY, 5 YVYU, 6 v210, 7 RGBXLE10, 8 Y210.
 unsigned packedIngressRowBytes(uint32_t code,unsigned width){
     if(code==6)return ((width+5)/6)*16;
-    if(code==7)return width*4;
+    if(code==7||code==8)return width*4;
     return code==1?width*3:width*2;
 }
 unsigned packedIngressTexels(uint32_t code,unsigned width){
@@ -131,6 +134,7 @@ AVPixelFormat packedIngressFormat(uint32_t code){
     case 4:return AV_PIX_FMT_UYVY422;
     case 5:return AV_PIX_FMT_YVYU422;
     case 6:case 7:return AV_PIX_FMT_BGRA; // raw storage carrier, explicitly unpacked
+    case 8:return AV_PIX_FMT_Y210LE;
     default:break;
     }
     return AV_PIX_FMT_NONE;
@@ -148,6 +152,7 @@ uint8_t packedIngressLuma(const uint8_t* data,ptrdiff_t linesize,uint32_t code,u
     case 5:return p[x*2];   // YVYU: Y0 leads
     case 6:{const auto* q=p+(x/6)*16;uint32_t words[4];std::memcpy(words,q,16);
         constexpr unsigned word[]={0,1,1,2,3,3},shift[]={10,0,20,10,0,20};return uint8_t(((words[word[x%6]]>>shift[x%6])&1023)>>2);}
+    case 8:return p[x*4+1]; // high byte of the luma word
     case 7:{uint32_t word;std::memcpy(&word,p+x*4,4);const auto r=(word>>22)&1023,g=(word>>12)&1023,b=(word>>2)&1023;return uint8_t(std::min(255u,(54*r+183*g+19*b+512)>>10));}
     default:break;
     }
@@ -765,7 +770,7 @@ bool EnhanceGraph::dispatchSlotPasses(ID3D12GraphicsCommandList* list,const std:
     return true;
 }
 
-bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
+bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc, const std::atomic<bool>* rdna3StartupCancel)
 {
     fgInitResult_=0;
     driverRequirementNotice_.clear();
@@ -860,7 +865,10 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
         // Double SR runs any SR backend; the supersample shrink only RTX Video SR.
         if(!desc.enableSr||(!desc.dualSr&&!engine::rtxVideoSr(desc.videoSrQuality))){veyra::log::error("resolution","supersampled SR runs on RTX Video SR only");return false;}
     }
-    if(context_.adapter().vendorId==0x1002 && desc_.opticalFlowBackend==engine::OpticalFlowBackend::Nvidia)
+    const auto vendor=context_.adapter().vendorId;
+    const bool intelXess=vendor==0x8086&&(xessEnabled()||(desc_.enableSr&&
+        (desc_.finalSrQuality()==engine::kVideoSrXess||desc_.firstSrRuns(engine::kVideoSrXess))));
+    if((vendor==0x1002||intelXess)&&desc_.opticalFlowBackend==engine::OpticalFlowBackend::Nvidia)
         desc_.opticalFlowBackend=engine::OpticalFlowBackend::AmdFidelityFx;
     if(desc_.opticalFlowBackend==engine::OpticalFlowBackend::AmdFidelityFx&&desc.amdFlowHalfResolution){nvofW_=std::max(1u,nvofW_/2);nvofH_=std::max(1u,nvofH_/2);}
     diagnostics::DiagnosticEvent initDiagnostic;initDiagnostic.stage="initialize";initDiagnostic.identity={epoch_+1,desc.settingsRevision,0};initDiagnostic.resolution.source={srcW_,srcH_};initDiagnostic.resolution.base=initDiagnostic.resolution.fg=initDiagnostic.resolution.output={workW_,workH_};initDiagnostic.resolution.nr={nrW_,nrH_};initDiagnostic.resolution.flow={nvofW_,nvofH_};initDiagnostic.flowApplied=std::to_string(unsigned(desc.flowQuality));initDiagnostic.runtimeHash="unverified-user-replaceable";Logger::diagnosticContext(initDiagnostic);
@@ -869,6 +877,32 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
     if(!desc.videoHdr.valid()||(desc.hdrOutput&&!desc.hdrInput&&!desc.convertVideoHdr())){veyra::log::error("hdr","HDR output requires native HDR input or explicit Video HDR conversion");return false;}
     const bool videoRestore=!desc.stillImage&&desc.videoSrQuality>=1&&desc.videoSrQuality<=4;
     srEnabled_ = desc.enableSr && (srcW_ != workW_ || srcH_ != workH_ || videoRestore || srPrescaleActive() || srResolveActive());
+    // Smart SR: a single RTX Video SR (NGX) without the double SR reduction or the
+    // supersample shrink, on SDR or on HDR10 kept as HDR (SmartSrCoding per frame).
+    // The detected render extent is descaled and enlarged; until a verdict settles,
+    // and for native frames, SR keeps the whole source. HDR tone-mapped at ingest is
+    // no longer what the source's scaler enlarged.
+    smartSrAuto_=smartSrSettled_=false;smartSrX_={};smartSrY_={};smartSrW_=smartSrH_=0;smartSrProbeAxes_.clear();
+    smartSrScaler_=SmartSrScaler::Bilinear;
+    smartSrProbeFrames_=smartSrProbeCount_=0;smartSrProbeTarget_={};smartSrProbeStreak_=0;smartSrVerdict_={};
+    smartSrKeptVotes_=smartSrNoneVotes_=smartSrOtherVotes_=smartSrFlatProbes_=0;
+    if(desc.smartSrBlocked)veyra::log::info("smart-sr","not running: a stage ahead of SR changes the picture (NR, denoise, anti-aliasing or beauty)");
+    // SR has to read the converted source itself (describeStages keeps it so).
+    if(srEnabled_&&desc.smartSr&&!desc.dualSr&&!(desc.hdrInput&&!desc.hdrWorking())&&!srPrescaleActive()&&!srResolveActive()&&
+       !desc.nrBeforeSr&&!desc.sourcePostActive()&&engine::ngxVideoSr(finalVideoSrQuality(desc_))){
+        smartSrAuto_=true;
+        uint32_t candidates=0;
+        for(const uint32_t h:kSmartSrCandidates){
+            const auto e=smartSrRenderExtent({srcW_,srcH_},h);
+            smartSrProbeAxes_.push_back(e.valid()?smartSrInverseAxis(srcW_,e.width):SmartSrAxis{});
+            candidates+=e.valid();
+        }
+        const auto half=smartSrRenderExtent({srcW_,srcH_},srcH_/2);
+        smartSrProbeAxes_.push_back(half.valid()&&half.height*2==srcH_?smartSrInverseAxis(srcW_,half.width,SmartSrScaler::Aligned2x):SmartSrAxis{});
+        veyra::log::info("smart-sr",std::format("auto: {} candidate heights{}, {} rows every {} frames, source={}x{} work={}x{} coding={}; {} until {} equal verdicts",
+            candidates,smartSrProbeAxes_.back().taps.empty()?"":" and aligned 2x",kSmartSrProbeRows,kSmartSrProbeInterval,srcW_,srcH_,workW_,workH_,desc.hdrInput?"PQ (HDR10)":"sRGB",
+            desc.smartSrNativeCopy?"pass-through":"whole-source SR",kSmartSrProbeStreak));
+    }
     lmxxfNr_ = context_.adapter().vendorId == 0x1002 || desc.nrRuntime == engine::NrRuntime::LmxxfAmd;
     nrEnabled_ = desc.enableNr && !desc.noFeatures && (!desc.noNgx || lmxxfNr_);
     fgEnabled_ = desc.enableFg && !desc.noFeatures && !desc.stillImage &&
@@ -914,10 +948,10 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
     // for a single FSR pass, the largest DLSS SR / FSR input or motion extent of
     // a double SR (a first DLSS pass takes motion at its result, a second DLSS
     // pass at the work extent, a second FSR pass renders at the SR input).
-    const bool fsrSinglePass=srEnabled_&&!desc_.dualSr&&desc_.videoSrQuality==engine::kVideoSrFsr;
+    const bool lowResolutionMotionSinglePass=srEnabled_&&!desc_.dualSr&&engine::lowResolutionMotionSr(desc_.videoSrQuality);
     const bool temporalDual=srEnabled_&&desc_.dualSr&&(temporalSrQuality(desc_.videoSrQuality)||temporalSrQuality(desc_.dualSrQuality));
     fsrAuxW_=fsrAuxH_=0;
-    if(fsrSinglePass||temporalDual){
+    if(lowResolutionMotionSinglePass||temporalDual){
         fsrAuxW_=srcW_;fsrAuxH_=srcH_;
         const auto grow=[this](uint32_t w,uint32_t h){fsrAuxW_=std::max(fsrAuxW_,w);fsrAuxH_=std::max(fsrAuxH_,h);};
         if(desc_.firstSrRuns(0))grow(desc_.firstSrWidth,desc_.firstSrHeight);
@@ -930,7 +964,7 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
     const uint64_t firstSrPixels=uint64_t(desc_.firstSrWidth)*desc_.firstSrHeight;
     const uint64_t firstResultBytes=(desc_.firstSrEnlarges()||firstVideoSr)?firstSrPixels*8u:0;
     const uint64_t dualBytes=desc_.dualSr?firstResultBytes+(firstVideoSr?(firstSrPixels+uint64_t(srcW_)*srcH_)*4u:0)+
-        (desc_.dualSrQuality==engine::kVideoSrFsr?uint64_t(srInW_)*srInH_*4u:0)+
+        (engine::lowResolutionMotionSr(desc_.dualSrQuality)?uint64_t(srInW_)*srInH_*4u:0)+
         (temporalDual?uint64_t(fsrAuxW_)*fsrAuxH_*8u:0):0;
     // Supersampling keeps the larger RGBA8 SR result beside the work textures.
     const uint64_t supersampleBytes=!desc_.dualSr&&srResolveActive()?uint64_t(srOutW_)*srOutH_*4u:0;
@@ -952,7 +986,8 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
     const uint64_t dlaaBytes=dlaaPixels*(dlaaCopies*8u+dlaaInstances*(desc_.hdrWorking()?28u:20u));
     const uint64_t temporalHdrBytes=desc_.hdrWorking()&&srEnabled_?
         (temporalSrQuality(desc_.finalSrQuality())?uint64_t(workW_)*workH_*8u:0)+
-        ((desc_.firstSrRuns(0)||desc_.firstSrRuns(engine::kVideoSrFsr))?uint64_t(desc_.firstSrWidth)*desc_.firstSrHeight*8u:0):0;
+        ((desc_.firstSrRuns(0)||desc_.firstSrRuns(engine::kVideoSrFsr)||desc_.firstSrRuns(engine::kVideoSrXess))?
+            uint64_t(desc_.firstSrWidth)*desc_.firstSrHeight*8u:0):0;
     // NR inference reuse keeps one inferred chain output and input plus motion
     // at the flow extent (createNrReusePass); only a preview graph asks for it.
     const bool reuseRequested=desc_.nrReusePreview&&desc_.enableNr&&desc_.nrReuse!=engine::NrReuseMode::Off;
@@ -961,10 +996,10 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
     const unsigned outputBytes=desc_.hdrOutput&&!hdr10Output()?8u:4u;
     const auto protectRegions=engine::hudProtectRegions(desc_.hudProtect,desc_.exclusion);
     const auto hudBounds=HudProtect::regionBounds(workW_,workH_,protectRegions);
-    const bool hasHud=(fgEnabled_||presentSinkFg())&&hudBounds.right>hudBounds.left;
+    const bool hasHud=(desc_.hudAllEffects||fgEnabled_||presentSinkFg())&&hudBounds.right>hudBounds.left;
     const uint64_t hudBytes=hasHud?
         uint64_t(workW_)*workH_*(2*outputBytes+(desc_.fgUsesFlow()?4u:0u)+
-            (presentSinkFg()?(desc_.exclusion.enabled?0u:4*outputBytes):0u))+
+            (presentSinkFg()?(desc_.writesProtectedOutput()?0u:4*outputBytes):0u))+
         uint64_t(hudBounds.right-hudBounds.left)*(hudBounds.bottom-hudBounds.top)*
             (18u+(presentSinkFg()?0u:outputBytes)):0;
     const auto spatialBytes = [&](uint32_t quality, Extent input, Extent output) -> uint64_t {
@@ -981,13 +1016,13 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
         spatialBytes(desc_.finalSrQuality(), {srInW_, srInH_}, {srOutW_, srOutH_}) +
         (desc_.dualSr && desc_.firstSrEnlarges() ?
             spatialBytes(desc_.videoSrQuality, {srcW_, srcH_}, {desc_.firstSrWidth, desc_.firstSrHeight}) : 0);
-    const uint64_t estimate=hudBytes+spatialSrBytes+reuseBytes+temporalHdrBytes+dlaaBytes+vfxSrBytes+firstSrMotionBytes+dualBytes+supersampleBytes+uint64_t(workW_)*workH_*(76u+4u*generatedTextures)+vfgSharedBytes
+    const uint64_t estimate=((desc_.restoresHud()||(desc_.subtitleHold&&(fgEnabled_||presentSinkFg())))?uint64_t(workW_)*workH_*outputBytes*2:0)+hudBytes+spatialSrBytes+reuseBytes+temporalHdrBytes+dlaaBytes+vfxSrBytes+firstSrMotionBytes+dualBytes+supersampleBytes+uint64_t(workW_)*workH_*(76u+4u*generatedTextures)+vfgSharedBytes
         +nrTextureBytes+fullLayerBytes
         +uint64_t(srcW_)*srcH_*(32u+(desc_.protectionBeforeSr()?8u:0u))+temporalBytes+tailColorBytes+interProtectionBytes
         +(flowRefine_?uint64_t(nvofW_)*nvofH_*(flowConsistency_?13u:flowClaims_?18u:12u)+uint64_t(workW_)*workH_*4u:0)
         // Two real outputs + generated scratch; XeSS also holds two graph UI
         // textures and two presenter composition targets (estimated at work size).
-        +(desc_.exclusion.enabled?uint64_t(workW_)*workH_*outputBytes*(presentSinkFg()?7u:3u):0);
+        +(desc_.writesProtectedOutput()?uint64_t(workW_)*workH_*outputBytes*(presentSinkFg()?7u:3u):0);
     if(context_.videoMemoryInfo(budget,usage)){
         veyra::log::info("memory",std::format("graph lower-bound={}MiB budget={}MiB usage={}MiB; SDK allocations additional",estimate>>20,budget>>20,usage>>20));
         // Keep measured WDDM headroom for SDK-owned allocations. There is no
@@ -1000,7 +1035,8 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
         // each Video Effects instance, and each DLSS SR feature / FSR context of a
         // double SR. An estimate, not a measured SDK peak.
         const unsigned temporalModels=srEnabled_?unsigned(temporalSrQuality(finalVideoSrQuality(desc_)))+
-            unsigned(desc_.firstSrRuns(0))+unsigned(desc_.firstSrRuns(engine::kVideoSrFsr)):0u;
+            unsigned(desc_.firstSrRuns(0))+unsigned(desc_.firstSrRuns(engine::kVideoSrFsr))+
+            unsigned(desc_.firstSrRuns(engine::kVideoSrXess)):0u;
         const uint64_t srModels=std::max(1u,unsigned(vfxFinal)+unsigned(vfxFirst)+unsigned(srEnabled_&&ngxVideoSrPass(desc_))+temporalModels);
         const uint64_t stagedReserve=stagedSr?((nrEnabled_?(1024ull<<20):0)+
             (vfg?uint64_t(workW_)*workH_*128u:0)+srModels*(256ull<<20)):0;
@@ -1015,17 +1051,24 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
     lumaPitch_ = (static_cast<size_t>(srcW_)*(desc_.wideYuvInput()?2:1) + 255) & ~size_t(255);
     chromaPitch_ = lumaPitch_;
     lumaSize_ = lumaPitch_ * srcH_;
-    chromaSize_ = chromaPitch_ * ((srcH_ + 1) / 2);
+    chromaSize_ = chromaPitch_ * desc_.chromaHeight(srcH_);
     dPitch_ = (static_cast<size_t>(workW_) * 4 + 255) & ~size_t(255);
     const size_t dSize = dPitch_ * workH_;
     nv12Buf_.resize(lumaSize_ + chromaSize_);
 
     if(!gpuTimer_.initialize(context_.device(),ring_->queue()))veyra::log::warn("gpu-timestamp","GPU timing unavailable");
     if (!initHudProtect()) return false;
+    if(desc_.subtitleHold&&(fgEnabled_||presentSinkFg()||desc_.hudAllEffects)){
+        auto pass=std::make_unique<SubtitleHold>();
+        ID3D12Resource* shared[2]={hudProtect_?hudProtect_->input(0):nullptr,hudProtect_?hudProtect_->input(1):nullptr};
+        if(pass->initialize(context_.device(),workW_,workH_,outputFormat(),hdr10Output()?2u:desc_.hdrOutput?1u:0u,hudProtect_?shared:nullptr))
+            subtitleHold_=std::move(pass);
+    }
     if (!createResources()) return false;
     if (!initZeroAndDepthTextures()) return false;
     if (!initNvof()) { failedBackend_=engine::FailedBackend::OpticalFlow; return false; }
     if (!initFsrSr()) return false;
+    if (!initXessSr()) return false;
     if (!initSpatialSr()) return false;
     if (!initFsrFg()) return false;
     if (!initVfg()) return false;
@@ -1036,11 +1079,11 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
         failedBackend_=engine::FailedBackend::Nr;
         veyra::log::error("backend-recovery-test","test-only NR initialization rejection before SDK call; not a hardware failure");return false;
     }
-    if (!initNgxFeatures()) return false;
+    if (!initNgxFeatures(rdna3StartupCancel)) return false;
     failedBackend_=engine::FailedBackend::Infrastructure;
     if(desc_.hdrWorking()){
-        const bool finalTemporal=fsrSrBackend_||(srBackend_&&srBackend_->created());
-        const bool firstTemporal=firstFsrSrBackend_||(firstDlssSrBackend_&&firstDlssSrBackend_->created());
+        const bool finalTemporal=fsrSrBackend_||xessSrBackend_||(srBackend_&&srBackend_->created());
+        const bool firstTemporal=firstFsrSrBackend_||firstXessSrBackend_||(firstDlssSrBackend_&&firstDlssSrBackend_->created());
         if(finalTemporal&&!createSignedHdrRestore(srHdrRestore_,workW_,workH_))return false;
         if(firstTemporal&&!createSignedHdrRestore(firstSrHdrRestore_,desc_.firstSrWidth,desc_.firstSrHeight))return false;
     }
@@ -1086,9 +1129,9 @@ bool EnhanceGraph::createResources()
     upZeroDepth_ = makeUploadBuffer(context_.device(), dPitch_ * workH_);
     upZeroMotion_ = makeUploadBuffer(context_.device(), dPitch_ * workH_);
     lumaTex_ = makeTexture(context_.device(), srcW_, srcH_, desc_.wideYuvInput()?DXGI_FORMAT_R16_UNORM:DXGI_FORMAT_R8_UNORM, true);
-    chromaTex_ = makeTexture(context_.device(), (srcW_+1) / 2, (srcH_+1) / 2, desc_.wideYuvInput()?DXGI_FORMAT_R16G16_UNORM:DXGI_FORMAT_R8G8_UNORM, true);
+    chromaTex_ = makeTexture(context_.device(), (srcW_+1) / 2, desc_.chromaHeight(srcH_), desc_.wideYuvInput()?DXGI_FORMAT_R16G16_UNORM:DXGI_FORMAT_R8G8_UNORM, true);
     if(desc_.rgbInput||desc_.yuy2Input||desc_.packedInput){
-        if((desc_.yuy2Input||desc_.packedInput==4||desc_.packedInput==5)&&srcW_%2)return false;
+        if((desc_.yuy2Input||desc_.packedInput==4||desc_.packedInput==5||desc_.packedInput==8)&&srcW_%2)return false;
         if(desc_.rgbInput&&(desc_.yuy2Input||desc_.packedInput))return false;
         const unsigned packedWidth=desc_.packedInput?packedIngressTexels(desc_.packedInput,srcW_):desc_.yuy2Input?srcW_/2:srcW_;
         rgbPitch_=(size_t(packedWidth)*4+255)&~size_t(255);
@@ -1107,8 +1150,25 @@ bool EnhanceGraph::createResources()
     // RTX Video SR in the final pass (the only pass without double SR) reads and
     // writes RGBA8.
     if(srEnabled_&&engine::rtxVideoSr(finalVideoSrQuality(desc_))){videoSrInput_=makeTexture(context_.device(),srInW_,srInH_,DXGI_FORMAT_R8G8B8A8_UNORM,true);videoSrOutput_=makeTexture(context_.device(),srOutW_,srOutH_,DXGI_FORMAT_R8G8B8A8_UNORM,true);if(!videoSrInput_||!videoSrOutput_)return false;}
-    // Three-step SR: the linear SR input after the exact area shrink.
-    if(srEnabled_&&srPrescaleActive()&&!(srPrescaled_=makeTexture(context_.device(),srInW_,srInH_,DXGI_FORMAT_R16G16B16A16_FLOAT,true)))return false;
+    // Three-step SR: the linear SR input after Lanczos-2 AA.
+    // Smart SR keeps srIn at the source extent: its render extent is the top-left of these.
+    if(srEnabled_&&(srPrescaleActive()||smartSrAuto_)&&!(srPrescaled_=makeTexture(context_.device(),srInW_,srInH_,DXGI_FORMAT_R16G16B16A16_FLOAT,true)))return false;
+    if(smartSrAuto_&&!(smartSrMid_=makeTexture(context_.device(),srInW_,srcH_,DXGI_FORMAT_R16G16B16A16_FLOAT,true)))return false;
+    if(smartSrAuto_){
+        auto makeBuffer=[&](uint64_t bytes,D3D12_HEAP_TYPE heapType,D3D12_RESOURCE_FLAGS flags,D3D12_RESOURCE_STATES state){
+            D3D12_HEAP_PROPERTIES hp{};hp.Type=heapType;
+            D3D12_RESOURCE_DESC bd{};bd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;bd.Width=bytes;bd.Height=1;bd.DepthOrArraySize=1;
+            bd.MipLevels=1;bd.SampleDesc.Count=1;bd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;bd.Flags=flags;
+            ComPtr<ID3D12Resource> r;
+            return SUCCEEDED(context_.device()->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&bd,state,nullptr,IID_PPV_ARGS(&r)))?r:nullptr;
+        };
+        const uint64_t statsBytes=kSmartSrProbes*kSmartSrProbeRows*16;
+        smartSrProbeReduced_=makeTexture(context_.device(),srcW_,kSmartSrProbeRows,DXGI_FORMAT_R32_FLOAT,true);
+        smartSrProbeStats_=makeBuffer(statsBytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+        smartSrProbeReadback_=makeBuffer(statsBytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST);
+        smartSrProbePending_=false;smartSrProbeFence_=0;
+        if(!smartSrProbeReduced_||!smartSrProbeStats_||!smartSrProbeReadback_)return false;
+    }
     if(srEnabled_&&desc_.dualSr){
         const bool firstVideoSr=engine::rtxVideoSr(desc_.videoSrQuality);
         // A bypassed first pass can feed its input directly into the reduction.
@@ -1121,7 +1181,7 @@ bool EnhanceGraph::createResources()
             firstSrOutput_=makeTexture(context_.device(),desc_.firstSrWidth,desc_.firstSrHeight,DXGI_FORMAT_R8G8B8A8_UNORM,true);
             if(!firstSrInput_||!firstSrOutput_)return false;
         }
-        if(desc_.dualSrQuality==engine::kVideoSrFsr&&!(secondSrFlow_=makeTexture(context_.device(),srInW_,srInH_,DXGI_FORMAT_R16G16_FLOAT,true)))return false;
+        if(engine::lowResolutionMotionSr(desc_.dualSrQuality)&&!(secondSrFlow_=makeTexture(context_.device(),srInW_,srInH_,DXGI_FORMAT_R16G16_FLOAT,true)))return false;
     }
     if(const auto extent=firstSrMotionExtent();extent.valid()){
         firstSrFlow_=makeTexture(context_.device(),extent.width,extent.height,DXGI_FORMAT_R16G16_FLOAT,true);
@@ -1231,7 +1291,13 @@ bool EnhanceGraph::createResources()
     if(!createBeautyShared())return false;
     videoFrame_[0] = makeTexture(context_.device(), workW_, workH_, outputFormat(), true);
     videoFrame_[1] = makeTexture(context_.device(), workW_, workH_, outputFormat(), true);
-    if(desc_.exclusion.enabled){
+    if(desc_.restoresHud()||subtitleHold_){
+        for(auto& texture:hudDetectionSource_){
+            texture=makeTexture(context_.device(),workW_,workH_,outputFormat(),true);
+            if(!texture)return false;
+        }
+    }
+    if(desc_.writesProtectedOutput()){
         for(auto& texture:exclusionVideo_){
             texture=makeTexture(context_.device(),workW_,workH_,outputFormat(),true);
             if(!texture)return false;
@@ -1239,7 +1305,7 @@ bool EnhanceGraph::createResources()
         exclusionScratch_=makeTexture(context_.device(),workW_,workH_,outputFormat(),true);
         if(!exclusionScratch_)return false;
     }
-    if(presentSinkFg()&&(desc_.exclusion.enabled||hudProtect_)){
+    if(presentSinkFg()&&(desc_.writesProtectedOutput()||hudProtect_||subtitleHold_)){
         // The UI-only pass binds a spare UAV for the unused real output.
         if(!exclusionScratch_)exclusionScratch_=makeTexture(context_.device(),1,1,outputFormat(),true);
         if(!exclusionScratch_)return false;
@@ -1483,11 +1549,11 @@ Extent EnhanceGraph::firstSrMotionExtent() const
 {
     if(!srEnabled_)return {};
     if(desc_.firstSrRuns(0))return {desc_.firstSrWidth,desc_.firstSrHeight};
-    const bool fsrReadsSource=desc_.dualSr?desc_.firstSrRuns(engine::kVideoSrFsr):
-        desc_.videoSrQuality==engine::kVideoSrFsr;
-    // FSR expects motion vectors in render pixels. The source is the render
-    // extent for a single FSR pass or the first pass of double SR.
-    if(fsrReadsSource&&desc_.srUsesFlow()&&(nvofW_!=srcW_||nvofH_!=srcH_))return {srcW_,srcH_};
+    const bool usesSourceMotion=desc_.dualSr?
+        (desc_.firstSrRuns(engine::kVideoSrFsr)||desc_.firstSrRuns(engine::kVideoSrXess)):
+        engine::lowResolutionMotionSr(desc_.videoSrQuality);
+    // FSR and XeSS expect motion vectors in render-resolution pixels.
+    if(usesSourceMotion&&desc_.srUsesFlow()&&(nvofW_!=srcW_||nvofH_!=srcH_))return {srcW_,srcH_};
     return {};
 }
 
@@ -1743,8 +1809,32 @@ bool EnhanceGraph::initFsrSr()
     return true;
 }
 
+bool EnhanceGraph::initXessSr()
+{
+    if(!srEnabled_||desc_.noFeatures||desc_.stillImage)return true;
+    const bool final=desc_.finalSrQuality()==engine::kVideoSrXess;
+    const bool first=desc_.firstSrRuns(engine::kVideoSrXess);
+    if(!final&&!first)return true;
+    failedBackend_=engine::FailedBackend::Sr;
+    const auto create=[this](std::unique_ptr<gfx::XessSrBackend>& backend,uint32_t inW,uint32_t inH,uint32_t outW,uint32_t outH){
+        auto pending=std::make_unique<gfx::XessSrBackend>();
+        if(!pending->initialize(context_.device(),inW,inH,outW,outH))return false;
+        backend=std::move(pending);
+        return true;
+    };
+    if(final&&!create(xessSrBackend_,desc_.dualSr?srInW_:srcW_,desc_.dualSr?srInH_:srcH_,workW_,workH_))return false;
+    if(first&&!create(firstXessSrBackend_,srcW_,srcH_,desc_.firstSrWidth,desc_.firstSrHeight))return false;
+    failedBackend_=engine::FailedBackend::None;
+    return true;
+}
+
 bool EnhanceGraph::fsrActive() const { return fsrFgBackend_&&fsrFgBackend_->available(); }
 const char* EnhanceGraph::fsrProviderVersion() const { return fsrFgBackend_?fsrFgBackend_->providerVersion():""; }
+const char* EnhanceGraph::fsrSrProviderVersion() const {
+    if (fsrSrBackend_ && fsrSrBackend_->created()) return fsrSrBackend_->providerVersion();
+    if (firstFsrSrBackend_ && firstFsrSrBackend_->created()) return firstFsrSrBackend_->providerVersion();
+    return "";
+}
 bool EnhanceGraph::initFsrFg() {
     if(!fsrEnabled()||!fgEnabled_)return true;
     failedBackend_=engine::FailedBackend::Fg;
@@ -1763,21 +1853,23 @@ bool EnhanceGraph::initFsrFg() {
 // generation as it was and reports state 2.
 bool EnhanceGraph::initHudProtect() {
     hudProtect_.reset();
-    if(!fgEnabled_&&!presentSinkFg())return true;
+    if(!desc_.hudAllEffects&&!fgEnabled_&&!presentSinkFg())return true;
     const auto regions=engine::hudProtectRegions(desc_.hudProtect,desc_.exclusion);
     if(HudProtect::regionBounds(workW_,workH_,regions).right==0)return true;
     auto pass=std::make_unique<HudProtect>();
     if(!pass->initialize(context_.device(),outputFormat(),workW_,workH_,
                          hdr10Output()?2u:desc_.hdrOutput?1u:0u,regions,desc_.fgUsesFlow(),
-                         presentSinkFg()?0:kGeneratedPoolSlots)){
+                         fgEnabled_&&!presentSinkFg()?kGeneratedPoolSlots:0)){
         log::error("hud-protect","could not allocate HUD protection passes");
         return false;
     }
+    pass->setRegionFeather(desc_.exclusion.featherPixels);
     hudProtect_=std::move(pass);
     return true;
 }
 
 ID3D12Resource* EnhanceGraph::fgInput(unsigned slot) const {
+    if(subtitleHold_)return subtitleHold_->input(slot%2);
     return hudProtect_?hudProtect_->input(slot%2):unmaskedVideo(slot);
 }
 
@@ -1791,6 +1883,7 @@ ID3D12Resource* EnhanceGraph::hudProtectionCounters(unsigned slot) const {
 
 void EnhanceGraph::composeHudProtect(ID3D12GraphicsCommandList* list,unsigned slot,unsigned parity,
                                      unsigned subframe,unsigned multiplier) {
+    if(subtitleHold_)subtitleHold_->compose(list,tracker_,slot,parity,float(subframe)/multiplier);
     if(!hudProtect_)return;
     const auto stage=GpuStage(unsigned(GpuStage::HudCompose1)+subframe-1);
     gpuTimer_.mark(list,stage);
@@ -1800,10 +1893,10 @@ void EnhanceGraph::composeHudProtect(ID3D12GraphicsCommandList* list,unsigned sl
 
 bool EnhanceGraph::initHudLock() {
     hudLock_.reset();
-    if((!desc_.hudLock&&!desc_.dynamicHud)||!fgEnabled_||presentSinkFg())return true;
+    if((!desc_.hudLock&&!desc_.dynamicHud)||(!desc_.hudAllEffects&&(!fgEnabled_||presentSinkFg())))return true;
     auto pass=std::make_unique<HudLock>();
     if(!pass->initialize(context_.device(),workW_,workH_,outputFormat(),
-                         hdr10Output()?2u:desc_.hdrOutput?1u:0u,desc_.hudLock,desc_.dynamicHud)){
+                         hdr10Output()?2u:desc_.hdrOutput?1u:0u,desc_.hudLock,desc_.dynamicHud,!desc_.hudAllEffects)){
         veyra::log::error("hud-lock",std::format("Live HUD Lock unavailable at {}x{}; frame generation runs without it",workW_,workH_));
         return true;
     }
@@ -1811,7 +1904,7 @@ bool EnhanceGraph::initHudLock() {
     return true;
 }
 void EnhanceGraph::composeHudLock(ID3D12GraphicsCommandList* list,unsigned generatedSlot,unsigned heldParity,bool useNewerHud){
-    if(hudLock_&&!hudLock_->compose(list,tracker_,generatedSlot,heldParity,useNewerHud))
+    if(!desc_.hudAllEffects&&hudLock_&&!hudLock_->compose(list,tracker_,generatedSlot,heldParity,useNewerHud))
         veyra::log::warn("hud-lock",std::format("compose skipped slot={} held={}",generatedSlot,heldParity));
 }
 
@@ -1851,7 +1944,7 @@ bool EnhanceGraph::initRife()
     return true;
 }
 
-bool EnhanceGraph::initNgxFeatures()
+bool EnhanceGraph::initNgxFeatures(const std::atomic<bool>* rdna3StartupCancel)
 {
     const bool anr=fgEnabled_&&desc_.frameGenerationBackend==engine::FrameGenerationBackend::Anr;
     if(anr){
@@ -2107,9 +2200,11 @@ bool EnhanceGraph::initNgxFeatures()
                     const auto directory=std::filesystem::path(desc_.runtimeAbsPath)/L".."/L"amd-nr-rdna3";
                     const auto runtime=directory.lexically_normal();
                     const bool deferred=desc_.deferRdna3Init;
-                    const bool open=deferred?backend->openAsync(runtime,context_.device(),ring_->queue(),extent.width,extent.height,instance->model.performance):
-                        backend->open(runtime,context_.device(),ring_->queue(),extent.width,extent.height,instance->model.performance);
-                    if(!open)return false;
+                    const bool background=desc_.backgroundRdna3Init&&rdna3StartupCancel&&!deferred;
+                    const bool opened=deferred||background?
+                        backend->openAsync(runtime,context_.device(),ring_->queue(),extent.width,extent.height,instance->model.performance):
+                        backend->open(runtime,context_.device(),ring_->queue(),extent.width,extent.height,instance->model.performance,rdna3StartupCancel);
+                    if(!opened||(background&&!backend->waitForPreparation(rdna3StartupCancel)))return false;
                     nrPreparing_=deferred;
                     pendingNrEnabled_=deferred;
                     instance->amd=std::move(backend);
@@ -2469,8 +2564,8 @@ void EnhanceGraph::setNrReuseLevel(unsigned level)
 bool EnhanceGraph::createComputePasses()
 {
     std::vector<uint8_t> cs;
-    if((desc_.exclusion.enabled||exclusionUi_[0])&&(!exclusionPass_.loadShader("EffectExclusion.dxil",cs)||
-       !exclusionPass_.create(context_.device(),cs,kOutputPoolSlots*12,4,2,28,0,true)))return false;
+    if((desc_.writesProtectedOutput()||exclusionUi_[0])&&(!exclusionPass_.loadShader("EffectExclusion.dxil",cs)||
+       !exclusionPass_.create(context_.device(),cs,kOutputPoolSlots*24,10,2,36,0,true)))return false;
     for(auto& instance:additionalColorInstances_)if(instance&&!instance->createPass(context_.device()))return false;
     for(auto& instance:nodeColorInstances_)if(instance&&!instance->createPass(context_.device()))return false;
     {
@@ -2513,8 +2608,9 @@ bool EnhanceGraph::createComputePasses()
     const UINT ingressUavCount = preGradeRgba_ ? 2u : 1u;
     // extraSrvCount covers t8..t14: the five colour-grade tables plus the three
     // Dolby Vision profile 7 enhancement layer planes (luma, chroma, curve).
-    if (!yuvPass_.loadShader("YuvToLinearRgb.dxil", cs) || !yuvPass_.create(context_.device(), cs, 16, 2, ingressUavCount, 12+kColorGradeConstantCount+kDolbyVisionP5ConstantCount, 7)) return false;
-    const char* rgbShader=desc_.packedInput?"PackedCaptureToLinear.dxil":desc_.yuy2Input?"Yuy2ToLinear.dxil":"RgbToLinear.dxil";
+    if (!yuvPass_.loadShader(desc_.p210Input?"P210ToLinearRgb.dxil":"YuvToLinearRgb.dxil", cs) || !yuvPass_.create(context_.device(), cs, 16, 2, ingressUavCount, 12+kColorGradeConstantCount+kDolbyVisionP5ConstantCount, 7)) return false;
+    const char* rgbShader=desc_.packedInput==8?"Y210ToLinearRgb.dxil":
+        desc_.packedInput?"PackedCaptureToLinear.dxil":desc_.yuy2Input?"Yuy2ToLinear.dxil":"RgbToLinear.dxil";
     if((desc_.rgbInput||desc_.yuy2Input||desc_.packedInput)&&(!rgbPass_.loadShader(rgbShader,cs)||!rgbPass_.create(context_.device(),cs,12,1,ingressUavCount,(desc_.packedInput?12:8)+kColorGradeConstantCount,4)))return false;
     // Descriptor budget grows with the NR stack: encode needs one SRV+UAV pair
     // per layer, decode needs three SRVs and one UAV per layer. The base 8
@@ -2526,7 +2622,7 @@ bool EnhanceGraph::createComputePasses()
         if(!amdHdrEncodePass_.loadShader("HdrAmdNrEncode.dxil",cs)||!amdHdrEncodePass_.create(context_.device(),cs,2*nrLayerSlots,1,1))return false;
         if(!amdHdrRestorePass_.loadShader("HdrAmdNrRestore.dxil",cs)||!amdHdrRestorePass_.create(context_.device(),cs,4*nrLayerSlots,3,1))return false;
     }
-    if (!blitPass_.loadShader("ScaleBlit.dxil", cs) || !blitPass_.create(context_.device(), cs, 27, 1, 1)) return false;
+    if (!blitPass_.loadShader("ScaleBlit.dxil", cs) || !blitPass_.create(context_.device(), cs, 31, 1, 1)) return false;
     // Nv12Upload stays: frame-time CopyTextureRegion is poisoned by the
     // injected layer (SEH in NGX evaluate, r33-final3 evidence); the compute
     // upload is the proven frame-path ingestion on this system.
@@ -2534,9 +2630,19 @@ bool EnhanceGraph::createComputePasses()
     if (!densifyPass_.loadShader("NvofDensify.dxil", cs) ||
         !densifyPass_.create(context_.device(), cs, 7, 5, 2)) return false;
     if(desc_.hdrWorking()&&videoSrInput_&&(!hdrVideoSrPass_.loadShader("HdrVideoSrRestore.dxil",cs)||!hdrVideoSrPass_.create(context_.device(),cs,10,3,1)))return false;
-    // Three-step SR: NrDownsample's exact area shrink before RTX Video SR, SrResolve after it.
+    // Three-step SR: Lanczos-2 AA before and after RTX Video SR.
     if(srPrescaled_&&(!srPrescalePass_.loadShader("NrDownsample.dxil",cs)||!srPrescalePass_.create(context_.device(),cs,2,1,1)))return false;
-    if(videoSrOutput_&&srResolveActive()&&(!srResolvePass_.loadShader("SrResolve.dxil",cs)||!srResolvePass_.create(context_.device(),cs,10,3,1)))return false;
+    if(smartSrAuto_&&(!smartSrPass_.loadShader("SmartSrReduce.dxil",cs)||!smartSrPass_.create(context_.device(),cs,4,1,1,kSmartSrConstants)))return false;
+    if(smartSrAuto_&&(!smartSrProbeReducePass_.loadShader("SmartSrProbeReduce.dxil",cs)||!smartSrProbeReducePass_.create(context_.device(),cs,2,1,1,kSmartSrConstants)||
+                      !smartSrProbeResidualPass_.loadShader("SmartSrProbeResidual.dxil",cs)||!smartSrProbeResidualPass_.create(context_.device(),cs,3,2,1,16)))return false;
+    srResolveSrgb_=false;
+    if(videoSrOutput_&&srResolveActive()){
+        D3D12_FEATURE_DATA_D3D12_OPTIONS3 caps{};
+        srResolveSrgb_=!desc_.hdrWorking()&&SUCCEEDED(context_.device()->CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS3,&caps,sizeof(caps)))&&caps.CastingFullyTypedFormatSupported;
+        const char* shader = srOutW_ == 2*workW_ && srOutH_ == 2*workH_ ? "SrResolve2x.dxil" : "SrResolve.dxil";
+        if(!srResolvePass_.loadShader(shader,cs)||!srResolvePass_.create(context_.device(),cs,10,3,1))return false;
+    }
     if(firstSrInput_&&desc_.hdrWorking()&&(!firstSrRestorePass_.loadShader("HdrVideoSrRestore.dxil",cs)||!firstSrRestorePass_.create(context_.device(),cs,4,3,1)))return false;
     if (!stager_.initialize(context_.device(), 96)) {
         veyra::log::error("graph", "descriptor stager init failed");
@@ -2556,13 +2662,16 @@ bool EnhanceGraph::createViews()
 {
     bindSignedHdrRestore(firstSrHdrRestore_,srStageInput(),firstSrLinear_.Get());
     bindSignedHdrRestore(srHdrRestore_,desc_.dualSr?srPrescaled_.Get():srStageInput(),workRgba_.Get());
-    if(hudLock_||hudProtect_){
+    if(hudLock_||hudProtect_||subtitleHold_){
         ID3D12Resource* const real[2]={videoFrame_[0].Get(),videoFrame_[1].Get()};
         std::array<ID3D12Resource*,kGeneratedPoolSlots> generated{};
         for(size_t i=0;i<kGeneratedPoolSlots;++i)generated[i]=genFrame_[i].Get();
-        if(hudLock_)hudLock_->createViews(context_.device(),stager_,real,generated.data(),unsigned(generated.size()));
+        ID3D12Resource* const detection[2]={hudDetectionSource_[0]?hudDetectionSource_[0].Get():real[0],
+                                             hudDetectionSource_[1]?hudDetectionSource_[1].Get():real[1]};
+        if(subtitleHold_)subtitleHold_->createViews(context_.device(),stager_,real,generated.data(),fgEnabled_&&!presentSinkFg()?unsigned(generated.size()):0u,detection);
+        if(hudLock_)hudLock_->createViews(context_.device(),stager_,desc_.hudAllEffects?detection:real,generated.data(),fgEnabled_&&!presentSinkFg()?unsigned(generated.size()):0u);
         if(hudProtect_)hudProtect_->createViews(context_.device(),stager_,real,generated.data(),
-            desc_.fgUsesFlow()?(flowRefine_?fgBaseFlow_.Get():baseFlow_.Get()):nullptr);
+            desc_.fgUsesFlow()?(flowRefine_?fgBaseFlow_.Get():baseFlow_.Get()):nullptr,desc_.hudAllEffects?detection:real);
     }
     // Descriptor initialization is DEFAULT ON since the RAW-upload-SRV removal
     // (2026-09-06): texture SRV/UAV views keep the device alive and NVOF
@@ -2738,7 +2847,24 @@ bool EnhanceGraph::createViews()
     if(srPrescaled_){
         stagedSrv(srPrescaleInput(),DXGI_FORMAT_R16G16B16A16_FLOAT,srPrescalePass_,0);
         makeUav(context_.device(),srPrescaled_.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,cpu(srPrescalePass_,1));
+        if(smartSrAuto_){
+            // Rows: linear source -> smartSrMid_ (coded); columns: smartSrMid_ -> srPrescaled_ (linear).
+            stagedSrv(srStageInput(),DXGI_FORMAT_R16G16B16A16_FLOAT,smartSrPass_,0);
+            makeUav(context_.device(),smartSrMid_.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,cpu(smartSrPass_,1));
+            stagedSrv(smartSrMid_.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,smartSrPass_,2);
+            makeUav(context_.device(),srPrescaled_.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,cpu(smartSrPass_,3));
+        }
         stagedSrv(srPrescaled_.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,blitPass_,21);
+        if(smartSrAuto_){
+            stagedSrv(srStageInput(),DXGI_FORMAT_R16G16B16A16_FLOAT,smartSrProbeReducePass_,0);
+            makeUav(context_.device(),smartSrProbeReduced_.Get(),DXGI_FORMAT_R32_FLOAT,cpu(smartSrProbeReducePass_,1));
+            stagedSrv(srStageInput(),DXGI_FORMAT_R16G16B16A16_FLOAT,smartSrProbeResidualPass_,0);
+            stagedSrv(smartSrProbeReduced_.Get(),DXGI_FORMAT_R32_FLOAT,smartSrProbeResidualPass_,1);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC stats{};
+            stats.Format=DXGI_FORMAT_UNKNOWN;stats.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;
+            stats.Buffer.NumElements=UINT(kSmartSrProbes*kSmartSrProbeRows);stats.Buffer.StructureByteStride=16;
+            context_.device()->CreateUnorderedAccessView(smartSrProbeStats_.Get(),nullptr,&stats,cpu(smartSrProbeResidualPass_,2));
+        }
     }
     if(firstSrInput_){
         stagedSrv(srStageInput(),DXGI_FORMAT_R16G16B16A16_FLOAT,blitPass_,22);
@@ -2758,7 +2884,8 @@ bool EnhanceGraph::createViews()
         for(size_t i=0;i<3;++i){
             stagedSrv(bases[i],DXGI_FORMAT_R16G16B16A16_FLOAT,srResolvePass_,sets[i]);
             stagedSrv(videoSrInput_.Get(),DXGI_FORMAT_R8G8B8A8_UNORM,srResolvePass_,sets[i]+1);
-            stagedSrv(videoSrOutput_.Get(),DXGI_FORMAT_R8G8B8A8_UNORM,srResolvePass_,sets[i]+2);
+            const auto format=srResolveSrgb_?DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:DXGI_FORMAT_R8G8B8A8_UNORM;
+            stagedSrv(videoSrOutput_.Get(),format,srResolvePass_,sets[i]+2);
         }
         makeUav(context_.device(),workRgba_.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,cpu(srResolvePass_,3));
     }
@@ -2857,6 +2984,10 @@ bool EnhanceGraph::createViews()
         finalInput=chainSlotViews(tailPasses_,finalInput,"tail");
         tailColorOutput_=finalInput;
     }
+    for(unsigned parity=0;parity<2;++parity)if(hudDetectionSource_[parity]){
+        if(viewsTex)stagedSrv(sourceReferences_[parity].Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,blitPass_,27+parity);
+        if(viewsUav)makeUav(context_.device(),hudDetectionSource_[parity].Get(),outputFormat(),cpu(blitPass_,29+parity));
+    }
     if (viewsTex) stagedSrv(finalInput, DXGI_FORMAT_R16G16B16A16_FLOAT, blitPass_, 2);
     if (viewsUav) makeUav(context_.device(), videoFrame_[0].Get(), outputFormat(), cpu(blitPass_, 3));
     if (viewsUav) makeUav(context_.device(), videoFrame_[1].Get(), outputFormat(), cpu(blitPass_, 4));
@@ -2903,22 +3034,28 @@ bool EnhanceGraph::createViews()
         context_.device()->CreateUnorderedAccessView(confTex_.Get(), nullptr, &uc, cpu(densifyPass_, 6));
     }
     if(exclusionPass_.heap){
-        const unsigned outputs=desc_.exclusion.enabled?kOutputPoolSlots:2;
+        const unsigned outputs=desc_.writesProtectedOutput()&&fgEnabled_&&!presentSinkFg()?kOutputPoolSlots:2;
         for(unsigned output=0;output<outputs;++output){
             auto* enhanced=output<2?videoFrame_[output].Get():genFrame_[output-2].Get();
             auto* destination=output<2&&exclusionVideo_[output]?exclusionVideo_[output].Get():exclusionScratch_.Get();
             for(unsigned raw=0;raw<2;++raw){
-                const unsigned base=(output*2+raw)*6;
+                const unsigned base=(output*2+raw)*12;
                 if(viewsTex){
                     stagedSrv(enhanced,outputFormat(),exclusionPass_,base);
                     stagedSrv(sourceReferences_[raw].Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,exclusionPass_,base+1);
                     stagedSrv(videoFrame_[output<2?1-raw:raw].Get(),outputFormat(),exclusionPass_,base+2);
                     stagedSrv(hudProtect_?hudProtect_->mask(raw):nullptr,DXGI_FORMAT_R8G8B8A8_UNORM,exclusionPass_,base+3);
+                    stagedSrv(hudLock_?hudLock_->stillState():nullptr,DXGI_FORMAT_R16G16_FLOAT,exclusionPass_,base+4);
+                    stagedSrv(hudLock_?hudLock_->dynamicMask():nullptr,DXGI_FORMAT_R8_UNORM,exclusionPass_,base+5);
+                    stagedSrv(sourceReferences_[1-raw].Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,exclusionPass_,base+6);
+                    stagedSrv(hudProtect_?hudProtect_->mask(1-raw):nullptr,DXGI_FORMAT_R8G8B8A8_UNORM,exclusionPass_,base+7);
+                    stagedSrv(subtitleHold_?subtitleHold_->maskTexture(raw):nullptr,DXGI_FORMAT_R16_FLOAT,exclusionPass_,base+8);
+                    stagedSrv(subtitleHold_?subtitleHold_->maskTexture(1-raw):nullptr,DXGI_FORMAT_R16_FLOAT,exclusionPass_,base+9);
                 }
                 if(viewsUav){
                     auto* ui=exclusionUi_[raw]?exclusionUi_[raw].Get():destination;
-                    makeUav(context_.device(),destination,outputFormat(),cpu(exclusionPass_,base+4));
-                    makeUav(context_.device(),ui,outputFormat(),cpu(exclusionPass_,base+5));
+                    makeUav(context_.device(),destination,outputFormat(),cpu(exclusionPass_,base+10));
+                    makeUav(context_.device(),ui,outputFormat(),cpu(exclusionPass_,base+11));
                 }
             }
         }
@@ -3093,25 +3230,33 @@ bool EnhanceGraph::uploadElCurve(ID3D12GraphicsCommandList* list) {
 }
 
 void EnhanceGraph::composeExclusion(ID3D12GraphicsCommandList* list,unsigned output,unsigned rawParity,
-                                    bool ui,bool historyValid) {
-    if(!desc_.exclusion.enabled&&!ui)return;
+                                    bool ui,bool historyValid,bool newerHud) {
+    if(!desc_.writesProtectedOutput()&&!ui)return;
     const bool generated=output>=2;
     auto* enhanced=generated?genFrame_[output-2].Get():videoFrame_[output].Get();
     auto* destination=!generated&&exclusionVideo_[output]?exclusionVideo_[output].Get():exclusionScratch_.Get();
     auto* original=sourceReferences_[rawParity].Get();
     auto* held=videoFrame_[generated?rawParity:1-rawParity].Get();
-    const bool overlayHud=hudProtect_&&ui;
-    const unsigned flags=(ui?1u:0u)|(generated?2u:0u)|(desc_.exclusion.enabled?4u:0u)|
-                         (overlayHud?8u:0u)|(historyValid?16u:0u);
+    const bool rawHud=desc_.restoresHud();
+    const bool overlayHud=hudProtect_&&(ui||rawHud);
+    const unsigned hudParity=newerHud?1-rawParity:rawParity;
+    const unsigned flags=(ui?1u:0u)|(generated?2u:0u)|(desc_.writesProtectedOutput()?4u:0u)|
+                         (overlayHud?8u:0u)|(historyValid?16u:0u)|(rawHud?32u:0u)|(newerHud?64u:0u);
     constexpr auto read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     constexpr auto write=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     constexpr auto common=D3D12_RESOURCE_STATE_COMMON;
     tracker_.transition(list,enhanced,read);
-    if(desc_.exclusion.enabled)tracker_.transition(list,original,read);
+    if(desc_.writesProtectedOutput())tracker_.transition(list,original,read);
     if(historyValid)tracker_.transition(list,held,read);
-    if(desc_.exclusion.enabled)tracker_.transition(list,destination,write);
+    if(desc_.writesProtectedOutput())tracker_.transition(list,destination,write);
     if(ui)tracker_.transition(list,exclusionUi_[rawParity].Get(),write);
-    float constants[28]={uintBits(workW_),uintBits(workH_),desc_.exclusion.featherPixels,
+    if(overlayHud)tracker_.transition(list,hudProtect_->mask(hudParity),read);
+    if(rawHud&&newerHud)tracker_.transition(list,sourceReferences_[hudParity].Get(),read);
+    if(rawHud&&hudLock_){
+        tracker_.transition(list,hudLock_->stillState(),read);
+        if(hudLock_->dynamicMask())tracker_.transition(list,hudLock_->dynamicMask(),read);
+    }
+    float constants[36]={uintBits(workW_),uintBits(workH_),desc_.exclusion.featherPixels,
         hdr10Output()?2.f:desc_.hdrOutput?1.f:0.f,desc_.hdrOutput&&!desc_.hdrInput?203.f/80.f:1.f,
         outputDitherStep(),uintBits(flags),uintBits(engine::exclusionModes(desc_.exclusion))};
     if(desc_.exclusion.enabled){
@@ -3125,8 +3270,16 @@ void EnhanceGraph::composeExclusion(ID3D12GraphicsCommandList* list,unsigned out
         constants[24]=uintBits(b.left);constants[25]=uintBits(b.top);
         constants[26]=uintBits(b.right);constants[27]=uintBits(b.bottom);
     }
-    const auto base=(output*2+rawParity)*6;
-    exclusionPass_.bind(list,constants,gpuHandleOf(exclusionPass_,base).ptr,gpuHandleOf(exclusionPass_,base+4).ptr);
+    if(subtitleHold_&&(rawHud||ui)){
+        const auto zone=subtitleHold_->zone();
+        constants[32]=uintBits(zone.x);constants[33]=uintBits(zone.y);
+        constants[34]=uintBits(zone.x+zone.w);constants[35]=uintBits(zone.y+zone.h);
+        tracker_.transition(list,subtitleHold_->maskTexture(hudParity),read);
+    }
+    constants[28]=uintBits(rawHud&&hudLock_&&desc_.hudLock?1u:0u);
+    constants[29]=uintBits(rawHud&&hudLock_?hudLock_->dynamicCell():0u);
+    const auto base=(output*2+rawParity)*12;
+    exclusionPass_.bind(list,constants,gpuHandleOf(exclusionPass_,base).ptr,gpuHandleOf(exclusionPass_,base+10).ptr);
     list->Dispatch((workW_+15)/16,(workH_+15)/16,1);
     if(generated){
         tracker_.transition(list,destination,D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -3134,9 +3287,16 @@ void EnhanceGraph::composeExclusion(ID3D12GraphicsCommandList* list,unsigned out
         list->CopyResource(enhanced,destination);
     }
     tracker_.transition(list,enhanced,common);
-    if(desc_.exclusion.enabled){
+    if(desc_.writesProtectedOutput()){
         tracker_.transition(list,destination,common);
         tracker_.transition(list,original,common);
+    }
+    if(subtitleHold_&&(rawHud||ui))tracker_.transition(list,subtitleHold_->maskTexture(hudParity),common);
+    if(overlayHud)tracker_.transition(list,hudProtect_->mask(hudParity),common);
+    if(rawHud&&newerHud)tracker_.transition(list,sourceReferences_[hudParity].Get(),common);
+    if(rawHud&&hudLock_){
+        tracker_.transition(list,hudLock_->stillState(),common);
+        if(hudLock_->dynamicMask())tracker_.transition(list,hudLock_->dynamicMask(),common);
     }
     if(historyValid)tracker_.transition(list,held,common);
     if(ui)tracker_.transition(list,exclusionUi_[rawParity].Get(),common);
@@ -3150,7 +3310,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         std::memcpy(p7Params_, doviP7->params, sizeof(p7Params_));
         std::memcpy(p7Curve_, doviP7->curve, sizeof(p7Curve_));
     }
-    retainReferences=retainReferences||desc_.exclusion.enabled;
+    retainReferences=retainReferences||desc_.writesProtectedOutput()||bool(subtitleHold_);
     if(nrPreparing_){
         bool pending=false;
         for(auto& layer:nrInstances_){
@@ -3183,7 +3343,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         desc_.nrRuntime==engine::NrRuntime::Original&&!desc_.enableSr&&!desc_.enableFg&&
         !srEnabled_&&!fgEnabled_&&!desc_.videoHdr.enabled&&!desc_.hdrInput&&!desc_.hdrOutput&&
         !colorGradeActive()&&!tailColorActiveCount_&&!preNrColorActiveCount_&&
-        !preSrColorActiveCount_&&!interNrColorActiveCount_&&!slotPassesActive()&&!desc_.exclusion.enabled&&desc_.nrHoldStrength==0&&
+        !preSrColorActiveCount_&&!interNrColorActiveCount_&&!slotPassesActive()&&!desc_.writesProtectedOutput()&&!subtitleHold_&&desc_.nrHoldStrength==0&&
         (!hardwareSurface||!hardwareSurface->present())&&
         !GetEnvironmentVariableW(L"VEYRA_TEST_DISABLE_PAUSED_NR_RESIDUAL_REUSE",nullptr,0);
     const bool reusePausedNr=pausedEligible&&pausedNrCacheValid_&&pausedNrResidualOnly_&&
@@ -3239,7 +3399,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     }
     const bool gpuRgb=frame&&desc_.rgbInput&&frame->format==AV_PIX_FMT_D3D11&&hardwareSurface&&hardwareSurface->present();
     if(resolved.scRgb&&(!gpuRgb||resolved.transfer!=TransferFunction::Linear||resolved.primaries!=ColorPrimaries::BT709||hardwareSurface->texture->GetDesc().Format!=DXGI_FORMAT_R16G16B16A16_FLOAT))return false;
-    const bool packedHdr=desc_.packedInput==6||desc_.packedInput==7;
+    const bool packedHdr=desc_.packedInput==6||desc_.packedInput==7||desc_.packedInput==8;
     if (resolved.isHdrPath()&&(!desc_.hdrInput||(!resolved.scRgb&&desc_.rgbInput)||desc_.yuy2Input||(desc_.packedInput&&!packedHdr))) {
         veyra::log::error("graph", "HDR input requires an explicit YUV HDR contract; RGB/YUY2 HDR ingress is unsupported"); return false;
     }
@@ -3290,6 +3450,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     if (list == nullptr) { veyra::log::error("graph", "ring acquire"); return false; }
     // The ring handed this slot out after its fence: the face status it carried is ready.
     if(faceTracker_)faceTracker_->collect(slot);
+    if(smartSrAuto_)collectSmartSrProbe();
     cpuTrace.mark("acquire");
     if(!captureWarmup)gpuTimer_.frame({epoch_,desc_.settingsRevision,realFrameIndex_+1},ring_->fence());
     gpuTimer_.mark(list,GpuStage::Color);
@@ -3454,7 +3615,12 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         stager_.stageSrv(nv12Texture, &chromaSrv, yuvPass_.heap.Get(), 4 + parity * 2);
         tracker_.transition(list, nv12Texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     } else {
-        const auto uploadFormat=desc_.captureBitDepth==16?AV_PIX_FMT_P016:desc_.wideYuvInput()?AV_PIX_FMT_P010:AV_PIX_FMT_NV12;
+        const auto uploadFormat=desc_.p210Input?AV_PIX_FMT_P210LE:
+            desc_.captureBitDepth==16?AV_PIX_FMT_P016:desc_.wideYuvInput()?AV_PIX_FMT_P010:AV_PIX_FMT_NV12;
+        if(desc_.p210Input&&frame->format!=uploadFormat){
+            veyra::log::error("graph","P210 graph received a different pixel format");return false;
+        }
+        const auto chromaRows=desc_.chromaHeight(srcH_);
         const bool sameLayout=frame->format==uploadFormat;
         const unsigned sampleBytes=desc_.wideYuvInput()?2u:1u;
         const bool directUpload=sameLayout||(!desc_.wideYuvInput()&&(frame->format==AV_PIX_FMT_YUV420P||frame->format==AV_PIX_FMT_YUVJ420P));
@@ -3469,7 +3635,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             // Native semiplanar capture already matches the upload textures.
             // Copy rows once, preserving every code value and signed stride.
             const size_t rowBytes[2]={size_t(srcW_)*sampleBytes,size_t((srcW_+1)/2)*2*sampleBytes};
-            const unsigned rows[2]={srcH_,(srcH_+1)/2};
+            const unsigned rows[2]={srcH_,chromaRows};
             for(unsigned plane=0;plane<2;++plane){
                 const auto pitch=int64_t(frame->linesize[plane]);
                 if(!frame->data[plane]||uint64_t(pitch<0?-pitch:pitch)<rowBytes[plane]){
@@ -3511,7 +3677,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         analyzeLuma(sample);
         if(!directUpload){for (uint32_t y = 0; y < srcH_; ++y)
             std::memcpy(mappedLuma_[parity] + y * lumaPitch_, planes[0] + y * lumaPitch_, srcW_*(desc_.wideYuvInput()?2:1));
-        for (uint32_t y = 0; y < (srcH_+1) / 2; ++y)
+        for (uint32_t y = 0; y < chromaRows; ++y)
             std::memcpy(mappedChroma_[parity] + y * chromaPitch_, planes[1] + y * chromaPitch_, ((srcW_+1)/2)*(desc_.wideYuvInput()?4:2));}
         auto copyPlane = [&](ID3D12Resource* texture, ID3D12Resource* upload,
                              DXGI_FORMAT format, UINT width, UINT height, UINT pitch, UINT64 offset = 0) {
@@ -3528,7 +3694,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         copyPlane(lumaTex_.Get(), gpuDirectFrame?gpuDirectFrame->resource.Get():upLuma_[parity].Get(), desc_.wideYuvInput()?DXGI_FORMAT_R16_UNORM:DXGI_FORMAT_R8_UNORM,
                   srcW_, srcH_, gpuDirectFrame?gpuDirectFrame->pitch:static_cast<UINT>(lumaPitch_));
         copyPlane(chromaTex_.Get(), gpuDirectFrame?gpuDirectFrame->resource.Get():upChroma_[parity].Get(), desc_.wideYuvInput()?DXGI_FORMAT_R16G16_UNORM:DXGI_FORMAT_R8G8_UNORM,
-                  (srcW_+1)/2, (srcH_+1)/2, gpuDirectFrame?gpuDirectFrame->pitch:static_cast<UINT>(chromaPitch_), gpuDirectFrame?gpuDirectFrame->chromaOffset:0);
+                  (srcW_+1)/2, chromaRows, gpuDirectFrame?gpuDirectFrame->pitch:static_cast<UINT>(chromaPitch_), gpuDirectFrame?gpuDirectFrame->chromaOffset:0);
         tracker_.transition(list, lumaTex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         tracker_.transition(list, chromaTex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
@@ -3552,7 +3718,13 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     }else if(desc_.rgbInput||desc_.yuy2Input||desc_.packedInput){
         float c[12+kColorGradeConstantCount]={uintBits(srcW_),uintBits(srcH_),uintBits(resolved.transfer==TransferFunction::PQ?4u:resolved.transfer==TransferFunction::HLG?5u:workingTransferCode(resolved)),uintBits(resolved.range==ColorRange::Limited?1u:0u),
             resolved.range==ColorRange::Full?0.0f:1.0f,resolved.matrix==YuvMatrix::BT2020NCL?2.0f:resolved.matrix==YuvMatrix::BT601?0.0f:1.0f,resolved.primaries==ColorPrimaries::BT2020?1.0f:0.0f,uintBits(desc_.packedInput)};
-        if(desc_.packedInput){c[8]=desc_.hdrWorking()?1.f:0.f;c[9]=toneMapPeakNits_;c[10]=203.f;}
+        if(desc_.packedInput){
+            c[8]=desc_.hdrWorking()?1.f:0.f;c[9]=toneMapPeakNits_;c[10]=203.f;
+            if(desc_.packedInput==8){
+                if(resolved.range==ColorRange::Limited&&resolved.fullRangeChroma)c[4]=2.f;
+                c[11]=uintBits(unsigned(resolved.chromaLocation));
+            }
+        }
         if(grade)packColorGradeConstants(colorTables_,c+(desc_.packedInput?12:8));
         if(resolved.scRgb){c[4]=desc_.hdrWorking()?1.f:2.f;c[5]=toneMapPeakNits_;}
         rgbPass_.bind(list,c,gpuHandleOf(rgbPass_,gpuRgb?3+parity:0).ptr,gpuHandleOf(rgbPass_,1+uavSlot).ptr,gpuHandleOf(rgbPass_,8).ptr);
@@ -3632,7 +3804,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     // A beauty node restoring faces needs the same ungraded picture this frame.
     const bool beautyRestore=beautyNodesActive_&&beautyRestoreRequested();
     const bool beautyCopy=beautyOriginal_&&beautyRestore;
-    if((colorGradeActive()||desc_.exclusion.enabled)&&(retainReferences||beautyCopy)){
+    if((colorGradeActive()||desc_.writesProtectedOutput()||subtitleHold_)&&(retainReferences||beautyCopy)){
         convertInput(false,srcRgba_.Get(),0);
         tracker_.transition(list,srcRgba_.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE);
         if(retainReferences){
@@ -3747,40 +3919,121 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         }
         return true;
     };
-    // Double SR reduces the first AI result before the second pass (exact area, linear light).
+    // Smart SR coding of this frame (SmartSr.h): sRGB for SDR, PQ for HDR10; HLG and
+    // linear float sources keep the ordinary path.
+    const auto smartCoding=smartSrAuto_?smartSrCoding(desc_.hdrInput,desc_.hdrWorking(),
+        lastSourceColor_.transfer==TransferFunction::PQ,lastSourceColor_.scRgb):SmartSrCoding::None;
+    const bool smartRuns=smartCoding!=SmartSrCoding::None;
+    const uint32_t smartDomain=smartCoding==SmartSrCoding::Pq?1u:0u;
+    // Double SR reduces the first AI result in linear light before the second pass.
     auto reduceFirstSr=[&]{
         if(!srPrescaled_)return;
+        if(smartRuns&&smartSrProbeFrames_++%kSmartSrProbeInterval==0&&!smartSrProbePending_){
+            // Render detection on the linear source: per candidate, reduce the probed rows,
+            // then re-upscale and sum the residuals; the readback is collected at the start
+            // of a later frame, once the GPU has passed this one (collectSmartSrProbe).
+            tracker_.transition(list,srStageInput(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            const uint32_t rowBase=smartSrProbeRow(0,srcH_),rowSpan=srcH_*8/10;
+            for(size_t c=0;c<smartSrProbeAxes_.size();++c){
+                const auto& axis=smartSrProbeAxes_[c];
+                if(axis.taps.empty())continue;
+                tracker_.transition(list,smartSrProbeReduced_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                for(uint32_t phase=0;phase<axis.q;++phase){
+                    std::array<uint32_t,kSmartSrConstants> k{};
+                    k[0]=srcW_;k[1]=kSmartSrProbeRows;k[2]=axis.lowLength;k[3]=rowBase;k[4]=phase;k[5]=axis.q;k[6]=axis.p;k[7]=rowSpan;k[8]=smartDomain;
+                    std::memcpy(&k[12],axis.taps[phase].data(),sizeof(float)*kSmartSrTaps);
+                    smartSrProbeReducePass_.bind(list,reinterpret_cast<const float*>(k.data()),gpuHandleOf(smartSrProbeReducePass_,0).ptr,gpuHandleOf(smartSrProbeReducePass_,1).ptr);
+                    const uint32_t count=(axis.lowLength-phase+axis.q-1)/axis.q;
+                    list->Dispatch((count+63)/64,(kSmartSrProbeRows+3)/4,1);
+                }
+                tracker_.uavBarrier(list,smartSrProbeReduced_.Get());
+                tracker_.transition(list,smartSrProbeReduced_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                tracker_.transition(list,smartSrProbeStats_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                std::array<uint32_t,16> r{srcW_,kSmartSrProbeRows,axis.lowLength,rowBase,rowSpan,uint32_t(c),smartDomain,uint32_t(axis.scaler)};
+                for(size_t t=0;t<4;++t){r[8+t]=std::bit_cast<uint32_t>(float(kSmartSrAlignedEven[t]));r[12+t]=std::bit_cast<uint32_t>(float(kSmartSrAlignedOdd[t]));}
+                smartSrProbeResidualPass_.bind(list,reinterpret_cast<const float*>(r.data()),gpuHandleOf(smartSrProbeResidualPass_,0).ptr,gpuHandleOf(smartSrProbeResidualPass_,2).ptr);
+                list->Dispatch(kSmartSrProbeRows,1,1);
+            }
+            tracker_.uavBarrier(list,smartSrProbeStats_.Get());
+            tracker_.transition(list,smartSrProbeStats_.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyBufferRegion(smartSrProbeReadback_.Get(),0,smartSrProbeStats_.Get(),0,kSmartSrProbes*kSmartSrProbeRows*16);
+            smartSrProbePending_=true;smartSrProbeFence_=0;
+        }
+        if(smartSrAuto_&&(!smartSrW_||!smartRuns))return;  // no render extent: finalVideoSr reads the whole source
+        if(smartSrAuto_){
+            // Smart SR descale: rows code and invert into smartSrMid_, columns invert and
+            // decode into srPrescaled_. One dispatch per tap phase (SmartSrReduce.hlsl).
+            auto descale=[&](const SmartSrAxis& axis,bool vertical,uint32_t across,UINT srv,UINT uav){
+                for(uint32_t phase=0;phase<axis.q;++phase){
+                    std::array<uint32_t,kSmartSrConstants> c{};
+                    c[0]=axis.highLength;c[1]=across;c[2]=axis.lowLength;c[3]=vertical;c[4]=phase;c[5]=axis.q;c[6]=axis.p;c[7]=(vertical?2u:1u)|(smartDomain?4u:0u);
+                    std::memcpy(&c[12],axis.taps[phase].data(),sizeof(float)*kSmartSrTaps);
+                    smartSrPass_.bind(list,reinterpret_cast<const float*>(c.data()),gpuHandleOf(smartSrPass_,srv).ptr,gpuHandleOf(smartSrPass_,uav).ptr);
+                    const uint32_t count=(axis.lowLength-phase+axis.q-1)/axis.q;
+                    if(vertical)list->Dispatch((across+15)/16,(count+15)/16,1);else list->Dispatch((count+15)/16,(across+15)/16,1);
+                }
+            };
+            tracker_.transition(list,srStageInput(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            tracker_.transition(list,smartSrMid_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            descale(smartSrX_,false,srcH_,0,1);tracker_.uavBarrier(list,smartSrMid_.Get());
+            tracker_.transition(list,smartSrMid_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            tracker_.transition(list,srPrescaled_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            descale(smartSrY_,true,smartSrW_,2,3);tracker_.uavBarrier(list,srPrescaled_.Get());
+            tracker_.transition(list,srPrescaled_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            return;
+        }
         tracker_.transition(list,srPrescaleInput(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         tracker_.transition(list,srPrescaled_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const float down[8]={uintBits(desc_.dualSr?desc_.firstSrWidth:srcW_),uintBits(desc_.dualSr?desc_.firstSrHeight:srcH_),uintBits(srInW_),uintBits(srInH_),0,0,0,0};
-        srPrescalePass_.bind(list,down,gpuHandleOf(srPrescalePass_,0).ptr,gpuHandleOf(srPrescalePass_,1).ptr);
-        list->Dispatch((srInW_+15)/16,(srInH_+15)/16,1);tracker_.uavBarrier(list,srPrescaled_.Get());
+        const uint32_t fromW = desc_.dualSr ? desc_.firstSrWidth : srcW_;
+        const uint32_t fromH = desc_.dualSr ? desc_.firstSrHeight : srcH_;
+        recordLanczos2Reduce(list,srPrescalePass_,fromW,fromH,srInW_,srInH_,desc_.hdrWorking(),0,1);
+        tracker_.uavBarrier(list,srPrescaled_.Get());
         tracker_.transition(list,srPrescaled_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     };
     // RTX Video SR into the work texture: the single pass, or the second of a double SR.
     auto finalVideoSr=[&]()->bool{
-        const bool prescaled=srPrescaled_!=nullptr;
+        if(desc_.smartSr&&desc_.smartSrNativeCopy&&!(smartSrAuto_&&smartRuns&&smartSrW_)){
+            // Smart SR found no render extent (native, reconstructed or not settled), or cannot
+            // run on this source, in a raw frame at the work size: copy it, as such a source
+            // skips SR without smart SR.
+            tracker_.transition(list,srStageInput(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            tracker_.transition(list,workRgba_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            const float copy[8]={uintBits(srcW_),uintBits(srcH_),uintBits(workW_),uintBits(workH_),0,0,0,0};
+            blitPass_.bind(list,copy,gpuHandleOf(blitPass_,desc_.nrBeforeSr||sourcePostOutput_?18:0).ptr,gpuHandleOf(blitPass_,1).ptr);
+            list->Dispatch((workW_+15)/16,(workH_+15)/16,1);tracker_.uavBarrier(list,workRgba_.Get());
+            tracker_.transition(list,workRgba_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            return true;
+        }
+        // Smart SR reads only the detected render extent (top-left of the source-sized
+        // inputs); without one it encodes the whole source as the ordinary pass does.
+        const bool smartExtent=smartSrAuto_&&smartRuns&&smartSrW_;
+        const bool prescaled=srPrescaled_!=nullptr&&(!smartSrAuto_||smartExtent);
+        const uint32_t inW=smartExtent?smartSrW_:srInW_,inH=smartExtent?smartSrH_:srInH_;
         tracker_.transition(list,videoSrInput_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const float enc[8]={uintBits(srInW_),uintBits(srInH_),uintBits(srInW_),uintBits(srInH_),desc_.hdrWorking()?3.0f:1.0f,0,0,0};
-        blitPass_.bind(list,enc,gpuHandleOf(blitPass_,prescaled?21:desc_.nrBeforeSr||sourcePostOutput_?18:0).ptr,gpuHandleOf(blitPass_,16).ptr);list->Dispatch((srInW_+15)/16,(srInH_+15)/16,1);tracker_.uavBarrier(list,videoSrInput_.Get());
+        const float enc[8]={uintBits(inW),uintBits(inH),uintBits(inW),uintBits(inH),desc_.hdrWorking()?3.0f:1.0f,0,0,0};
+        blitPass_.bind(list,enc,gpuHandleOf(blitPass_,prescaled?21:desc_.nrBeforeSr||sourcePostOutput_?18:0).ptr,gpuHandleOf(blitPass_,16).ptr);list->Dispatch((inW+15)/16,(inH+15)/16,1);tracker_.uavBarrier(list,videoSrInput_.Get());
         tracker_.transition(list,videoSrInput_.Get(),D3D12_RESOURCE_STATE_COMMON);tracker_.transition(list,videoSrOutput_.Get(),D3D12_RESOURCE_STATE_COMMON);
         if(vfxSrBackend_){if(!runVfx(*vfxSrBackend_,videoSrInput_.Get(),videoSrOutput_.Get()))return false;}
-        else if(!videoSrBackend_->evaluate(list,videoSrInput_.Get(),videoSrOutput_.Get(),desc_.dualSr?desc_.dualSrQuality:desc_.videoSrQuality)){failedBackend_=engine::FailedBackend::Sr;return false;}
+        else if(!videoSrBackend_->evaluate(list,videoSrInput_.Get(),videoSrOutput_.Get(),desc_.dualSr?desc_.dualSrQuality:desc_.videoSrQuality,
+                                           smartSrAuto_?inW:0,smartSrAuto_?inH:0)){failedBackend_=engine::FailedBackend::Sr;return false;}
         tracker_.uavBarrier(list,videoSrOutput_.Get());tracker_.transition(list,videoSrOutput_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);tracker_.transition(list,workRgba_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // HDR restore and the resolve take the base that was encoded.
         const UINT restoreSet=prescaled?7:desc_.nrBeforeSr||sourcePostOutput_?4:0;
         if(srResolveActive()){
             tracker_.transition(list,videoSrInput_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            const float fit[8]={uintBits(srOutW_),uintBits(srOutH_),uintBits(workW_),uintBits(workH_),desc_.hdrWorking()?1.0f:0.0f,0,0,0};
-            srResolvePass_.bind(list,fit,gpuHandleOf(srResolvePass_,restoreSet).ptr,gpuHandleOf(srResolvePass_,3).ptr);
+            recordLanczos2Reduce(list,srResolvePass_,srOutW_,srOutH_,workW_,workH_,
+                                 desc_.hdrWorking(),restoreSet,3,srResolveSrgb_);
         }else{
             const float dec[8]={uintBits(workW_),uintBits(workH_),uintBits(workW_),uintBits(workH_),-1,0,0,0};
             if(desc_.hdrWorking()){
+                // Smart SR: the HDR base and the proxy input hold the render extent only.
+                const float hdrDec[8]={dec[0],dec[1],dec[2],dec[3],dec[4],smartExtent?uintBits(inW):0.0f,smartExtent?uintBits(inH):0.0f,0};
                 tracker_.transition(list,videoSrInput_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                hdrVideoSrPass_.bind(list,dec,gpuHandleOf(hdrVideoSrPass_,restoreSet).ptr,gpuHandleOf(hdrVideoSrPass_,3).ptr);
+                hdrVideoSrPass_.bind(list,hdrDec,gpuHandleOf(hdrVideoSrPass_,restoreSet).ptr,gpuHandleOf(hdrVideoSrPass_,3).ptr);
             }else blitPass_.bind(list,dec,gpuHandleOf(blitPass_,17).ptr,gpuHandleOf(blitPass_,1).ptr);
+            list->Dispatch((workW_+15)/16,(workH_+15)/16,1);
         }
-        list->Dispatch((workW_+15)/16,(workH_+15)/16,1);tracker_.uavBarrier(list,workRgba_.Get());tracker_.transition(list,workRgba_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        tracker_.uavBarrier(list,workRgba_.Get());tracker_.transition(list,workRgba_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         ++metrics_.srEvaluateCount;
         return true;
     };
@@ -4012,11 +4265,25 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         failedBackend_ = failureBeforeSr;
         return true;
     };
-    ID3D12Resource* fsrSourceMotion=nullptr;
+    ID3D12Resource* renderSrMotion=nullptr;
     if(srEnabled_&&desc_.srUsesFlow()&&haveFlow){
-        if(nvofW_==srcW_&&nvofH_==srcH_)fsrSourceMotion=flowTex_.Get();
-        else fsrSourceMotion=firstSrFlow_.Get();
+        if(nvofW_==srcW_&&nvofH_==srcH_)renderSrMotion=flowTex_.Get();
+        else renderSrMotion=firstSrFlow_.Get();
     }
+    auto runXessSr=[&](gfx::XessSrBackend& backend,ID3D12Resource* input,ID3D12Resource* motion,ID3D12Resource* output){
+        auto& restore=output==firstSrLinear_.Get()?firstSrHdrRestore_:srHdrRestore_;
+        auto* target=restore.raw?restore.raw.Get():output;
+        auto* depth=fsrSrDepth_.Get();
+        auto* vectors=motion?motion:fsrSrZeroMotion_.Get();
+        for(auto* resource:{input,vectors,depth})tracker_.transition(list,resource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        tracker_.transition(list,target,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if(!backend.evaluate(list,input,vectors,depth,target,reset||(desc_.srUsesFlow()&&!motion))){
+            failedBackend_=engine::FailedBackend::Sr;
+            return false;
+        }
+        finishTemporalOutput(list,restore,output);
+        return true;
+    };
     auto runMixedDualSr=[&]()->bool{
         gpuTimer_.mark(list,GpuStage::Sr);
         const bool validMotion=desc_.srUsesFlow()&&haveFlow;
@@ -4037,7 +4304,9 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             auto* target=restore.raw?restore.raw.Get():output;
             const bool fsrReset=reset||(desc_.srUsesFlow()&&motion==fsrSrZeroMotion_.Get());
             readable({color,motion,fsrSrDepth_.Get()});tracker_.transition(list,target,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            if(!backend.evaluate(list,color,motion,fsrSrDepth_.Get(),target,inW,inH,outW,outH,fsrReset,float(deltaMs))){
+            // Sharpening an intermediate SR result changes the next pass's input.
+            const float sharpness=first?0.0f:desc_.fsrSrSharpness;
+            if(!backend.evaluate(list,color,motion,fsrSrDepth_.Get(),target,inW,inH,outW,outH,fsrReset,float(deltaMs),sharpness)){
                 failedBackend_=engine::FailedBackend::Sr;veyra::log::error("dual-sr","FSR evaluate failed");return false;
             }
             finishTemporalOutput(list,restore,output);
@@ -4051,7 +4320,9 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             if(firstDlssSrBackend_){
                 if(!dlss(*firstDlssSrBackend_,input,validMotion?firstSrFlow_.Get():zero,firstSrLinear_.Get()))return false;
             }else if(firstFsrSrBackend_&&firstFsrSrBackend_->created()){
-                if(!fsr(*firstFsrSrBackend_,input,fsrSourceMotion?fsrSourceMotion:zero,firstSrLinear_.Get(),srcW_,srcH_,desc_.firstSrWidth,desc_.firstSrHeight))return false;
+                if(!fsr(*firstFsrSrBackend_,input,renderSrMotion?renderSrMotion:zero,firstSrLinear_.Get(),srcW_,srcH_,desc_.firstSrWidth,desc_.firstSrHeight))return false;
+            }else if(firstXessSrBackend_){
+                if(!runXessSr(*firstXessSrBackend_,input,renderSrMotion,firstSrLinear_.Get()))return false;
             }else if(nisSr_[0]||amfSr_[0]){
                 if(!runSpatialSr(0,input,firstSrLinear_.Get()))return false;
             }else{failedBackend_=engine::FailedBackend::Sr;veyra::log::error("dual-sr","first SR pass has no backend");return false;}
@@ -4066,6 +4337,8 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
                 if(!dlss(*srBackend_,srPrescaled_.Get(),validMotion?baseFlow_.Get():zero,workRgba_.Get()))return false;
             }else if(desc_.dualSrQuality==engine::kVideoSrFsr&&fsrSrBackend_&&fsrSrBackend_->created()){
                 if(!fsr(*fsrSrBackend_,srPrescaled_.Get(),validMotion?secondSrFlow_.Get():zero,workRgba_.Get(),srInW_,srInH_,workW_,workH_))return false;
+            }else if(xessSrBackend_){
+                if(!runXessSr(*xessSrBackend_,srPrescaled_.Get(),validMotion?secondSrFlow_.Get():nullptr,workRgba_.Get()))return false;
             }else if(nisSr_[1]||amfSr_[1]){
                 if(!runSpatialSr(1,srPrescaled_.Get(),workRgba_.Get()))return false;
             }else{failedBackend_=engine::FailedBackend::Sr;veyra::log::error("dual-sr","second SR pass has no backend");return false;}
@@ -4081,6 +4354,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         if(engine::spatialVideoSr(quality))return first?(nisSr_[0]||amfSr_[0]):(nisSr_[1]||amfSr_[1]);
         if(quality==0)return first?(firstDlssSrBackend_&&firstDlssSrBackend_->created()):(srBackend_&&srBackend_->created());
         if(quality==engine::kVideoSrFsr)return first?(firstFsrSrBackend_&&firstFsrSrBackend_->created()):(fsrSrBackend_&&fsrSrBackend_->created());
+        if(quality==engine::kVideoSrXess)return first?bool(firstXessSrBackend_):bool(xessSrBackend_);
         if(engine::vfxVideoSr(quality))return first?firstVfxSrBackend_!=nullptr:vfxSrBackend_!=nullptr;
         return first?(firstVideoSrBackend_||videoSrBackend_):videoSrBackend_!=nullptr;
     };
@@ -4108,18 +4382,23 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         // split-node/color output. Reading srcRgba_ here discards completed NR.
         auto* srInput=srStageInput();
         tracker_.transition(list,srInput,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        auto* srMotion=fsrSourceMotion?fsrSourceMotion:fsrSrZeroMotion_.Get();
+        auto* srMotion=renderSrMotion?renderSrMotion:fsrSrZeroMotion_.Get();
         tracker_.transition(list,srMotion,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         tracker_.transition(list,fsrSrDepth_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         auto* fsrTarget=srHdrRestore_.raw?srHdrRestore_.raw.Get():workRgba_.Get();
         tracker_.transition(list,fsrTarget,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if(!fsrSrBackend_->evaluate(list,srInput,srMotion,fsrSrDepth_.Get(),fsrTarget,
-                                    srcW_,srcH_,workW_,workH_,reset||(desc_.srUsesFlow()&&!fsrSourceMotion),float(deltaMs))){
+                                    srcW_,srcH_,workW_,workH_,reset||(desc_.srUsesFlow()&&!renderSrMotion),float(deltaMs),desc_.fsrSrSharpness)){
             failedBackend_=engine::FailedBackend::Sr;
             return false;
         }
         ++metrics_.srEvaluateCount;
         finishTemporalOutput(list,srHdrRestore_,workRgba_.Get());
+        gpuTimer_.mark(list,GpuStage::Sr,true);
+    } else if(!mixed&&srEnabled_&&xessSrBackend_){
+        gpuTimer_.mark(list,GpuStage::Sr);
+        if(!runXessSr(*xessSrBackend_,srStageInput(),renderSrMotion,workRgba_.Get()))return false;
+        ++metrics_.srEvaluateCount;
         gpuTimer_.mark(list,GpuStage::Sr,true);
     } else if(!mixed&&srEnabled_&&(videoSrBackend_||vfxSrBackend_)){
         if(!runVideoSr())return false;
@@ -4177,7 +4456,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         // Comparison references belong to this real-frame lease. Avoid the two
         // full-frame copies when comparison is disabled.
         auto retain=[&](ID3D12Resource* src,ID3D12Resource* dst){tracker_.transition(list,src,D3D12_RESOURCE_STATE_COPY_SOURCE);tracker_.transition(list,dst,D3D12_RESOURCE_STATE_COPY_DEST);list->CopyResource(dst,src);tracker_.transition(list,dst,D3D12_RESOURCE_STATE_COMMON);tracker_.transition(list,src,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);};
-        if(!colorGradeActive()&&!desc_.exclusion.enabled)retain(srcRgba_.Get(),sourceReferences_[parity].Get());
+        if(!colorGradeActive()&&!desc_.writesProtectedOutput()&&!subtitleHold_)retain(srcRgba_.Get(),sourceReferences_[parity].Get());
         if(baseReferences_[parity].Get()!=sourceReferences_[parity].Get())retain(workRgba_.Get(),baseReferences_[parity].Get());
     }
 
@@ -4269,11 +4548,10 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
                     tracker_.transition(list, layer->input(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 } else {
                     tracker_.transition(list, layer->input(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                    const float down[8] = {uintBits(sourceW), uintBits(sourceH), uintBits(nrW), uintBits(nrH), 0, 0, 0, 0};
                     const UINT layers = UINT(std::max<size_t>(1, nrInstances_.size()));
-                    downsamplePass_.bind(list, down, gpuHandleOf(downsamplePass_, 2u * UINT(layerIndex)).ptr,
-                                         gpuHandleOf(downsamplePass_, 2u * layers + 2u * UINT(layerIndex)).ptr);
-                    list->Dispatch((nrW + 15) / 16, (nrH + 15) / 16, 1);
+                    const UINT layerSlot = 2u * UINT(layerIndex);
+                    recordLanczos2Reduce(list,downsamplePass_,sourceW,sourceH,nrW,nrH,
+                                         desc_.hdrWorking(),layerSlot,2u*layers+layerSlot);
                     tracker_.uavBarrier(list, layer->input());
                     tracker_.transition(list, layer->input(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 }
@@ -4545,6 +4823,17 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         tracker_.transition(list, videoFrame_[parity].Get(), D3D12_RESOURCE_STATE_COMMON);
 
     }
+    // Detect on the original picture. Neural rendering can change a stationary glyph from one frame to the next.
+    if(hudDetectionSource_[parity]){
+        tracker_.transition(list,sourceReferences_[parity].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        tracker_.transition(list,hudDetectionSource_[parity].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const float constants[8]={uintBits(srcW_),uintBits(srcH_),uintBits(workW_),uintBits(workH_),
+            hdr10Output()?2.f:desc_.hdrOutput?0.f:1.f,0,0,0};
+        blitPass_.bind(list,constants,gpuHandleOf(blitPass_,27+parity).ptr,gpuHandleOf(blitPass_,29+parity).ptr);
+        list->Dispatch((workW_+15)/16,(workH_+15)/16,1);
+        tracker_.transition(list,hudDetectionSource_[parity].Get(),D3D12_RESOURCE_STATE_COMMON);
+        tracker_.transition(list,sourceReferences_[parity].Get(),D3D12_RESOURCE_STATE_COMMON);
+    }
     auto* fgMotion=desc_.fgMotionProbe?desc_.fgMotionProbe:
         haveFlow&&desc_.fgUsesFlow()?(flowRefine_?fgBaseFlow_.Get():baseFlow_.Get()):nrZeroMotion_.Get();
     if(hudProtect_){
@@ -4553,6 +4842,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         if(!reset&&prevValid_&&useFgFlow)
             fgMotion=hudProtect_->fixMotion(list,tracker_,gpuTimer_,parity,fgMotion);
     }
+    if(subtitleHold_)subtitleHold_->update(list,tracker_,parity,reset||!prevValid_);
     auto* fgFrame=fgInput(parity);
     if(presentSinkFg()){
         // Both the graph and present providers consume current->previous pixels.
@@ -4630,17 +4920,17 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         tracker_.transition(list,fgFrame,D3D12_RESOURCE_STATE_COMMON);
     }
     if((runFg||rifeRecordOnly)&&rife_){
-        // The span from here to the last unpack brackets RIFE's DirectML work,
-        // which runs between our lists on this same queue.
+        // Both spans include capture and the fixed preparation. DirectML
+        // runs between the producer and unpack lists on this same queue.
         if(runFg){gpuTimer_.mark(list,GpuStage::FgBatch);gpuTimer_.mark(list,GpuStage::Fg1);}
         if(resetFg)rife_->reset();
         tracker_.transition(list,fgFrame,D3D12_RESOURCE_STATE_COPY_SOURCE);
         if(!rife_->capture(list,fgFrame)){failedBackend_=engine::FailedBackend::Fg;return false;}
         tracker_.transition(list,fgFrame,D3D12_RESOURCE_STATE_COMMON);
     }
-    composeExclusion(list,parity,parity,exclusionUi_[parity]!=nullptr,!reset&&prevValid_);
     // Live HUD Lock learns from this real frame against the previous one (enhanced colours).
     if(hudLock_&&!hudLock_->update(list,tracker_,parity,!prevValid_))veyra::log::warn("hud-lock","update skipped");
+    composeExclusion(list,parity,parity,exclusionUi_[parity]!=nullptr,!reset&&prevValid_);
     if(!runFg)gpuTimer_.resolve(list);
     if (!submitGraph(slot)) return false;
     if(hudProtect_)hudProtect_->submitted(ring_->lastSignaledValue());
@@ -4663,7 +4953,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             if(!copied&&!resetFg){veyra::log::error("amf-frc","AMF returned no interpolated frame for this pair");failedBackend_=engine::FailedBackend::Fg;return false;}
             composeHudLock(flist,generatedSlot,resetFg?parity:1-parity,useNewerHud);
             if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,outputMultiplier);
-            composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true);
+            composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true,useNewerHud);
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
             gpuTimer_.mark(flist,GpuStage::Fg1,true);gpuTimer_.mark(flist,GpuStage::FgBatch,true);gpuTimer_.resolve(flist);
             if(!submitGraph(slot))return false;
@@ -4691,10 +4981,11 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             if(!rife_->copyOutput(flist,genFrame_[generatedSlot].Get(),sub,outputMultiplier)){failedBackend_=engine::FailedBackend::Fg;return false;}
             composeHudLock(flist,generatedSlot,1-parity,useNewerHud);
             if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,outputMultiplier);
-            composeExclusion(flist,generatedSlot+2,1-parity,false,true);
+            composeExclusion(flist,generatedSlot+2,1-parity,false,true,useNewerHud);
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
             const bool last=sub==fgCalls;
-            if(last){gpuTimer_.mark(flist,GpuStage::Fg1,true);gpuTimer_.mark(flist,GpuStage::FgBatch,true);gpuTimer_.resolve(flist);}
+            if(sub==1)gpuTimer_.mark(flist,GpuStage::Fg1,true);
+            if(last){gpuTimer_.mark(flist,GpuStage::FgBatch,true);gpuTimer_.resolve(flist);}
             if(!submitGraph(slot))return false;
             if(last)gpuTimer_.submitted(ring_->lastSignaledValue());
             if(previewCheckpoint&&!reset)previewCheckpoint();
@@ -4717,7 +5008,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             if(!vfgBackend_->copyOutput(flist,genFrame_[generatedSlot].Get(),generatedSlot)){failedBackend_=engine::FailedBackend::Fg;return false;}
             composeHudLock(flist,generatedSlot,resetFg?parity:1-parity,useNewerHud);
             if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,outputMultiplier);
-            composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true);
+            composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true,useNewerHud);
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
             const auto timingStage=GpuStage(unsigned(GpuStage::Fg1)+sub-1);gpuTimer_.mark(flist,timingStage,true);
             if(sub<fgCalls)gpuTimer_.mark(flist,GpuStage(unsigned(GpuStage::Fg1)+sub));
@@ -4780,7 +5071,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
                 failedBackend_=engine::FailedBackend::Fg;return false;
             }
         }else if(!fgBackend_->evaluate(flist,ngxParams_,fe,st)){failedBackend_=engine::FailedBackend::Fg;return false;}
-        if((desc_.exclusion.enabled||hudProtect_||hudLock_)&&desc_.frameGenerationBackend==engine::FrameGenerationBackend::Anr){
+        if((desc_.writesProtectedOutput()||hudProtect_||hudLock_||subtitleHold_)&&desc_.frameGenerationBackend==engine::FrameGenerationBackend::Anr){
             // ANR's Vulkan bridge fulfills the recorded evaluation when this
             // list is submitted. Post-generation composition in the same list
             // runs before that output exists and is then overwritten. Submit
@@ -4801,7 +5092,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         }
         composeHudLock(flist,generatedSlot,resetFg?parity:1-parity,useNewerHud);
         if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,outputMultiplier);
-        composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true);
+        composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true,useNewerHud);
         tracker_.transition(flist,fgFrame,D3D12_RESOURCE_STATE_COMMON);
         tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
         tracker_.transition(flist,depthTex_.Get(),D3D12_RESOURCE_STATE_COMMON);
@@ -4977,8 +5268,9 @@ bool EnhanceGraph::applySettings(const engine::EnhancementSettings& s){
     // Output stabiliser: its pass is allocated at build time, so on/off rebuilds; strength and
     // tolerance are uniforms. Neither used to reach a running graph (field report
     // 2026-10-01: switching it on mid-play did nothing until something else rebuilt).
-    if(s.exclusion.enabled!=desc_.exclusion.enabled)return false;
-    if((fgEnabled_||presentSinkFg())&&engine::hudProtectRegions(s.hudProtect,s.exclusion)!=
+    if(s.subtitleHold!=desc_.subtitleHold||s.hudAllEffects!=desc_.hudAllEffects||s.exclusion.enabled!=desc_.exclusion.enabled)return false;
+    if(desc_.hudAllEffects&&(s.hudLock!=desc_.hudLock||s.dynamicHud!=desc_.dynamicHud))return false;
+    if((desc_.hudAllEffects||fgEnabled_||presentSinkFg())&&engine::hudProtectRegions(s.hudProtect,s.exclusion)!=
         engine::hudProtectRegions(desc_.hudProtect,desc_.exclusion))return false;
     if((s.nrHoldStrength>0.0f)!=(desc_.nrHoldStrength>0.0f))return false;
     // NR inference reuse: a preview graph allocates its pass only when built
@@ -5029,10 +5321,12 @@ bool EnhanceGraph::applySettings(const engine::EnhancementSettings& s){
     desc_.antiAlias=nextNr.antiAlias;
     for(size_t i=0;i<antiAliasPasses_.size();++i)if(antiAliasPasses_[i])antiAliasPasses_[i]->refresh(desc_.antiAlias[i]);
     desc_.videoDenoise=s.videoDenoise;
+    desc_.fsrSrSharpness=float(s.fsrSrSharpness)*0.01f;
     desc_.beauty=nextNr.beauty;desc_.beautyDetection=nextNr.beautyDetection;
     for(size_t i=0;i<beautyPasses_.size();++i)if(beautyPasses_[i])beautyPasses_[i]->refresh(desc_.beauty[i]);
     if(faceTracker_)faceTracker_->configure(desc_.beautyDetection,beautyMinConfidence());
     desc_.contentRate=s.content;desc_.model=s.model;desc_.residual=s.residual;desc_.protection=s.protection;desc_.exclusion=s.exclusion;desc_.hudProtect=s.hudProtect;desc_.settingsRevision=s.revision;
+    if(hudProtect_)hudProtect_->setRegionFeather(s.exclusion.featherPixels);
     desc_.nrHoldStrength=s.nrHoldStrength;desc_.nrHoldTolerance=s.nrHoldTolerance;
     if(desc_.nrReusePreview&&s.nr){
         const auto previousReuse=desc_.nrReuse;desc_.nrReuse=s.nrReuse;
@@ -5140,6 +5434,76 @@ ID3D12Resource* EnhanceGraph::generatedFrameResource(uint32_t slot) const
 // The NVOF out-fence drain must ALREADY have happened (caller), while the
 // ring and fences were alive.
 // ---------------------------------------------------------------------------
+// The ring handed this slot out after its fence, so a probe it carried is complete.
+void EnhanceGraph::collectSmartSrProbe(){
+    if(!smartSrProbePending_)return;
+    // Called at the start of a frame. The list that holds the probe need not be its frame's
+    // first one (optical flow, NR and the Video Effects SR split a frame over several ring
+    // slots), so a ring slot coming round does not tell when it ran. Everything signaled by
+    // the start of a later frame includes it; until the GPU is past that nothing waits.
+    if(!smartSrProbeFence_)smartSrProbeFence_=ring_->lastSignaledValue();
+    if(ring_->fence()->GetCompletedValue()<smartSrProbeFence_)return;
+    smartSrProbePending_=false;smartSrProbeFence_=0;
+    constexpr size_t n=kSmartSrCandidates.size();
+    std::vector<float> stats(kSmartSrProbes*kSmartSrProbeRows*4);
+    void* mapped=nullptr;const D3D12_RANGE range{0,stats.size()*sizeof(float)};
+    if(FAILED(smartSrProbeReadback_->Map(0,&range,&mapped))||!mapped)return;
+    std::memcpy(stats.data(),mapped,range.End);
+    const D3D12_RANGE none{0,0};smartSrProbeReadback_->Unmap(0,&none);
+    // Row energy (mean removed) from the first candidate that ran; every candidate sums the same luma.
+    const auto first=std::find_if(smartSrProbeAxes_.begin(),smartSrProbeAxes_.end(),[](const auto& a){return !a.taps.empty();});
+    if(first==smartSrProbeAxes_.end())return;
+    const size_t c0=size_t(first-smartSrProbeAxes_.begin());
+    double energy=0.0;
+    for(uint32_t r=0;r<kSmartSrProbeRows;++r){
+        const float* s=&stats[(c0*kSmartSrProbeRows+r)*4];
+        energy+=std::max(0.0,double(s[2])-double(s[1])*double(s[1])/double(srcW_));
+    }
+    // Field evidence: one line per kSmartSrReportProbes probes, whatever they found.
+    const auto report=[&]{
+        if(++smartSrProbeCount_%kSmartSrReportProbes)return;
+        veyra::log::info("smart-sr",std::format("probes {}: in use={} kept={} none={} other={} flat={}; last fit={}{} knee x{:.1f} notch x{:.1f}",
+            smartSrProbeCount_,smartSrH_,smartSrKeptVotes_,smartSrNoneVotes_,smartSrOtherVotes_,smartSrFlatProbes_,
+            smartSrVerdict_.fit,smartSrVerdict_.scaler==SmartSrScaler::Aligned2x?" aligned 2x":"",smartSrVerdict_.knee,smartSrVerdict_.notch));
+        smartSrKeptVotes_=smartSrNoneVotes_=smartSrOtherVotes_=smartSrFlatProbes_=0;
+    };
+    // An almost flat frame (black, a fade, a loading screen) is no evidence either way:
+    // the extent stays as it is.
+    if(energy<kSmartSrMinDeviation*kSmartSrMinDeviation*double(kSmartSrProbeRows)*double(srcW_)){++smartSrFlatProbes_;report();return;}
+    const auto errorOf=[&](size_t c){
+        double residual=0.0;
+        for(uint32_t r=0;r<kSmartSrProbeRows;++r)residual+=stats[(c*kSmartSrProbeRows+r)*4];
+        return smartSrProbeAxes_[c].taps.empty()?std::numeric_limits<double>::quiet_NaN():residual/energy;
+    };
+    std::array<double,n> errors{};
+    for(size_t c=0;c<n;++c)errors[c]=errorOf(c);
+    smartSrVerdict_=smartSrDecide(errors,errorOf(kSmartSrAlignedProbe),srcH_/2);
+    // Only a spatial upscale is re-rendered; native and reconstructed frames keep the ordinary
+    // SR. A weak fit at the height in use (a dark picture) counts for it.
+    const SmartSrTarget current{smartSrH_,smartSrScaler_},target=smartSrVote(smartSrVerdict_,current);
+    ++(!target.height?smartSrNoneVotes_:target==current?smartSrKeptVotes_:smartSrOtherVotes_);
+    report();
+    smartSrProbeStreak_=target==smartSrProbeTarget_?smartSrProbeStreak_+1:1;
+    smartSrProbeTarget_=target;
+    if(smartSrProbeStreak_!=smartSrVotesNeeded(target,current))return;  // act, and log, once per settled verdict
+    smartSrSettled_=true;
+    if(target!=current){
+        smartSrW_=smartSrH_=0;smartSrScaler_=SmartSrScaler::Bilinear;
+        if(target.height){
+            const auto e=smartSrRenderExtent({srcW_,srcH_},target.height);
+            auto x=smartSrInverseAxis(srcW_,e.width,target.scaler),y=smartSrInverseAxis(srcH_,e.height,target.scaler);
+            // RTX Video SR enlarges up to 4x: a render extent further below the work size keeps the ordinary path.
+            const bool enlargeable=uint64_t(e.width)*4>=workW_&&uint64_t(e.height)*4>=workH_;
+            if(x.q&&y.q&&x.q<=kSmartSrMaxPhases&&y.q<=kSmartSrMaxPhases&&enlargeable){
+                smartSrX_=std::move(x);smartSrY_=std::move(y);smartSrW_=e.width;smartSrH_=e.height;smartSrScaler_=target.scaler;
+            }
+        }
+    }
+    veyra::log::info("smart-sr",std::format("auto: {} (knee x{:.1f} notch x{:.1f}, {} equal probes)",
+        smartSrW_?std::format("render {}x{}{}",smartSrW_,smartSrH_,smartSrScaler_==SmartSrScaler::Aligned2x?" aligned 2x":""):std::string(desc_.smartSrNativeCopy?"pass-through":"whole-source SR"),
+        smartSrVerdict_.knee,smartSrVerdict_.notch,smartSrProbeStreak_));
+}
+
 void EnhanceGraph::shutdown()
 {
     pausedNrCacheValid_=pausedNrResidualOnly_=false;pausedNrFrame_=nullptr;
@@ -5176,6 +5540,8 @@ void EnhanceGraph::shutdown()
     for(auto& motion:presentMotion_)motion.Reset();
     if(fsrSrBackend_){fsrSrBackend_->release();fsrSrBackend_.reset();}
     if(firstFsrSrBackend_){firstFsrSrBackend_->release();firstFsrSrBackend_.reset();}
+    xessSrBackend_.reset();
+    firstXessSrBackend_.reset();
     fsrSrDepth_.Reset();
     fsrSrZeroMotion_.Reset();upFsrSrZeroMotion_.Reset();
     upFsrSrDepth_.Reset();
@@ -5286,7 +5652,8 @@ void EnhanceGraph::shutdown()
     fgFlowClaims_.Reset();fgFlowAgreement_.Reset();flowClaimPass_={};flowClaims_=false;
     for(unsigned i=0;i<kGeneratedPoolSlots;++i){if(fgDisableMapped_[i]&&fgDisableReadback_[i]){D3D12_RANGE written{0,0};fgDisableReadback_[i]->Unmap(0,&written);}fgDisableMapped_[i]=nullptr;fgDisable_[i].Reset();fgDisableReadback_[i].Reset();generatedLeases_[i].reset();genFrame_[i].Reset();}for(auto& lease:realLeases_)lease.reset();fgDisableInit_.Reset();
     encPass_ = ComputePass{};
-    blitPass_ = ComputePass{};hdrVideoSrPass_={};srPrescalePass_={};srResolvePass_={};firstSrRestorePass_={};
+    blitPass_ = ComputePass{};hdrVideoSrPass_={};srPrescalePass_={};srResolvePass_={};firstSrRestorePass_={};smartSrPass_={};
+    smartSrProbeReducePass_={};smartSrProbeResidualPass_={};
     yuvPass_ = ComputePass{};
     for(auto i=additionalColorInstances_.rbegin();i!=additionalColorInstances_.rend();++i)i->reset();
     for(auto i=nodeColorInstances_.rbegin();i!=nodeColorInstances_.rend();++i)i->reset();
@@ -5328,12 +5695,15 @@ void EnhanceGraph::shutdown()
     neuralTex_.Reset();
     proxyTex_.Reset();
     exclusionPass_={};exclusionScratch_.Reset();
+    subtitleHold_.reset();
     hudProtect_.reset();
     hudLock_.reset();
     for(auto& r:exclusionVideo_)r.Reset();
+    for(auto& r:hudDetectionSource_)r.Reset();
     for(auto& r:exclusionUi_)r.Reset();
     for(auto& r:sourceReferences_)r.Reset();for(auto& r:baseReferences_)r.Reset();workRgba_.Reset();
-    preGradeRgba_.Reset();srcRgba_.Reset();videoSrInput_.Reset();videoSrOutput_.Reset();srPrescaled_.Reset();
+    preGradeRgba_.Reset();srcRgba_.Reset();videoSrInput_.Reset();videoSrOutput_.Reset();srPrescaled_.Reset();smartSrMid_.Reset();
+    smartSrProbeReduced_.Reset();smartSrProbeStats_.Reset();smartSrProbeReadback_.Reset();smartSrProbePending_=false;smartSrProbeFence_=0;
     firstSrInput_.Reset();firstSrOutput_.Reset();firstSrLinear_.Reset();firstSrFlow_.Reset();secondSrFlow_.Reset();fsrAuxW_=fsrAuxH_=0;
     nrHoldPass_.reset();
     nrReusePass_.reset();
