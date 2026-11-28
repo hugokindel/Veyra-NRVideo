@@ -7,8 +7,8 @@
 ## Fork：hugokindel/Veyra-NRVideo `feature/mirror-output`
 
 - 基于官方 2.2.2（2026-11-28 合并 `v2.2.2`），加入[镜像窗口](MIRROR_WINDOW_2026-11-20.md)（扩展模式第二窗口，同一最终画面，两屏保留 HDR）与 [Elgato 4K Pro 色度修复](ELGATO_4K_PRO_CHROMA_2026-11-24.md)。全功能构建，exe 依赖（93 个 DLL）与官方 2.2.2 一致。
-- 2.2.2 补丁集合（与官方 2.2.2 NVIDIA 便携包逐文件 SHA-256 比对）：`veyra_qml_ui.exe`、`qml/Veyra/Main.qml`、`ProPage.qml`、`shaders/YuvToLinearRgb.dxil`、`shaders/P210ToLinearRgb.dxil`。尚未打标签/打包。
-- 上一补丁标签 `v2.2.1-mirror4`（`33a47f46`），用户安装 `C:/Shared/Veyra` 仍为此版本。
+- 2.2.2 补丁集合（与官方 2.2.2 NVIDIA 便携包逐文件 SHA-256 比对）：`veyra_qml_ui.exe`、`qml/Veyra/Main.qml`、`ProPage.qml`、`shaders/YuvToLinearRgb.dxil`、`shaders/P210ToLinearRgb.dxil`。补丁标签 `v2.2.2-mirror1`（`4c5f04dc`），ZIP 在 `D:/Projects/Veyra-work/releases/v2.2.2-mirror1`。
+- 用户安装 `C:/Shared/Veyra` 已升级为官方 2.2.2 + `v2.2.2-mirror1`；`versions/2.2.1`（mirror4）保留可回退。
 - 合并上游、构建、测试与打包流程见 [FORK.md](FORK.md)；构建脚本在 `scripts/fork/`。
 - 待定：更新公钥（当前未写入）；GitHub Release 未创建；采集卡交接时的镜像切换与流媒体/DeckLink/Magewell/AMD 实机未验证。记录见 [WORKLOG](WORKLOG.md) 2026-11-24。
 

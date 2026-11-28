@@ -13,7 +13,7 @@ adds and how to take a new upstream release without losing it. If an upstream me
 | Full-feature build (every optional SDK of the official NVIDIA exe) | MIRROR doc, "Full-feature build" | configure log, dumpbin comparison |
 
 Branch `feature/mirror-output`. `origin` = this fork (push allowed), `upstream` = `Likely7/Veyra-NRVideo`
-(never push, comment or release there). Patch tags `v2.2.1-mirror1..4`; never move a pushed tag.
+(never push, comment or release there). Patch tags `v2.2.1-mirror1..4`, `v2.2.2-mirror1`; never move a pushed tag.
 
 ## Files the fork changes, and what to check in each after a merge
 

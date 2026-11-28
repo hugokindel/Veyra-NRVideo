@@ -10,7 +10,9 @@
 - 测试（PATH 加官方 2.2.2 `versions/2.2.2`，TEMP 在 `tmp/tests-222`）：镜像 GPU `MIRROR_RESULT passed=1 debugErrors=0`；VFG GPU 2521 项 0 失败；采集颜色 failures=0（含 4K Pro 各项）；HDR 颜色 154 项 pass=1（含 `HDR_P010_CHROMA_CENTRE`）。
 - 补丁审计：与官方 2.2.2 NVIDIA 便携包（SHA-256 `f0cc5839…c037` 与官方 SHA256SUMS 一致）比对 258 个产物，不同的为 exe、`Main.qml`、`ProPage.qml`、`YuvToLinearRgb.dxil`、`P210ToLinearRgb.dxil`。
 - 冒烟：`tests/mirror-on-222` 官方便携包副本 + 补丁，`Veyra.exe --data-dir <副本> --mirror-window 4000,7000,11000 --exit-after 13000 sample.mp4`：镜像 attach、全屏、detach（presented=185），正常退出，启动器退出码 0。
-- 未做：标签/补丁 ZIP/Release；用户安装未替换。Y210/P210 下 4K Pro 不走 Elgato 规则（见 FORK.md 待定项）。
+- 标签 `v2.2.2-mirror1`（`4c5f04dc`，已推送 fork）。补丁 ZIP `Veyra-2.2.2-mirror1-NVIDIA-patch.zip`（SHA-256 `2d0598ee…b9bb`）、SHA256SUMS、RELEASE_NOTES 在 `D:/Projects/Veyra-work/releases/v2.2.2-mirror1`；解包核对 6 个文件哈希一致。GitHub Release 未创建。
+- 用户安装 `C:/Shared/Veyra`（用户授权，确认无 Veyra 进程且锁文件未占用）：新增 `versions/2.2.2`（官方原件逐文件一致）并覆盖 5 个补丁文件，官方原件备份 `versions/2.2.2/_pre-mirror-backup`；根目录 `Veyra.exe`、`START-HERE.txt`、`current-version.txt` 换为官方 2.2.2，旧件备份 `versions/2.2.1/_pre-2.2.2-root-backup`。`versions/2.2.1`（mirror4）保留。未启动用户安装。
+- Y210/P210 下 4K Pro 不走 Elgato 规则（见 FORK.md 待定项）。
 
 ## 2026-11-24 Fork：镜像窗口 2.2.1 全功能构建与 Elgato 4K Pro 色度修复
 
